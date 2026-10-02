@@ -1,0 +1,14 @@
+{
+ "metrics": {
+  "total_wire_length": 29.3,
+  "detour_ratio": 1.054,
+  "bends": 0,
+  "duplicate_segments": 0,
+  "parallel_exits": 0
+ },
+ "problems": [],
+ "warnings": [
+  "同一网络的导线 T 形分支于 (6.7,0)（电气已显式绑定,图面正常）"
+ ],
+ "n_seg": 28
+}

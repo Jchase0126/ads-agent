@@ -1,0 +1,35 @@
+; Top Design: "BFR106_lib:CE_FM_Amp:schematic"
+; Netlisted using Hierarchy Policy: "Standard"
+
+Options ResourceUsage=yes UseNutmegFormat=no EnableOptim=no TopDesignName="BFR106_lib:CE_FM_Amp:schematic" DcopOutputNodeVoltages=yes DcopOutputPinCurrents=yes DcopOutputAllSweepPoints=no DcopOutputDcopType=0
+#include "E:/ADS/Work_AI/BFR106_wrk/Infineon_RF//circuit/models/RF.net"
+BFR106:Q1  N__18 N__8 N__12 
+V_Source:VCC  N__3 0 Type="V_DC" Vdc=5 V SaveCurrent=1 
+R:R1  N__8 N__3 R=1.5 kOhm Noise=yes 
+R:R2  N__8 0 R=620 Ohm Noise=yes 
+R:RE1  N__12 0 R=62 Ohm Noise=yes 
+C:CE  N__12 0 C=10 nF 
+L:LC  N__18 N__3 L=2.2 uH Noise=yes  
+C:CDCIN  N__16 N__8 C=1 nF 
+C:CDCOUT  N__18 N__25 C=1 nF 
+C:CIN  N__21 0 C=27 pF 
+L:LIN  N__21 N__16 L=110 nH Noise=yes  
+C:COUT  N__25 0 C=3.9 pF 
+L:LOUT  N__25 N__30 L=33 nH Noise=yes  
+R:RD  N__25 0 R=51 Ohm Noise=yes 
+Port:PORT1  N__21 0 Num=1 Z=50 Ohm Noise=yes 
+Port:PORT2  N__30 0 Num=2 Z=50 Ohm Noise=yes 
+S_Param:SP1 CalcS=yes CalcY=no CalcZ=no GroupDelayAperture=1e-4 FreqConversion=no FreqConversionPort=1 StatusLevel=2 CalcNoise=no SortNoise=0 BandwidthForNoise=1.0 Hz DevOpPtLevel=0 SPSS_WSP=yes \
+SweepVar="freq" SweepPlan="SP1_stim" OutputPlan="SP1_Output" 
+
+SweepPlan: SP1_stim Start=70 MHz Stop=130 MHz Step=0.5 MHz 
+
+OutputPlan:SP1_Output \
+      Type="Output" \
+      UseEquationNestLevel=yes \
+      EquationNestLevel=2 \
+      UseSavedEquationNestLevel=yes \
+      SavedEquationNestLevel=2
+
+#load "python","LinearCollapse"
+Component Module="LinearCollapse" Type="ModelExtractor" NetworkRepresentation=2

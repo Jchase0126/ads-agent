@@ -1,0 +1,17 @@
+{
+ "n_seg": 34,
+ "problems": [
+  "导线 (8.75,2.125)->(9.75,2.125) 穿过元件 VCC 的符号内部",
+  "导线 (9.75,2.125)->(9.75,2.138) 穿过元件 VCC 的符号内部"
+ ],
+ "warnings": [
+  "导线 (8.375,-1)->(8.375,-1.5) 穿过 Q1 的文字区（bbox 7.93,-1.44~8.47,-1.1）"
+ ],
+ "metrics": {
+  "total_wire_length": 17.7,
+  "detour_ratio": 1.0043,
+  "bends": 0,
+  "duplicate_segments": 0,
+  "parallel_exits": 0
+ }
+}

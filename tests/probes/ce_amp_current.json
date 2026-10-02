@@ -1,0 +1,1393 @@
+{
+ "design": "BFR106_lib:CE_FM_Amp:schematic",
+ "instances": [
+  {
+   "name": "INC1",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    0.0,
+    3.3
+   ],
+   "params": {},
+   "pins": [],
+   "bbox": [
+    0.0,
+    2.8312,
+    2.6625,
+    3.3
+   ],
+   "annot_box": [
+    0.2062,
+    2.375,
+    1.7063,
+    2.75
+   ]
+  },
+  {
+   "name": "Q1",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    7.7,
+    -0.5
+   ],
+   "params": {},
+   "pins": [
+    {
+     "label": null,
+     "x": 8.2,
+     "y": -1.0,
+     "net": "N__12"
+    },
+    {
+     "label": null,
+     "x": 7.7,
+     "y": -0.5,
+     "net": "N__8"
+    },
+    {
+     "label": null,
+     "x": 8.2,
+     "y": 0.0,
+     "net": "N__18"
+    }
+   ],
+   "bbox": [
+    7.7,
+    -1.0,
+    8.2,
+    0.0
+   ],
+   "annot_box": [
+    7.9062,
+    -1.4563,
+    8.4938,
+    -1.0813
+   ]
+  },
+  {
+   "name": "VCC",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    9.6875,
+    2.1375
+   ],
+   "params": {
+    "Vdc": "5 V",
+    "Vac": "",
+    "SaveCurrent": "1"
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 10.6875,
+     "y": 2.1375,
+     "net": "gnd!"
+    },
+    {
+     "label": null,
+     "x": 9.6875,
+     "y": 2.1375,
+     "net": "N__3"
+    }
+   ],
+   "bbox": [
+    9.6875,
+    1.9625,
+    10.6875,
+    2.2625
+   ],
+   "annot_box": [
+    9.8938,
+    1.3,
+    10.5125,
+    1.8813
+   ]
+  },
+  {
+   "name": "R1",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    7.55,
+    0.25
+   ],
+   "params": {
+    "R": "1.5 kOhm",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "Noise": "yes",
+    "wPmax": "",
+    "wImax": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 7.55,
+     "y": 0.25,
+     "net": "N__8"
+    },
+    {
+     "label": null,
+     "x": 7.55,
+     "y": 1.25,
+     "net": "N__3"
+    }
+   ],
+   "bbox": [
+    7.4813,
+    0.25,
+    7.6188,
+    1.25
+   ],
+   "annot_box": [
+    7.7,
+    0.6687,
+    8.6188,
+    1.25
+   ]
+  },
+  {
+   "name": "R2",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    7.45,
+    -1.25
+   ],
+   "params": {
+    "R": "620 Ohm",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "Noise": "yes",
+    "wPmax": "",
+    "wImax": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 7.45,
+     "y": -1.25,
+     "net": "N__8"
+    },
+    {
+     "label": null,
+     "x": 7.45,
+     "y": -2.25,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    7.3812,
+    -2.25,
+    7.5187,
+    -1.25
+   ],
+   "annot_box": [
+    5.0,
+    -1.8313,
+    5.875,
+    -1.25
+   ]
+  },
+  {
+   "name": "RE1",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    8.575,
+    -1.0
+   ],
+   "params": {
+    "R": "62 Ohm",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "Noise": "yes",
+    "wPmax": "",
+    "wImax": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 8.575,
+     "y": -1.0,
+     "net": "N__12"
+    },
+    {
+     "label": null,
+     "x": 9.575,
+     "y": -1.0,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    8.575,
+    -1.0688,
+    9.575,
+    -0.9313
+   ],
+   "annot_box": [
+    5.4813,
+    -1.7312,
+    6.2625,
+    -1.15
+   ]
+  },
+  {
+   "name": "CE",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    8.325,
+    -1.5
+   ],
+   "params": {
+    "C": "10 nF",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "wBV": "",
+    "InitCond": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 8.325,
+     "y": -1.5,
+     "net": "N__12"
+    },
+    {
+     "label": null,
+     "x": 8.325,
+     "y": -2.5,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    8.2,
+    -2.5,
+    8.45,
+    -1.5
+   ],
+   "annot_box": [
+    8.5312,
+    -2.0812,
+    9.15,
+    -1.5
+   ]
+  },
+  {
+   "name": "LC",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    8.7,
+    0.625
+   ],
+   "params": {
+    "L": "2.2 uH",
+    "R": "",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "InitCond": "",
+    "Noise": "yes",
+    "Model": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 8.7,
+     "y": 1.625,
+     "net": "N__3"
+    },
+    {
+     "label": null,
+     "x": 8.7,
+     "y": 0.625,
+     "net": "N__18"
+    }
+   ],
+   "bbox": [
+    8.6125,
+    0.625,
+    8.7375,
+    1.625
+   ],
+   "annot_box": [
+    8.8187,
+    0.8375,
+    9.4938,
+    1.625
+   ]
+  },
+  {
+   "name": "CDCIN",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    4.55,
+    -0.5
+   ],
+   "params": {
+    "C": "1 nF",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "wBV": "",
+    "InitCond": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 4.55,
+     "y": -0.5,
+     "net": "N__16"
+    },
+    {
+     "label": null,
+     "x": 5.55,
+     "y": -0.5,
+     "net": "N__8"
+    }
+   ],
+   "bbox": [
+    4.55,
+    -0.625,
+    5.55,
+    -0.375
+   ],
+   "annot_box": [
+    4.7562,
+    -1.2875,
+    5.2812,
+    -0.7063
+   ]
+  },
+  {
+   "name": "CDCOUT",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    10.225,
+    0.0
+   ],
+   "params": {
+    "C": "1 nF",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "wBV": "",
+    "InitCond": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 10.225,
+     "y": 0.0,
+     "net": "N__18"
+    },
+    {
+     "label": null,
+     "x": 11.225,
+     "y": 0.0,
+     "net": "N__25"
+    }
+   ],
+   "bbox": [
+    10.225,
+    -0.125,
+    11.225,
+    0.125
+   ],
+   "annot_box": [
+    10.4313,
+    -0.7875,
+    11.0813,
+    -0.2062
+   ]
+  },
+  {
+   "name": "CIN",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    1.625,
+    -0.5
+   ],
+   "params": {
+    "C": "27 pF",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "wBV": "",
+    "InitCond": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 1.625,
+     "y": -0.5,
+     "net": "N__21"
+    },
+    {
+     "label": null,
+     "x": 1.625,
+     "y": -1.5,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    1.5,
+    -1.5,
+    1.75,
+    -0.5
+   ],
+   "annot_box": [
+    1.8313,
+    -1.0813,
+    2.45,
+    -0.5
+   ]
+  },
+  {
+   "name": "LIN",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    2.65,
+    -0.5
+   ],
+   "params": {
+    "L": "110 nH",
+    "R": "",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "InitCond": "",
+    "Noise": "yes",
+    "Model": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 3.65,
+     "y": -0.5,
+     "net": "N__16"
+    },
+    {
+     "label": null,
+     "x": 2.65,
+     "y": -0.5,
+     "net": "N__21"
+    }
+   ],
+   "bbox": [
+    2.65,
+    -0.5375,
+    3.65,
+    -0.4125
+   ],
+   "annot_box": [
+    2.8563,
+    -1.4062,
+    3.5812,
+    -0.6188
+   ]
+  },
+  {
+   "name": "COUT",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    11.475,
+    -0.25
+   ],
+   "params": {
+    "C": "3.9 pF",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "wBV": "",
+    "InitCond": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 11.475,
+     "y": -0.25,
+     "net": "N__25"
+    },
+    {
+     "label": null,
+     "x": 11.475,
+     "y": -1.25,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    11.35,
+    -1.25,
+    11.6,
+    -0.25
+   ],
+   "annot_box": [
+    11.6813,
+    -0.8313,
+    12.35,
+    -0.25
+   ]
+  },
+  {
+   "name": "LOUT",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    13.125,
+    0.0
+   ],
+   "params": {
+    "L": "33 nH",
+    "R": "",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "InitCond": "",
+    "Noise": "yes",
+    "Model": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 14.125,
+     "y": 0.0,
+     "net": "N__30"
+    },
+    {
+     "label": null,
+     "x": 13.125,
+     "y": 0.0,
+     "net": "N__25"
+    }
+   ],
+   "bbox": [
+    13.125,
+    -0.0375,
+    14.125,
+    0.0875
+   ],
+   "annot_box": [
+    13.3313,
+    -0.9062,
+    13.9563,
+    -0.1187
+   ]
+  },
+  {
+   "name": "RD",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    12.475,
+    -0.25
+   ],
+   "params": {
+    "R": "51 Ohm",
+    "Temp": "",
+    "Trise": "",
+    "Tnom": "",
+    "TC1": "",
+    "TC2": "",
+    "Noise": "yes",
+    "wPmax": "",
+    "wImax": "",
+    "Model": "",
+    "Width": "",
+    "Length": "",
+    "_M": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 12.475,
+     "y": -0.25,
+     "net": "N__25"
+    },
+    {
+     "label": null,
+     "x": 12.475,
+     "y": -1.25,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    12.4062,
+    -1.25,
+    12.5437,
+    -0.25
+   ],
+   "annot_box": [
+    12.625,
+    -0.8313,
+    13.4062,
+    -0.25
+   ]
+  },
+  {
+   "name": "PORT1",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    0.625,
+    -0.5
+   ],
+   "params": {
+    "Num": "1",
+    "Z": "50 Ohm",
+    "Noise": "yes",
+    "Vdc": "",
+    "Temp": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 0.625,
+     "y": -0.5,
+     "net": "N__21"
+    }
+   ],
+   "bbox": [
+    -0.25,
+    -0.6875,
+    0.625,
+    -0.3125
+   ],
+   "annot_box": [
+    -1.2437,
+    -1.5562,
+    -0.4625,
+    -0.7688
+   ]
+  },
+  {
+   "name": "PORT2",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    15.15,
+    0.0
+   ],
+   "params": {
+    "Num": "2",
+    "Z": "50 Ohm",
+    "Noise": "yes",
+    "Vdc": "",
+    "Temp": ""
+   },
+   "pins": [
+    {
+     "label": null,
+     "x": 15.15,
+     "y": 0.0,
+     "net": "N__30"
+    }
+   ],
+   "bbox": [
+    15.15,
+    -0.1875,
+    16.025,
+    0.1875
+   ],
+   "annot_box": [
+    15.3562,
+    -1.0562,
+    16.1375,
+    -0.2687
+   ]
+  },
+  {
+   "name": "SP1",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    0.125,
+    2.175
+   ],
+   "params": {
+    "SweepVar": "\"freq\"",
+    "UseSweepPlan": "",
+    "SweepPlan": "",
+    "Start": "70 MHz",
+    "Stop": "130 MHz",
+    "Step": "0.5 MHz",
+    "Center": "",
+    "Span": "",
+    "Lin": "",
+    "Dec": "",
+    "Log": "",
+    "Reverse": "",
+    "Pt": "",
+    "Sort": "LINEAR START STEP",
+    "OutputPlan": "['']",
+    "UseEquationNestLevel": "yes",
+    "EquationNestLevel": "2",
+    "EquationName": "['']",
+    "CalcS": "yes",
+    "CalcY": "no",
+    "CalcZ": "no",
+    "CalcGroupDelay": "",
+    "GroupDelayAperture": "1e-4",
+    "FreqConversion": "no",
+    "FreqConversionPort": "1",
+    "UseFiniteDiff": "",
+    "StatusLevel": "2",
+    "CalcNoise": "no",
+    "SortNoise": "0",
+    "NoiseThresh": "",
+    "BandwidthForNoise": "1.0 Hz",
+    "Freq": "",
+    "DevOpPtLevel": "0",
+    "NoiseInputPort": "",
+    "NoiseOutputPort": "",
+    "Other": "",
+    "UseSavedEquationNestLevel": "yes",
+    "SavedEquationNestLevel": "2",
+    "SavedEquationName": "['']",
+    "AttachedEquationName": "['']",
+    "EnforcePassivity": "",
+    "SPSS_WSP": "yes"
+   },
+   "pins": [],
+   "bbox": [
+    0.125,
+    1.7063,
+    2.7,
+    2.175
+   ],
+   "annot_box": [
+    0.3312,
+    0.6312,
+    1.4438,
+    1.625
+   ]
+  },
+  {
+   "name": "G1",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    1.625,
+    -1.625
+   ],
+   "params": {},
+   "pins": [
+    {
+     "label": null,
+     "x": 1.625,
+     "y": -1.625,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    1.5,
+    -1.875,
+    1.75,
+    -1.625
+   ],
+   "annot_box": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "name": "G2",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    7.45,
+    -2.25
+   ],
+   "params": {},
+   "pins": [
+    {
+     "label": null,
+     "x": 7.45,
+     "y": -2.25,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    7.325,
+    -2.5,
+    7.575,
+    -2.25
+   ],
+   "annot_box": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "name": "G3",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    12.475,
+    -1.25
+   ],
+   "params": {},
+   "pins": [
+    {
+     "label": null,
+     "x": 12.475,
+     "y": -1.25,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    12.35,
+    -1.5,
+    12.6,
+    -1.25
+   ],
+   "annot_box": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "name": "G4",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    11.475,
+    -1.25
+   ],
+   "params": {},
+   "pins": [
+    {
+     "label": null,
+     "x": 11.475,
+     "y": -1.25,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    11.35,
+    -1.5,
+    11.6,
+    -1.25
+   ],
+   "annot_box": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "name": "G6",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    8.325,
+    -2.5
+   ],
+   "params": {},
+   "pins": [
+    {
+     "label": null,
+     "x": 8.325,
+     "y": -2.5,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    8.2,
+    -2.75,
+    8.45,
+    -2.5
+   ],
+   "annot_box": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "name": "G7",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    10.6875,
+    2.1375
+   ],
+   "params": {},
+   "pins": [
+    {
+     "label": null,
+     "x": 10.6875,
+     "y": 2.1375,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    10.6875,
+    2.0125,
+    10.9375,
+    2.2625
+   ],
+   "annot_box": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "name": "G8",
+   "angle": 0,
+   "mirror": false,
+   "origin": [
+    9.575,
+    -1.0
+   ],
+   "params": {},
+   "pins": [
+    {
+     "label": null,
+     "x": 9.575,
+     "y": -1.0,
+     "net": "gnd!"
+    }
+   ],
+   "bbox": [
+    9.575,
+    -1.125,
+    9.825,
+    -0.875
+   ],
+   "annot_box": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  }
+ ],
+ "wires": [
+  {
+   "pts": [
+    [
+     12.5,
+     0.0
+    ],
+    [
+     13.125,
+     0.0
+    ]
+   ],
+   "net": "N__25"
+  },
+  {
+   "pts": [
+    [
+     11.5,
+     0.0
+    ],
+    [
+     12.5,
+     0.0
+    ]
+   ],
+   "net": "N__25"
+  },
+  {
+   "pts": [
+    [
+     1.625,
+     -1.5
+    ],
+    [
+     1.625,
+     -1.625
+    ]
+   ],
+   "net": "gnd!"
+  },
+  {
+   "pts": [
+    [
+     7.45,
+     -1.25
+    ],
+    [
+     7.5,
+     -1.25
+    ],
+    [
+     7.5,
+     -0.5
+    ]
+   ],
+   "net": "N__8"
+  },
+  {
+   "pts": [
+    [
+     7.7,
+     -0.5
+    ],
+    [
+     7.5,
+     -0.5
+    ]
+   ],
+   "net": "N__8"
+  },
+  {
+   "pts": [
+    [
+     8.2,
+     -1.0
+    ],
+    [
+     8.375,
+     -1.0
+    ]
+   ],
+   "net": "N__12"
+  },
+  {
+   "pts": [
+    [
+     12.5,
+     0.0
+    ],
+    [
+     12.5,
+     -0.25
+    ],
+    [
+     12.475,
+     -0.25
+    ]
+   ],
+   "net": "N__25"
+  },
+  {
+   "pts": [
+    [
+     11.5,
+     0.0
+    ],
+    [
+     11.5,
+     -0.25
+    ],
+    [
+     11.475,
+     -0.25
+    ]
+   ],
+   "net": "N__25"
+  },
+  {
+   "pts": [
+    [
+     11.225,
+     0.0
+    ],
+    [
+     11.5,
+     0.0
+    ]
+   ],
+   "net": "N__25"
+  },
+  {
+   "pts": [
+    [
+     8.375,
+     -1.0
+    ],
+    [
+     8.575,
+     -1.0
+    ]
+   ],
+   "net": "N__12"
+  },
+  {
+   "pts": [
+    [
+     8.375,
+     -1.0
+    ],
+    [
+     8.375,
+     -1.5
+    ],
+    [
+     8.325,
+     -1.5
+    ]
+   ],
+   "net": "N__12"
+  },
+  {
+   "pts": [
+    [
+     8.75,
+     2.125
+    ],
+    [
+     9.75,
+     2.125
+    ],
+    [
+     9.75,
+     2.1375
+    ],
+    [
+     9.6875,
+     2.1375
+    ]
+   ],
+   "net": "N__3"
+  },
+  {
+   "pts": [
+    [
+     7.5,
+     -0.5
+    ],
+    [
+     5.55,
+     -0.5
+    ]
+   ],
+   "net": "N__8"
+  },
+  {
+   "pts": [
+    [
+     4.55,
+     -0.5
+    ],
+    [
+     3.65,
+     -0.5
+    ]
+   ],
+   "net": "N__16"
+  },
+  {
+   "pts": [
+    [
+     1.625,
+     -0.5
+    ],
+    [
+     2.65,
+     -0.5
+    ]
+   ],
+   "net": "N__21"
+  },
+  {
+   "pts": [
+    [
+     0.625,
+     -0.5
+    ],
+    [
+     1.625,
+     -0.5
+    ]
+   ],
+   "net": "N__21"
+  },
+  {
+   "pts": [
+    [
+     7.5,
+     -0.5
+    ],
+    [
+     7.5,
+     0.25
+    ],
+    [
+     7.55,
+     0.25
+    ]
+   ],
+   "net": "N__8"
+  },
+  {
+   "pts": [
+    [
+     8.75,
+     0.0
+    ],
+    [
+     8.75,
+     0.625
+    ],
+    [
+     8.7,
+     0.625
+    ]
+   ],
+   "net": "N__18"
+  },
+  {
+   "pts": [
+    [
+     8.2,
+     0.0
+    ],
+    [
+     8.75,
+     0.0
+    ]
+   ],
+   "net": "N__18"
+  },
+  {
+   "pts": [
+    [
+     7.55,
+     1.25
+    ],
+    [
+     7.5,
+     1.25
+    ],
+    [
+     7.5,
+     2.125
+    ],
+    [
+     8.75,
+     2.125
+    ]
+   ],
+   "net": "N__3"
+  },
+  {
+   "pts": [
+    [
+     8.7,
+     1.625
+    ],
+    [
+     8.75,
+     1.625
+    ],
+    [
+     8.75,
+     2.125
+    ]
+   ],
+   "net": "N__3"
+  },
+  {
+   "pts": [
+    [
+     8.75,
+     0.0
+    ],
+    [
+     10.225,
+     0.0
+    ]
+   ],
+   "net": "N__18"
+  },
+  {
+   "pts": [
+    [
+     14.125,
+     0.0
+    ],
+    [
+     15.15,
+     0.0
+    ]
+   ],
+   "net": "N__30"
+  }
+ ],
+ "netlist": "; Top Design: \"BFR106_lib:CE_FM_Amp:schematic\"\n; Netlisted using Hierarchy Policy: \"Standard\"\n\nOptions ResourceUsage=yes UseNutmegFormat=no EnableOptim=no TopDesignName=\"BFR106_lib:CE_FM_Amp:schematic\" DcopOutputNodeVoltages=yes DcopOutputPinCurrents=yes DcopOutputAllSweepPoints=no DcopOutputDcopType=0\n#include \"E:/ADS/Work_AI/BFR106_wrk/Infineon_RF//circuit/models/RF.net\"\nBFR106:Q1  N__18 N__8 N__12 \nV_Source:VCC  N__3 0 Type=\"V_DC\" Vdc=5 V SaveCurrent=1 \nR:R1  N__8 N__3 R=1.5 kOhm Noise=yes \nR:R2  N__8 0 R=620 Ohm Noise=yes \nR:RE1  N__12 0 R=62 Ohm Noise=yes \nC:CE  N__12 0 C=10 nF \nL:LC  N__18 N__3 L=2.2 uH Noise=yes  \nC:CDCIN  N__16 N__8 C=1 nF \nC:CDCOUT  N__18 N__25 C=1 nF \nC:CIN  N__21 0 C=27 pF \nL:LIN  N__21 N__16 L=110 nH Noise=yes  \nC:COUT  N__25 0 C=3.9 pF \nL:LOUT  N__25 N__30 L=33 nH Noise=yes  \nR:RD  N__25 0 R=51 Ohm Noise=yes \nPort:PORT1  N__21 0 Num=1 Z=50 Ohm Noise=yes \nPort:PORT2  N__30 0 Num=2 Z=50 Ohm Noise=yes \nS_Param:SP1 CalcS=yes CalcY=no CalcZ=no GroupDelayAperture=1e-4 FreqConversion=no FreqConversionPort=1 StatusLevel=2 CalcNoise=no SortNoise=0 BandwidthForNoise=1.0 Hz DevOpPtLevel=0 SPSS_WSP=yes \\\nSweepVar=\"freq\" SweepPlan=\"SP1_stim\" OutputPlan=\"SP1_Output\" \n\nSweepPlan: SP1_stim Start=70 MHz Stop=130 MHz Step=0.5 MHz \n\nOutputPlan:SP1_Output \\\n      Type=\"Output\" \\\n      UseEquationNestLevel=yes \\\n      EquationNestLevel=2 \\\n      UseSavedEquationNestLevel=yes \\\n      SavedEquationNestLevel=2\n\n#load \"python\",\"LinearCollapse\"\nComponent Module=\"LinearCollapse\" Type=\"ModelExtractor\" NetworkRepresentation=2\n"
+}

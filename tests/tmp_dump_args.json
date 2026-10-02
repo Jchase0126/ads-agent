@@ -1,0 +1,1 @@
+{"code": "import os\nimport keysight.ads.de.db_uu as db_uu\np = r'D:/Antenna/ADS Agent/logs/ce_final.pdf'\nif os.path.exists(p):\n    os.remove(p)\nd = db_uu.open_design('BFR106_lib:CE_FM_Amp_AGENT:schematic', mode='ReadOnly')\nd.print_design(p)\nprint('OK', os.path.getsize(p))"}

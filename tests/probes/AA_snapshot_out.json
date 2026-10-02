@@ -1,0 +1,1061 @@
+===== Wilkinson_5G9 (18 instances) =====
+[
+ {
+  "name": "PORT1",
+  "master": "ads_simulation:Term",
+  "origin": [
+   0.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Num": "1",
+   "Z": "Z0",
+   "Noise": "yes",
+   "Vdc": "",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__2"
+   ],
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "ML1",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   3.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSub1\"",
+   "W": "W50",
+   "L": "L50",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__5"
+   ],
+   [
+    "1",
+    null,
+    "N__2"
+   ]
+  ]
+ },
+ {
+  "name": "MTEE1",
+  "master": "ads_tlines:MTEE",
+  "origin": [
+   6.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSub1\"",
+   "W1": "W50",
+   "W2": "W70",
+   "W3": "W50",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "1",
+    null,
+    "N__5"
+   ],
+   [
+    "3",
+    null,
+    "N__25"
+   ],
+   [
+    "2",
+    null,
+    "N__7"
+   ]
+  ]
+ },
+ {
+  "name": "ML2",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   9.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSub1\"",
+   "W": "W70",
+   "L": "Lq",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__10"
+   ],
+   [
+    "1",
+    null,
+    "N__7"
+   ]
+  ]
+ },
+ {
+  "name": "MTEE2",
+  "master": "ads_tlines:MTEE",
+  "origin": [
+   12.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSub1\"",
+   "W1": "W70",
+   "W2": "W50",
+   "W3": "W50",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "1",
+    null,
+    "N__10"
+   ],
+   [
+    "3",
+    null,
+    "N__16"
+   ],
+   [
+    "2",
+    null,
+    "N__12"
+   ]
+  ]
+ },
+ {
+  "name": "ML4",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   15.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSub1\"",
+   "W": "W50",
+   "L": "L50",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__15"
+   ],
+   [
+    "1",
+    null,
+    "N__12"
+   ]
+  ]
+ },
+ {
+  "name": "PORT2",
+  "master": "ads_simulation:Term",
+  "origin": [
+   19.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Num": "2",
+   "Z": "Z0",
+   "Noise": "yes",
+   "Vdc": "",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__15"
+   ],
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "ML3",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   12.5,
+   -4.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSub1\"",
+   "W": "W70",
+   "L": "Lq",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__19"
+   ],
+   [
+    "1",
+    null,
+    "N__16"
+   ]
+  ]
+ },
+ {
+  "name": "MTEE3",
+  "master": "ads_tlines:MTEE",
+  "origin": [
+   15.5,
+   -5.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSub1\"",
+   "W1": "W70",
+   "W2": "W50",
+   "W3": "W50",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "1",
+    null,
+    "N__19"
+   ],
+   [
+    "3",
+    null,
+    "N__20"
+   ],
+   [
+    "2",
+    null,
+    "N__21"
+   ]
+  ]
+ },
+ {
+  "name": "ML5",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   18.5,
+   -5.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSub1\"",
+   "W": "W50",
+   "L": "L50",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__24"
+   ],
+   [
+    "1",
+    null,
+    "N__21"
+   ]
+  ]
+ },
+ {
+  "name": "PORT3",
+  "master": "ads_simulation:Term",
+  "origin": [
+   22.5,
+   -5.0
+  ],
+  "angle": null,
+  "params": {
+   "Num": "3",
+   "Z": "Z0",
+   "Noise": "yes",
+   "Vdc": "",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__24"
+   ],
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "R1",
+  "master": "ads_rflib:R",
+  "origin": [
+   6.5,
+   -3.0
+  ],
+  "angle": null,
+  "params": {
+   "R": "Riso",
+   "Temp": "",
+   "Trise": "",
+   "Tnom": "",
+   "TC1": "",
+   "TC2": "",
+   "Noise": "yes",
+   "wPmax": "",
+   "wImax": "",
+   "Model": "",
+   "Width": "",
+   "Length": "",
+   "_M": ""
+  },
+  "pins": [
+   [
+    "1",
+    null,
+    "N__20"
+   ],
+   [
+    "2",
+    null,
+    "N__25"
+   ]
+  ]
+ },
+ {
+  "name": "GND1",
+  "master": "ads_rflib:GROUND",
+  "origin": [
+   0.0,
+   -2.0
+  ],
+  "angle": null,
+  "params": {},
+  "pins": [
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "GND2",
+  "master": "ads_rflib:GROUND",
+  "origin": [
+   19.0,
+   -2.0
+  ],
+  "angle": null,
+  "params": {},
+  "pins": [
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "GND3",
+  "master": "ads_rflib:GROUND",
+  "origin": [
+   22.5,
+   -7.0
+  ],
+  "angle": null,
+  "params": {},
+  "pins": [
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "MSub1",
+  "master": "ads_tlines:MSUB",
+  "origin": [
+   4.5,
+   5.319
+  ],
+  "angle": null,
+  "params": {
+   "H": "10.0 mil",
+   "Er": "9.6",
+   "Mur": "1",
+   "Cond": "1.0E+50",
+   "Hu": "3.93701e+34 mil",
+   "T": "0 mil",
+   "TanD": "0",
+   "Rough": "0 mil",
+   "Cond1": "\"ads_device:ads_label\"",
+   "Cond2": "\"ads_device:ads_label\"",
+   "Diel1": "\"ads_device:ads_label\"",
+   "Diel2": "\"ads_device:ads_label\"",
+   "Hole": "\"ads_device:ads_label\"",
+   "Res": "\"ads_device:ads_label\"",
+   "Bond": "\"ads_device:ads_label\"",
+   "DielectricLossModel": "1",
+   "FreqForEpsrTanD": "1.0 GHz",
+   "LowFreqForTanD": "1.0 kHz",
+   "HighFreqForTanD": "1.0 THz",
+   "Bbase": "",
+   "Dpeaks": "",
+   "L2Rough": "",
+   "L2Bbase": "",
+   "L2Dpeaks": "",
+   "L3Rough": "",
+   "L3Bbase": "",
+   "L3Dpeaks": "",
+   "RoughnessModel": "2"
+  },
+  "pins": []
+ },
+ {
+  "name": "SP1",
+  "master": "ads_simulation:S_Param",
+  "origin": [
+   0.0,
+   -10.2
+  ],
+  "angle": null,
+  "params": {
+   "SweepVar": "\"freq\"",
+   "UseSweepPlan": "",
+   "SweepPlan": "",
+   "Start": "4.5 GHz",
+   "Stop": "7.5 GHz",
+   "Step": "0.02 GHz",
+   "Center": "",
+   "Span": "",
+   "Lin": "",
+   "Dec": "",
+   "Log": "",
+   "Reverse": "",
+   "Pt": "",
+   "Sort": "LINEAR START STEP",
+   "OutputPlan": "['']",
+   "UseEquationNestLevel": "yes",
+   "EquationNestLevel": "2",
+   "EquationName": "['']",
+   "CalcS": "yes",
+   "CalcY": "no",
+   "CalcZ": "no",
+   "CalcGroupDelay": "",
+   "GroupDelayAperture": "1e-4",
+   "FreqConversion": "no",
+   "FreqConversionPort": "1",
+   "UseFiniteDiff": "",
+   "StatusLevel": "2",
+   "CalcNoise": "no",
+   "SortNoise": "0",
+   "NoiseThresh": "",
+   "BandwidthForNoise": "1.0 Hz",
+   "Freq": "",
+   "DevOpPtLevel": "0",
+   "NoiseInputPort": "",
+   "NoiseOutputPort": "",
+   "Other": "",
+   "UseSavedEquationNestLevel": "yes",
+   "SavedEquationNestLevel": "2",
+   "SavedEquationName": "['']",
+   "AttachedEquationName": "['']",
+   "EnforcePassivity": "",
+   "SPSS_WSP": "yes"
+  },
+  "pins": []
+ },
+ {
+  "name": "VAR1",
+  "master": "ads_datacmps:VAR",
+  "origin": [
+   0.0,
+   6.562
+  ],
+  "angle": null,
+  "params": {
+   "Variable Value": "[['X', '1.0'], ['f0', '5.9 GHz'], ['Z0', '50 Ohm'], ['W50', '3.06 mm'], ['W70', '1.62 mm'], ['Lq', '7.04 mm'], ['L50', '6.96 mm'], ['Riso', '100 Ohm']]"
+  },
+  "pins": []
+ }
+]
+===== Wilkinson_2G4_v2 (18 instances) =====
+[
+ {
+  "name": "MSUB1",
+  "master": "ads_tlines:MSUB",
+  "origin": [
+   4.5,
+   5.319
+  ],
+  "angle": null,
+  "params": {
+   "H": "1.6 mm",
+   "Er": "4.4",
+   "Mur": "1",
+   "Cond": "1.0E+50",
+   "Hu": "3.93701e+34 mil",
+   "T": "0.035 mm",
+   "TanD": "0.02",
+   "Rough": "0 mil",
+   "Cond1": "\"ads_device:ads_label\"",
+   "Cond2": "\"ads_device:ads_label\"",
+   "Diel1": "\"ads_device:ads_label\"",
+   "Diel2": "\"ads_device:ads_label\"",
+   "Hole": "\"ads_device:ads_label\"",
+   "Res": "\"ads_device:ads_label\"",
+   "Bond": "\"ads_device:ads_label\"",
+   "DielectricLossModel": "1",
+   "FreqForEpsrTanD": "1.0 GHz",
+   "LowFreqForTanD": "1.0 kHz",
+   "HighFreqForTanD": "1.0 THz",
+   "Bbase": "",
+   "Dpeaks": "",
+   "L2Rough": "",
+   "L2Bbase": "",
+   "L2Dpeaks": "",
+   "L3Rough": "",
+   "L3Bbase": "",
+   "L3Dpeaks": "",
+   "RoughnessModel": "2"
+  },
+  "pins": []
+ },
+ {
+  "name": "PORT1",
+  "master": "ads_simulation:Term",
+  "origin": [
+   0.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Num": "1",
+   "Z": "50 Ohm",
+   "Noise": "yes",
+   "Vdc": "",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__2"
+   ],
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "ML1",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   3.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSUB1\"",
+   "W": "W50",
+   "L": "L50",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__5"
+   ],
+   [
+    "1",
+    null,
+    "N__2"
+   ]
+  ]
+ },
+ {
+  "name": "MTEE1",
+  "master": "ads_tlines:MTEE",
+  "origin": [
+   6.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSUB1\"",
+   "W1": "W50",
+   "W2": "W70",
+   "W3": "W70",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "1",
+    null,
+    "N__5"
+   ],
+   [
+    "3",
+    null,
+    "N__9"
+   ],
+   [
+    "2",
+    null,
+    "N__7"
+   ]
+  ]
+ },
+ {
+  "name": "ML2",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   9.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSUB1\"",
+   "W": "W70",
+   "L": "Lq",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__12"
+   ],
+   [
+    "1",
+    null,
+    "N__7"
+   ]
+  ]
+ },
+ {
+  "name": "ML3",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   6.5,
+   -5.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSUB1\"",
+   "W": "W70",
+   "L": "Lq",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__15"
+   ],
+   [
+    "1",
+    null,
+    "N__9"
+   ]
+  ]
+ },
+ {
+  "name": "MTEE2",
+  "master": "ads_tlines:MTEE",
+  "origin": [
+   12.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSUB1\"",
+   "W1": "W70",
+   "W2": "W50",
+   "W3": "W50",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "1",
+    null,
+    "N__12"
+   ],
+   [
+    "3",
+    null,
+    "N__22"
+   ],
+   [
+    "2",
+    null,
+    "N__17"
+   ]
+  ]
+ },
+ {
+  "name": "MTEE3",
+  "master": "ads_tlines:MTEE",
+  "origin": [
+   9.5,
+   -5.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSUB1\"",
+   "W1": "W70",
+   "W2": "W50",
+   "W3": "W50",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "1",
+    null,
+    "N__15"
+   ],
+   [
+    "3",
+    null,
+    "N__21"
+   ],
+   [
+    "2",
+    null,
+    "N__19"
+   ]
+  ]
+ },
+ {
+  "name": "ML4",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   15.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSUB1\"",
+   "W": "W50",
+   "L": "L50",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__24"
+   ],
+   [
+    "1",
+    null,
+    "N__17"
+   ]
+  ]
+ },
+ {
+  "name": "ML5",
+  "master": "ads_tlines:MLIN",
+  "origin": [
+   12.5,
+   -5.0
+  ],
+  "angle": null,
+  "params": {
+   "Subst": "\"MSUB1\"",
+   "W": "W50",
+   "L": "L50",
+   "Wall1": "1.0E+30 mil",
+   "Wall2": "1.0E+30 mil",
+   "Temp": "",
+   "Mod": "1"
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__26"
+   ],
+   [
+    "1",
+    null,
+    "N__19"
+   ]
+  ]
+ },
+ {
+  "name": "R1",
+  "master": "ads_rflib:R",
+  "origin": [
+   12.5,
+   -2.5
+  ],
+  "angle": null,
+  "params": {
+   "R": "Riso",
+   "Temp": "",
+   "Trise": "",
+   "Tnom": "",
+   "TC1": "",
+   "TC2": "",
+   "Noise": "yes",
+   "wPmax": "",
+   "wImax": "",
+   "Model": "",
+   "Width": "",
+   "Length": "",
+   "_M": ""
+  },
+  "pins": [
+   [
+    "1",
+    null,
+    "N__22"
+   ],
+   [
+    "2",
+    null,
+    "N__21"
+   ]
+  ]
+ },
+ {
+  "name": "PORT2",
+  "master": "ads_simulation:Term",
+  "origin": [
+   19.0,
+   0.0
+  ],
+  "angle": null,
+  "params": {
+   "Num": "2",
+   "Z": "50 Ohm",
+   "Noise": "yes",
+   "Vdc": "",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__24"
+   ],
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "PORT3",
+  "master": "ads_simulation:Term",
+  "origin": [
+   16.5,
+   -5.0
+  ],
+  "angle": null,
+  "params": {
+   "Num": "3",
+   "Z": "50 Ohm",
+   "Noise": "yes",
+   "Vdc": "",
+   "Temp": ""
+  },
+  "pins": [
+   [
+    "2",
+    null,
+    "N__26"
+   ],
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "SP1",
+  "master": "ads_simulation:S_Param",
+  "origin": [
+   0.0,
+   -10.2
+  ],
+  "angle": null,
+  "params": {
+   "SweepVar": "\"freq\"",
+   "UseSweepPlan": "",
+   "SweepPlan": "",
+   "Start": "1 GHz",
+   "Stop": "5 GHz",
+   "Step": "0.04 GHz",
+   "Center": "",
+   "Span": "",
+   "Lin": "",
+   "Dec": "",
+   "Log": "",
+   "Reverse": "",
+   "Pt": "",
+   "Sort": "LINEAR START STEP",
+   "OutputPlan": "['']",
+   "UseEquationNestLevel": "yes",
+   "EquationNestLevel": "2",
+   "EquationName": "['']",
+   "CalcS": "yes",
+   "CalcY": "no",
+   "CalcZ": "no",
+   "CalcGroupDelay": "",
+   "GroupDelayAperture": "1e-4",
+   "FreqConversion": "no",
+   "FreqConversionPort": "1",
+   "UseFiniteDiff": "",
+   "StatusLevel": "2",
+   "CalcNoise": "no",
+   "SortNoise": "0",
+   "NoiseThresh": "",
+   "BandwidthForNoise": "1.0 Hz",
+   "Freq": "",
+   "DevOpPtLevel": "0",
+   "NoiseInputPort": "",
+   "NoiseOutputPort": "",
+   "Other": "",
+   "UseSavedEquationNestLevel": "yes",
+   "SavedEquationNestLevel": "2",
+   "SavedEquationName": "['']",
+   "AttachedEquationName": "['']",
+   "EnforcePassivity": "",
+   "SPSS_WSP": "yes"
+  },
+  "pins": []
+ },
+ {
+  "name": "GND1",
+  "master": "ads_rflib:GROUND",
+  "origin": [
+   0.0,
+   -2.0
+  ],
+  "angle": null,
+  "params": {},
+  "pins": [
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "GND2",
+  "master": "ads_rflib:GROUND",
+  "origin": [
+   19.0,
+   -2.0
+  ],
+  "angle": null,
+  "params": {},
+  "pins": [
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "GND3",
+  "master": "ads_rflib:GROUND",
+  "origin": [
+   16.5,
+   -7.0
+  ],
+  "angle": null,
+  "params": {},
+  "pins": [
+   [
+    "1",
+    null,
+    "gnd!"
+   ]
+  ]
+ },
+ {
+  "name": "VAR1",
+  "master": "ads_datacmps:VAR",
+  "origin": [
+   0.0,
+   6.562
+  ],
+  "angle": null,
+  "params": {
+   "Variable Value": "[['X', '1.0'], ['f0', '2.4 GHz'], ['Z0', '50 Ohm'], ['W50', '3.06 mm'], ['W70', '1.62 mm'], ['Lq', '17.3 mm'], ['L50', '17.1 mm'], ['Riso', '100 Ohm']]"
+  },
+  "pins": []
+ }
+]
+

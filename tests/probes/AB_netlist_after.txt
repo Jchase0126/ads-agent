@@ -1,0 +1,42 @@
+; Top Design: "AI_lib:Wilkinson_5G9:schematic"
+; Netlisted using Hierarchy Policy: "Standard"
+
+Options ResourceUsage=yes UseNutmegFormat=no EnableOptim=no TopDesignName="AI_lib:Wilkinson_5G9:schematic" DcopOutputNodeVoltages=yes DcopOutputPinCurrents=yes DcopOutputAllSweepPoints=no DcopOutputDcopType=0
+Port:PORT1  0 N__2 Num=1 Z=Z0 Noise=yes 
+MLIN2:ML1  N__2 N__5 Subst="MSub1" W=W50 L=L50 Wall1=1.0E+30 mil Wall2=1.0E+30 mil Mod=1 
+MTEE:MTEE1  N__5 N__7 N__25 Subst="MSub1" W1=W50 W2=W70 W3=W50 
+MLIN2:ML2  N__7 N__10 Subst="MSub1" W=W70 L=Lq Wall1=1.0E+30 mil Wall2=1.0E+30 mil Mod=1 
+MTEE:MTEE2  N__10 N__12 N__16 Subst="MSub1" W1=W70 W2=W50 W3=W50 
+MLIN2:ML4  N__12 N__15 Subst="MSub1" W=W50 L=L50 Wall1=1.0E+30 mil Wall2=1.0E+30 mil Mod=1 
+Port:PORT2  0 N__15 Num=2 Z=Z0 Noise=yes 
+MLIN2:ML3  N__16 N__19 Subst="MSub1" W=W70 L=Lq Wall1=1.0E+30 mil Wall2=1.0E+30 mil Mod=1 
+MTEE:MTEE3  N__19 N__21 N__20 Subst="MSub1" W1=W70 W2=W50 W3=W50 
+MLIN2:ML5  N__21 N__24 Subst="MSub1" W=W50 L=L50 Wall1=1.0E+30 mil Wall2=1.0E+30 mil Mod=1 
+Port:PORT3  0 N__24 Num=3 Z=Z0 Noise=yes 
+R:R1  N__20 N__25 R=Riso Noise=yes 
+model MSub1 MSUB H=10.0 mil Er=9.6 Mur=1 Cond=1.0E+50 Hu=3.93701e+34 mil T=0 mil TanD=0 Rough=0 mil DielectricLossModel=1 FreqForEpsrTanD=1.0 GHz LowFreqForTanD=1.0 kHz HighFreqForTanD=1.0 THz RoughnessModel=2 
+S_Param:SP1 CalcS=yes CalcY=no CalcZ=no GroupDelayAperture=1e-4 FreqConversion=no FreqConversionPort=1 StatusLevel=2 CalcNoise=no SortNoise=0 BandwidthForNoise=1.0 Hz DevOpPtLevel=0 SPSS_WSP=yes \
+SweepVar="freq" SweepPlan="SP1_stim" OutputPlan="SP1_Output" 
+
+SweepPlan: SP1_stim Start=4.5 GHz Stop=7.5 GHz Step=0.02 GHz 
+
+OutputPlan:SP1_Output \
+      Type="Output" \
+      UseEquationNestLevel=yes \
+      EquationNestLevel=2 \
+      UseSavedEquationNestLevel=yes \
+      SavedEquationNestLevel=2
+
+#load "python","LinearCollapse"
+Component Module="LinearCollapse" Type="ModelExtractor" NetworkRepresentation=2
+
+X=1.0
+f0=5.9 GHz
+Z0=50 Ohm
+W50=3.06 mm
+W70=1.62 mm
+Lq=7.04 mm
+L50=6.96 mm
+Riso=100 Ohm
+
+

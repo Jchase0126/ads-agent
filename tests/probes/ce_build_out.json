@@ -1,0 +1,353 @@
+{
+ "design": "BFR106_lib:CE_FM_Amp_AGENT:schematic",
+ "created_cell": false,
+ "recreate": true,
+ "layout": "auto",
+ "backup": {
+  "backed_up": true,
+  "path": "E:\\ADS\\Work_AI\\BFR106_wrk\\ads_agent_backups\\BFR106_lib__CE_FM_Amp_AGENT__20260930_012315",
+  "files": 2,
+  "note": ""
+ },
+ "placed": [
+  "INC1",
+  "PORT1",
+  "PORT2",
+  "CIN",
+  "LIN",
+  "CDCIN",
+  "Q1",
+  "CDCOUT",
+  "COUT",
+  "LOUT",
+  "LC",
+  "RD",
+  "R1",
+  "R2",
+  "RE1",
+  "CE",
+  "VCC",
+  "G1",
+  "G2",
+  "G3",
+  "G4",
+  "G5",
+  "G6",
+  "G7",
+  "SP1"
+ ],
+ "n_instances": 25,
+ "n_nets": 32,
+ "connections": [
+  {
+   "a": [
+    "PORT1",
+    "1"
+   ],
+   "b": [
+    "CIN",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__4"
+  },
+  {
+   "a": [
+    "PORT1",
+    "1"
+   ],
+   "b": [
+    "LIN",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__4"
+  },
+  {
+   "a": [
+    "CIN",
+    "2"
+   ],
+   "b": [
+    "G1",
+    "1"
+   ],
+   "status": "ok",
+   "net": "gnd!"
+  },
+  {
+   "a": [
+    "LIN",
+    "2"
+   ],
+   "b": [
+    "CDCIN",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__7"
+  },
+  {
+   "a": [
+    "CDCIN",
+    "2"
+   ],
+   "b": [
+    "Q1",
+    "2"
+   ],
+   "status": "ok",
+   "net": "N__24"
+  },
+  {
+   "a": [
+    "Q1",
+    "2"
+   ],
+   "b": [
+    "R1",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__24"
+  },
+  {
+   "a": [
+    "Q1",
+    "2"
+   ],
+   "b": [
+    "R2",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__24"
+  },
+  {
+   "a": [
+    "R2",
+    "2"
+   ],
+   "b": [
+    "G2",
+    "1"
+   ],
+   "status": "ok",
+   "net": "gnd!"
+  },
+  {
+   "a": [
+    "Q1",
+    "3"
+   ],
+   "b": [
+    "RE1",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__28"
+  },
+  {
+   "a": [
+    "RE1",
+    "2"
+   ],
+   "b": [
+    "G3",
+    "1"
+   ],
+   "status": "ok",
+   "net": "gnd!"
+  },
+  {
+   "a": [
+    "Q1",
+    "3"
+   ],
+   "b": [
+    "CE",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__28"
+  },
+  {
+   "a": [
+    "CE",
+    "2"
+   ],
+   "b": [
+    "G4",
+    "1"
+   ],
+   "status": "ok",
+   "net": "gnd!"
+  },
+  {
+   "a": [
+    "Q1",
+    "1"
+   ],
+   "b": [
+    "CDCOUT",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__17"
+  },
+  {
+   "a": [
+    "Q1",
+    "1"
+   ],
+   "b": [
+    "LC",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__17"
+  },
+  {
+   "a": [
+    "R1",
+    "2"
+   ],
+   "b": [
+    "VCC",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__29"
+  },
+  {
+   "a": [
+    "LC",
+    "2"
+   ],
+   "b": [
+    "VCC",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__29"
+  },
+  {
+   "a": [
+    "VCC",
+    "2"
+   ],
+   "b": [
+    "G5",
+    "1"
+   ],
+   "status": "ok",
+   "net": "gnd!"
+  },
+  {
+   "a": [
+    "CDCOUT",
+    "2"
+   ],
+   "b": [
+    "COUT",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__15"
+  },
+  {
+   "a": [
+    "CDCOUT",
+    "2"
+   ],
+   "b": [
+    "RD",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__15"
+  },
+  {
+   "a": [
+    "COUT",
+    "2"
+   ],
+   "b": [
+    "G6",
+    "1"
+   ],
+   "status": "ok",
+   "net": "gnd!"
+  },
+  {
+   "a": [
+    "RD",
+    "2"
+   ],
+   "b": [
+    "G7",
+    "1"
+   ],
+   "status": "ok",
+   "net": "gnd!"
+  },
+  {
+   "a": [
+    "CDCOUT",
+    "2"
+   ],
+   "b": [
+    "LOUT",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__15"
+  },
+  {
+   "a": [
+    "LOUT",
+    "2"
+   ],
+   "b": [
+    "PORT2",
+    "1"
+   ],
+   "status": "ok",
+   "net": "N__1"
+  }
+ ],
+ "netlist_equivalence": {
+  "ok": true,
+  "diffs": [],
+  "component_diffs": [],
+  "n_components": 16
+ },
+ "parameters_ok": true,
+ "geometry": {
+  "n_segments": 25,
+  "problems": [],
+  "warnings": [
+   "同一网络的两根导线共线重叠",
+   "同一网络的两根导线共线重叠",
+   "同一网络的两根导线共线重叠",
+   "同一网络的导线 T 形分支于 (8.75,0.5)（电气已显式绑定,图面正常）",
+   "同一网络的两根导线共线重叠",
+   "同一网络的导线 T 形分支于 (6.7,0)（电气已显式绑定,图面正常）",
+   "同一网络的两根导线共线重叠",
+   "同一网络的两根导线共线重叠",
+   "同一网络的两根导线共线重叠"
+  ],
+  "unverified": [],
+  "metrics": {
+   "total_wire_length": 27.825,
+   "detour_ratio": 1.1654,
+   "bends": 0,
+   "duplicate_segments": 0,
+   "parallel_exits": 0
+  }
+ },
+ "sim_readiness": {
+  "problems": [],
+  "warnings": []
+ }
+}
