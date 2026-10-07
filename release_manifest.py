@@ -88,6 +88,8 @@ OPTIONAL_ROOT_FILES = [
 DOCS_FILES = [
     "Layout 审查设计.md",
     "原理图建图与仿真经验总结.md",
+    "兼容性矩阵.md",
+    "版本证据报告.md",
 ]
 
 #: 放到包**根目录**的文档（源在 docs/ 下，平铺到根方便用户一眼看到）

@@ -12,7 +12,7 @@
 
 ## 安装
 
-1. 从 Releases 下载 `ADSAgent-1.0.1.zip` 并完整解压。
+1. 从 Releases 下载 `ADSAgent-1.1.0.zip` 并完整解压。1.1.0 为兼容性预发布版，ADS 2024–2026 未实机验证。
 2. 运行 `安装 ADS Agent.bat`。ADS 位于需要提升权限的目录时，按安装说明操作。
 3. 重启 ADS，在右侧面板的设置中填写 API 地址、密钥并选择模型。
 
@@ -67,7 +67,7 @@ python tests/run_tests.py
 python tools/build_release.py
 ```
 
-Python 3.12 用于 GitHub 离线 CI，UI 测试使用 offscreen 模式。
+Python 3.12 和 3.14 用于 GitHub 离线 CI，UI 测试使用 offscreen 模式。
 测试构建不需要 ADS，但真实建图、仿真和插件生命周期需要本地 ADS 实机验收。
 新增运行模块需同步 `release_manifest.py`；不要提交真实配置、会话、日志或仿真产物。
 

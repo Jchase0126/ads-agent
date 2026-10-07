@@ -18,6 +18,8 @@ ads_agent_backups/
 
 # ADS / 本地工具的运行现场
 *.cfg.bak
+/de_sim.cfg
+/hpeesofsim.cfg
 hpeesofsim/
 simulation/
 
