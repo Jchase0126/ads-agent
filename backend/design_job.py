@@ -25,6 +25,8 @@
 与 ``projects.json`` 里那条结果页记录通过 ``job_id`` 关联。
 """
 
+from __future__ import annotations
+
 import datetime
 import json
 import os

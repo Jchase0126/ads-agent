@@ -7,6 +7,8 @@ this module forwards named tool calls to it and returns JSON results.
 注意：令牌只放在请求头里，绝不写进日志或结果 —— 日志记的是工具名、参数和耗时。
 """
 
+from __future__ import annotations
+
 import json
 import time
 import urllib.error
@@ -23,12 +25,27 @@ log = adslog.get("backend.tools")
 # urllib 会连 127.0.0.1 的请求也发给代理，于是"工具服务明明在跑"却报连不上。
 _LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-#: 工具服务身份校验结果缓存：{url: (monotonic 时间, verdict)}。
+#: 工具服务身份校验结果缓存：{url: (monotonic 时间, verdict, /health 原始 payload)}。
 #: 每次工具调用都多打一个 /health 太浪费；但**不校验**就等于把带令牌的请求
 #: 发给了端口上碰巧坐着的任何程序。折中：每个 url 最多 30s 校验一次，
 #: 连接层面一出错立刻作废缓存（下次调用重新判定）。
-_TOOLSERVER_VERDICT: dict[str, tuple[float, dict]] = {}
+#: payload 一并缓存：compat 门禁快照与身份校验共用同一次探测。
+_TOOLSERVER_VERDICT: dict[str, tuple[float, dict, dict]] = {}
 _VERDICT_TTL = 30.0
+
+
+def _probe_cached(cfg: dict) -> tuple:
+    """一次 /health 探测，同时产出身份判定与原始 payload（带 TTL 缓存）。"""
+    url = ads_base_url(cfg)
+    now = time.monotonic()
+    cached = _TOOLSERVER_VERDICT.get(url)
+    if cached and now - cached[0] < _VERDICT_TTL:
+        return cached[1], cached[2]
+    probed = instance.probe(url, timeout=2.0)
+    verdict = instance.evaluate(probed, "toolserver")
+    payload = probed.get("payload") if isinstance(probed.get("payload"), dict) else {}
+    _TOOLSERVER_VERDICT[url] = (now, verdict, payload)
+    return verdict, payload
 
 
 def _verify_toolserver(cfg: dict) -> None:
@@ -39,13 +56,7 @@ def _verify_toolserver(cfg: dict) -> None:
     用户看到的是"无法连接 ADS 端工具服务"这种指向错误的提示。
     """
     url = ads_base_url(cfg)
-    now = time.monotonic()
-    cached = _TOOLSERVER_VERDICT.get(url)
-    if cached and now - cached[0] < _VERDICT_TTL:
-        verdict = cached[1]
-    else:
-        verdict = instance.evaluate(instance.probe(url, timeout=2.0), "toolserver")
-        _TOOLSERVER_VERDICT[url] = (now, verdict)
+    verdict, _payload = _probe_cached(cfg)
 
     if verdict.get("usable"):
         return
@@ -57,7 +68,7 @@ def _verify_toolserver(cfg: dict) -> None:
     if reason == "unreachable":
         raise AdsToolError(
             "无法连接 ADS 端工具服务 "
-            f"({url})。请确认：1) ADS 2027 已启动；2) 已安装并启用 ADS Agent 插件"
+            f"({url})。请确认：1) ADS 已启动；2) 已安装并启用 ADS Agent 插件"
             "（Tools > ADS Agent）；3) 面板打开过一次。"
         )
     if reason in ("foreign_install", "no_install_id"):
@@ -84,6 +95,82 @@ def _verify_toolserver(cfg: dict) -> None:
         f"{url} 上的服务无法确认是本次安装的 ADS Agent 工具服务"
         f"（{verdict.get('detail') or reason}）。为避免把指令发给错误的实例，已停止调用。"
     )
+
+
+# ---------------------------------------------------------------------------
+# 跨版本兼容门禁（后端侧）
+# ---------------------------------------------------------------------------
+# 门禁的**裁决点**在 ADS 端插件（addon/ads_agent/capability.py， pump 派发前）；
+# 这里的预检只是更快、更友好：不可用的工具直接不进 LLM 工具列表、调用前
+# 就报"为什么不可用"，而不是发到 ADS 端被拒再折返一轮。
+
+#: /health 里 compat 快照的缓存：{url: (monotonic, snapshot)}。
+_COMPAT_CACHE: dict[str, tuple[float, dict]] = {}
+_COMPAT_TTL = 60.0
+
+
+def compat_snapshot(cfg: dict) -> dict:
+    """取工具服务 /health 上报的兼容快照（版本 + 能力 + 门禁）。
+
+    ``{"available": False}`` 表示对端插件较旧、没有上报快照 —— 此时**不过滤**
+    工具列表（保持既有行为，裁决完全交给 ADS 端）。
+    """
+    url = ads_base_url(cfg)
+    now = time.monotonic()
+    cached = _COMPAT_CACHE.get(url)
+    if cached and now - cached[0] < _COMPAT_TTL:
+        return cached[1]
+    try:
+        _verdict, payload = _probe_cached(cfg)
+        snap = payload.get("compat") if isinstance(payload.get("compat"), dict) else {}
+    except Exception as e:  # noqa: BLE001 — 快照拿不到不阻塞工具调用
+        log.debug("compat 快照获取失败（不过滤工具列表）: %s: %s", type(e).__name__, e)
+        snap = {}
+    if not snap or snap.get("error"):
+        snap = {"available": False}
+    elif not snap.get("capabilities"):
+        snap = {"available": False}  # 旧版插件（<1.1.0）没有 compat 字段
+    else:
+        snap = dict(snap)
+        snap["available"] = True
+    _COMPAT_CACHE[url] = (now, snap)
+    return snap
+
+
+def tool_unavailable_reason(cfg: dict, name: str) -> str:
+    """该工具在当前 ADS 版本上不可用的原因；可用返回空串。"""
+    if is_local(name):
+        return ""
+    snap = compat_snapshot(cfg)
+    if not snap.get("available"):
+        return ""
+    tools_info = snap.get("tools") if isinstance(snap.get("tools"), dict) else {}
+    decision = tools_info.get(name)
+    if isinstance(decision, dict) and not decision.get("allowed", True):
+        return str(decision.get("reason") or "当前 ADS 版本不可用")
+    return ""
+
+
+def available_tools(cfg: dict) -> list:
+    """给 LLM 的工具列表：过滤掉当前 ADS 版本上不可用的工具。
+
+    过滤依据是 ADS 端上报的门禁结果（同一裁决点的镜像），不可用时原样
+    返回全量列表 —— 宁可让 ADS 端拒绝，也不能在这里凭空造一个列表。
+    """
+    snap = compat_snapshot(cfg)
+    if not snap.get("available"):
+        return TOOLS
+    tools_info = snap.get("tools") if isinstance(snap.get("tools"), dict) else {}
+    if not tools_info:
+        return TOOLS
+    out = []
+    for schema in TOOLS:
+        name = schema.get("function", {}).get("name")
+        decision = tools_info.get(name)
+        if isinstance(decision, dict) and not decision.get("allowed", True):
+            continue
+        out.append(schema)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +691,12 @@ def call(cfg: dict, name: str, args: dict, job_id: str = "") -> dict:
         raise AdsToolError(f"未知工具: {name}")
     # 派发前先确认对端身份：带令牌的请求不能发给"碰巧占了那个端口"的服务
     _verify_toolserver(cfg)
+    # 兼容门禁预检（裁决在 ADS 端；这里只是提前报出原因）：
+    # 不可用的工具不发请求 —— "未执行、未写入"是可承诺的最坏情况。
+    deny = tool_unavailable_reason(cfg, name)
+    if deny:
+        log.warning("拒绝 %s（兼容门禁）: %s", name, deny)
+        raise AdsToolError(f"工具 {name} 在当前 ADS 版本上不可用：{deny}")
     import uuid
     job_id = job_id or uuid.uuid4().hex
     url = ads_base_url(cfg) + "/execute"
@@ -666,7 +759,7 @@ def call(cfg: dict, name: str, args: dict, job_id: str = "") -> dict:
         log.error("<- %s  连接失败(%s): %s", name, _elapsed(), e.reason)
         raise AdsToolError(
             "无法连接 ADS 端工具服务 "
-            f"({url})。请确认：1) ADS 2027 已启动；2) 已安装并启用 ADS Agent 插件"
+            f"({url})。请确认：1) ADS 已启动；2) 已安装并启用 ADS Agent 插件"
             "（Tools > ADS Agent）；3) 面板打开过一次。"
         ) from e
     except TimeoutError as e:

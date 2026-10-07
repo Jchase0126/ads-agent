@@ -12,6 +12,8 @@ must never touch ``__file__``. The addon directory is resolved from
 same approach the shipping addons use.
 """
 
+from __future__ import annotations
+
 import os
 import re
 import sys
@@ -166,6 +168,14 @@ def setup_addon(addon) -> None:
         ok, detail = prepare_data()
         print(f"[ADS Agent] 数据准备{'完成' if ok else '失败'}：{detail}")
 
+        # 跨版本兼容：识别当前 ADS（buildInfo.xml），实验性版本打印明示横幅
+        try:
+            import capability
+
+            print(f"[ADS Agent] 兼容性: {capability.summarize()}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[ADS Agent] 版本识别失败（按未知版本保守处理）: {type(e).__name__}: {e}")
+
         # Auto-start the backend with ADS (hidden child, reused if already up)
         import backend_launcher
 
@@ -175,9 +185,9 @@ def setup_addon(addon) -> None:
 
         if _ui_setting("auto_open", "true").lower() in ("1", "true", "yes", "on"):
             delay = int(_ui_setting("auto_open_delay_ms", "3000") or 3000)
-            from PySide6.QtCore import QTimer
+            from qtcompat import QtCore
 
-            QTimer.singleShot(max(delay, 0), lambda: _auto_open(retries=15))
+            QtCore.QTimer.singleShot(max(delay, 0), lambda: _auto_open(retries=15))
     except Exception as e:  # noqa: BLE001 — never break ADS startup
         print(f"[ADS Agent] auto-open 未调度: {type(e).__name__}: {e}")
 
@@ -195,9 +205,9 @@ def _auto_open(retries: int) -> None:
         print("[ADS Agent] 面板已自动打开")
     except Exception as e:  # noqa: BLE001
         if retries > 0:
-            from PySide6.QtCore import QTimer
+            from qtcompat import QtCore
 
-            QTimer.singleShot(2000, lambda: _auto_open(retries - 1))
+            QtCore.QTimer.singleShot(2000, lambda: _auto_open(retries - 1))
         else:
             print(
                 f"[ADS Agent] 自动打开面板失败（可从 Tools > ADS Agent 菜单打开）: "
@@ -265,6 +275,13 @@ def generate_menu(addon, win_def) -> None:
                 None,
             )
         )
+        menu.add_action(
+            app.Action(
+                "兼容性状态…",
+                lambda action, window: _show_compat_status(),
+                None,
+            )
+        )
         tools_menu.add_menu(menu)
 
     # Arm the tool server + main-thread pump timer now (we are on the main
@@ -276,6 +293,63 @@ def generate_menu(addon, win_def) -> None:
     except Exception as e:  # noqa: BLE001 — never break ADS startup
         print(f"[ADS Agent] toolserver 未启动: {type(e).__name__}: {e}")
 
+    # 能力检测（只读）在主线程预热：/health 的 compat 快照能立刻可用，
+    # 后端第一次握手就能拿到版本与工具门禁，而不是拿到空快照。
+    try:
+        from qtcompat import QtCore
+
+        QtCore.QTimer.singleShot(0, _warmup_compat)
+    except Exception:  # noqa: BLE001 — Qt 不可用时门禁会在首次调用时兜底探测
+        pass
+
+
+def _warmup_compat() -> None:
+    """主线程预热能力快照（只读探测；失败不影响任何功能）。"""
+    try:
+        import capability
+
+        info = capability.snapshot()
+        print(f"[ADS Agent] 兼容性: {capability.summarize(info)}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[ADS Agent] 能力检测失败（工具调用时将再次尝试）: {type(e).__name__}: {e}")
+
+
+def _show_compat_status() -> None:
+    from qtcompat import QtWidgets
+
+    try:
+        import capability
+
+        snap = capability.snapshot()
+        lines = [_compat_status_text(snap)]
+    except Exception as e:  # noqa: BLE001
+        lines = [f"能力检测失败: {type(e).__name__}: {e}"]
+    QtWidgets.QMessageBox.information(None, "ADS Agent 兼容性状态",
+                                      "\n".join(lines))
+
+
+def _compat_status_text(snap: dict) -> str:
+    version = snap.get("ads_version") or {}
+    year = version.get("year")
+    known = version.get("status") == "known"
+    caps = snap.get("capabilities") or {}
+    rows = []
+    for name in sorted(caps):
+        entry = caps[name] or {}
+        mark = {"supported": "[OK]", "unavailable": "[不可用]", "unknown": "[未知]"}.get(
+            entry.get("status"), "[?]")
+        reason = entry.get("reason") or ""
+        rows.append(f"{mark} {name}" + (f" — {reason}" if reason else ""))
+    year_line = (f"ADS {year}" if year else "ADS 版本未识别（buildInfo.xml 解析失败）")
+    tag = ("已实机验证基线" if known and year == 2027
+           else ("实验性适配：已完成文档与离线验证，未实机验证" if known
+                 else "未知版本：仅只读能力，写操作默认禁用"))
+    return (f"{year_line}（Update={version.get('update') or '?'} "
+            f"build={version.get('build') or '?'}）\n"
+            f"适配状态：{tag}\n"
+            f"Python: {snap.get('python')} ({snap.get('python_bitness')} 位)\n\n"
+            + "\n".join(rows))
+
 
 def _open_panel() -> None:
     try:
@@ -284,9 +358,9 @@ def _open_panel() -> None:
 
         panel.open_panel()
     except Exception as e:  # noqa: BLE001
-        from PySide6.QtWidgets import QMessageBox
+        from qtcompat import QtWidgets
 
-        QMessageBox.critical(None, "ADS Agent", f"无法打开面板：\n{type(e).__name__}: {e}")
+        QtWidgets.QMessageBox.critical(None, "ADS Agent", f"无法打开面板：\n{type(e).__name__}: {e}")
 
 
 def _ensure_server() -> str:
@@ -297,8 +371,9 @@ def _ensure_server() -> str:
 
 
 def _show_server_status() -> None:
-    from PySide6.QtWidgets import QMessageBox
+    from qtcompat import QtWidgets
 
+    QMessageBox = QtWidgets.QMessageBox
     try:
         url = _ensure_server()
         import urllib.request

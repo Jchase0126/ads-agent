@@ -19,6 +19,8 @@
     label 显示前: text = to_plain(text)
 """
 
+from __future__ import annotations
+
 import re
 
 # 预编译（模块级，气泡逐条渲染时不用反复编译）

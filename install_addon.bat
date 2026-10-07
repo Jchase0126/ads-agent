@@ -62,7 +62,7 @@ if defined HPEESOF_DIR if exist "%HPEESOF_DIR%\tools\python\python.exe" (
 )
 
 rem 2c. 常见的默认安装位置
-for %%D in ("C:\Program Files\Keysight\ADS2027") do (
+for %%D in ("C:\Program Files\Keysight\ADS2027" "C:\Program Files\Keysight\ADS2026" "C:\Program Files\Keysight\ADS2025" "C:\Program Files\Keysight\ADS2024") do (
   if exist "%%~D\tools\python\python.exe" set "PY=%%~D\tools\python\python.exe" & goto :eof
 )
 

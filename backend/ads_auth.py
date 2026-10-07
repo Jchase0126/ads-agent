@@ -27,6 +27,8 @@ sys.path 上，所以不能 import 同目录的其它模块。
 安全约定：令牌绝不写入日志、异常消息或 HTTP 响应体；需要展示时只用 ``mask()``。
 """
 
+from __future__ import annotations
+
 import configparser
 import hmac
 import os

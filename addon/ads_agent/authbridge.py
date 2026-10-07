@@ -9,6 +9,8 @@ backend/tools.py 这类通用名带进 ADS 进程，可能遮蔽 ADS 自己的�
 后端和 ADS 端不会各自维护默认值而生成出两个不同的令牌。
 """
 
+from __future__ import annotations
+
 import importlib.util
 import os
 import sys

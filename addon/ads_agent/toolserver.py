@@ -18,6 +18,8 @@ Endpoints:
 会继续算作运行中，并额外带 ``timed_out`` 标记 —— 不谎报空闲。
 """
 
+from __future__ import annotations
+
 import configparser
 import datetime
 import itertools
@@ -42,9 +44,30 @@ def _identity() -> dict:
 
     拿不到共享模块时返回空 dict —— 对端会把"没有身份"当成无法确认归属，
     拒绝复用。**宁可报冲突，也不要闷头连错实例。**
+
+    身份里额外带 ``ads_year`` / ``ads_dir``（来自 buildInfo.xml 的权威识别）：
+    同一份插件安装被多个 ADS 版本共用时，对端据此区分"同版本多开"与
+    "跨版本实例冲突"，不会误连到另一个版本的工具服务上。
     """
     try:
-        return pathbridge.load_backend_module("instance.py", "instance").identity()
+        inst = pathbridge.load_backend_module("instance.py", "instance")
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        extra = {}
+        import capability
+
+        version = capability.snapshot().get("ads_version") or {}
+        if version.get("year") is not None:
+            extra["ads_year"] = int(version["year"])
+        extra["ads_build"] = str(version.get("build") or "")
+        hpeesof = (os.environ.get("HPEESOF_DIR") or "").strip().strip('"')
+        if hpeesof:
+            extra["ads_dir"] = os.path.normpath(hpeesof)
+    except Exception:  # noqa: BLE001 — 版本信息拿不到不影响身份本身
+        extra = {}
+    try:
+        return inst.identity(extra)
     except Exception:  # noqa: BLE001
         return {}
 
@@ -75,6 +98,38 @@ def _protocol_version() -> int:
         return int(pathbridge.load().PROTOCOL_VERSION)
     except Exception:  # noqa: BLE001
         return 1
+
+
+def _gate_tool(name: str) -> dict:
+    """单工具门禁决策（pump 主线程内调用；探测结果有缓存）。
+
+    门禁只在**真实 ADS 进程内**生效：运行时能力检测的事实依据（keysight
+    模块、Qt 绑定）只有在那里才存在。脱离 ADS 跑 toolserver 属于测试/开发
+    配置，handlers 本身会在触碰 keysight API 时自然失败，无需门禁兜底。
+    """
+    try:
+        import capability
+
+        snap = capability.snapshot()
+        if not snap.get("inside_ads"):
+            return {"allowed": True, "code": "",
+                    "reason": "非 ADS 进程（测试/开发模式），兼容门禁旁路"}
+        return capability.gate_tool(name)
+    except Exception as e:  # noqa: BLE001
+        # 门禁本身坏了 = 无法证明允许 → 保守拒绝（fail-closed）
+        return {"allowed": False, "code": "gate_error",
+                "reason": f"兼容门禁不可用，按保守策略拒绝: {type(e).__name__}: {e}"}
+
+
+def _compat_snapshot() -> dict:
+    """能力快照（/health 用）。探测失败时返回明确的 unavailable 结构。"""
+    try:
+        import capability
+
+        return capability.snapshot()
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "capabilities": {},
+                "ads_version": {"status": "unknown"}}
 
 
 def _register_instance(host: str, port: int) -> None:
@@ -128,6 +183,14 @@ def _bind_conflict_detail(host: str, port: int, err: Exception) -> str:
             f"{who} 已被**另一个 ADS 实例**的工具服务占用（pid={ident.get('pid')}）。"
             f"本版本仅支持单实例：请只保留一个 ADS 窗口，或换一个端口"
             f"（config.ini 的 [ads] port）后重启 ADS。"
+        )
+    if verdict.get("reason") == "cross_version_conflict":
+        mine = _identity().get("ads_year") or "未知"
+        return (
+            f"{who} 已被**另一个 ADS 版本**的工具服务占用（对方 ADS "
+            f"{ident.get('ads_year') or '版本未知'}，本实例 ADS {mine}）。"
+            f"同一份插件安装同时只能服务一个 ADS 版本：请先退出另一个 ADS，"
+            f"或给本版本换一个端口（config.ini 的 [ads] port）。"
         )
     if verdict.get("reason") in ("foreign_install", "no_install_id"):
         return (
@@ -588,6 +651,18 @@ def pump() -> None:
                 box["error"] = f"未知工具: {name}"
                 _log("WARN", f"{name} 未知工具")
             else:
+                # 跨版本门禁：版本证据 + 运行时能力共同裁决（见 capability.py）。
+                # 只在确认允许后才进入处理器 —— 不允许时"未执行、未写入"。
+                gate = _gate_tool(name)
+                if not gate.get("allowed"):
+                    box["error"] = (f"工具 {name} 在当前 ADS 版本上不可用"
+                                    f"[{gate.get('code') or 'denied'}]：{gate.get('reason')}")
+                    _log("WARN", f"{name} 被兼容门禁拒绝 [{gate.get('code')}]: "
+                                 f"{gate.get('reason')}")
+                    _job_end(jid)
+                    done.set()
+                    executed += 1
+                    continue
                 result = handler(args or {}, ctx)
                 if ctx.deferred:
                     # 主线程已释放，完成时由后台线程收尾；作业仍是"运行中"
@@ -666,6 +741,9 @@ class _Handler(BaseHTTPRequestHandler):
                 # 面板/后端据此识别"另一个 ADS Agent 安装的 toolserver 占着端口"
                 # 的情况，而不是连上去才发现令牌对不上。见 backend/instance.py
                 "identity": _identity(),
+                # 跨版本兼容快照：版本识别 + 能力检测 + 门禁后的工具可用性。
+                # 后端据此过滤工具列表、面板据此显示"未实机验证"横幅。
+                "compat": _compat_snapshot(),
             })
         else:
             self._json({"error": "not found"}, 404)
@@ -775,9 +853,9 @@ def ensure_started() -> str:
         _log("ERROR", f"初始化回环令牌失败: {type(e).__name__}: {e}")
 
     if _pump_timer is None:
-        from PySide6.QtCore import QTimer
+        from qtcompat import QtCore
 
-        _pump_timer = QTimer()
+        _pump_timer = QtCore.QTimer()
         _pump_timer.timeout.connect(pump)
         _pump_timer.start(50)  # ms
 

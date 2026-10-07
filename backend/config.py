@@ -10,6 +10,8 @@ Reads config.ini at the project root; environment variables override:
 后端和 ADS 端工具服务必须拿到同一个值（见该模块的说明）。
 """
 
+from __future__ import annotations
+
 import configparser
 import os
 import re
@@ -47,6 +49,14 @@ DEFAULTS = {
     # 把耗时仿真放到后台线程执行（不占用 ADS 主线程）。
     # 网表生成等必须访问 DE 数据库的步骤始终留在主线程；见 ads_ops.run_simulation。
     "sim_off_main_thread": True,
+    # ---- 跨版本兼容（config.ini [compat]）----
+    # 未知版本放行（默认 False = 保守拒绝写操作）
+    "compat_allow_unknown_version": False,
+    # ADS 2024–2026 为实验性适配：写/建图/仿真需按年份显式开启。
+    # **开启不代表验证通过**，界面仍会显示"未实机验证"。
+    "compat_experimental_2024": False,
+    "compat_experimental_2025": False,
+    "compat_experimental_2026": False,
 }
 
 
@@ -82,6 +92,10 @@ def load() -> dict:
     get("agent", "sim_timeout", "sim_timeout", gi)
     get("agent", "context_budget_chars", "context_budget_chars", gi)
     get_bool("agent", "sim_off_main_thread", "sim_off_main_thread")
+    get_bool("compat", "allow_unknown_version", "compat_allow_unknown_version")
+    get_bool("compat", "experimental_2024", "compat_experimental_2024")
+    get_bool("compat", "experimental_2025", "compat_experimental_2025")
+    get_bool("compat", "experimental_2026", "compat_experimental_2026")
 
     cfg["llm_api_key"] = os.environ.get("ADS_AGENT_API_KEY", cfg["llm_api_key"])
     cfg["llm_base_url"] = os.environ.get("ADS_AGENT_BASE_URL", cfg["llm_base_url"])

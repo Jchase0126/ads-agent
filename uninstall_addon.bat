@@ -49,7 +49,7 @@ if defined ADS_AGENT_PYTHON if exist "%ADS_AGENT_PYTHON%" set "PY=%ADS_AGENT_PYT
 if defined HPEESOF_DIR if exist "%HPEESOF_DIR%\tools\python\python.exe" (
   set "PY=%HPEESOF_DIR%\tools\python\python.exe" & goto :eof
 )
-for %%D in ("C:\Program Files\Keysight\ADS2027") do (
+for %%D in ("C:\Program Files\Keysight\ADS2027" "C:\Program Files\Keysight\ADS2026" "C:\Program Files\Keysight\ADS2025" "C:\Program Files\Keysight\ADS2024") do (
   if exist "%%~D\tools\python\python.exe" set "PY=%%~D\tools\python\python.exe" & goto :eof
 )
 where py >nul 2>nul && for /f "delims=" %%P in ('py -3 -c "import sys;print(sys.executable)" 2^>nul') do if exist "%%P" set "PY=%%P" & goto :eof

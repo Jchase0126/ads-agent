@@ -33,6 +33,8 @@ API surface verified against ADS 2027 (650) bundled docs/examples:
     这是历史上"看着连上了、仿真结果却是悬空"的根因。
 """
 
+from __future__ import annotations
+
 import datetime
 import importlib
 import math
@@ -5762,7 +5764,9 @@ def _activate_window(cell: str):
     由调用方如实告诉用户"请手动打开"。绝不因此报错。
     """
     try:
-        from PySide6.QtWidgets import QApplication
+        from qtcompat import QtWidgets
+
+        QApplication = QtWidgets.QApplication
 
         app = QApplication.instance()
         if app is None:

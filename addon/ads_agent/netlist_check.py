@@ -16,6 +16,8 @@
 引脚成员。
 """
 
+from __future__ import annotations
+
 import re
 
 # 网表行元件引脚顺序（与 generate_netlist 输出一致；缺省 1,2,..n）

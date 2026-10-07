@@ -15,6 +15,8 @@ pins / shapes），输出 findings 列表。每条 finding 的形状：
      "actual", "problem", "suggestion", "verification"}
 """
 
+from __future__ import annotations
+
 import math
 
 # ---------------------------------------------------------------------------

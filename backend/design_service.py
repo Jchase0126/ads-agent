@@ -16,6 +16,8 @@
 生成的网表与输出目录，job 进 failed —— **不清空任何已有产物**。
 """
 
+from __future__ import annotations
+
 import os
 import threading
 

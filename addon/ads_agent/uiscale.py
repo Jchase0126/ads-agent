@@ -17,6 +17,8 @@ panel.py 按"容器比例"计算，不写死像素；面板拖宽拖窄时布局
 放大。字号缩放只跟随"逻辑字号"（pt），与屏幕 DPI 无关。
 """
 
+from __future__ import annotations
+
 import configparser
 import os
 
@@ -85,9 +87,9 @@ def _ui_setting(key: str, default: str = "") -> str:
 def _system_point_size() -> float:
     """宿主默认字号的 pt 值（反映 Windows 文本缩放 / ADS 字体偏好）。"""
     try:
-        from PySide6.QtWidgets import QApplication
+        import qtcompat
 
-        app = QApplication.instance()
+        app = qtcompat.QtWidgets().QApplication.instance()
         if app is None:
             return _BASE_PT
         pt = app.font().pointSizeF()
@@ -152,9 +154,9 @@ def _available_families() -> set:
         return _cache["families"]
     families: set = set()
     try:
-        from PySide6.QtGui import QFontDatabase
+        import qtcompat
 
-        families = set(QFontDatabase.families())
+        families = set(qtcompat.font_families())
     except Exception:  # noqa: BLE001
         families = set()
     _cache["families"] = families
@@ -197,7 +199,9 @@ def mono_css() -> str:
 
 def qfont(token: str = "body", bold: bool = False):
     """构造一个 QFont（用于 QListWidget 等不走样式表字号的控件）。"""
-    from PySide6.QtGui import QFont
+    import qtcompat
+
+    QFont = qtcompat.QtGui().QFont
 
     font = QFont()
     font.setFamily(_pick(_UI_FONT_PREFERENCE, "Microsoft YaHei UI"))

@@ -10,6 +10,8 @@ The panel receives a stream of JSON events (SSE):
   error        — turn failed {message}
 """
 
+from __future__ import annotations
+
 import json
 import time
 import traceback
@@ -493,11 +495,60 @@ class Turn:
             "model": model or "",
         }
 
+    def _tool_schemas(self, call_cfg: dict) -> list:
+        """本回合可用的工具列表（按 ADS 端门禁过滤；拿不到就回全量）。"""
+        fn = getattr(tools_mod, "available_tools", None)
+        if callable(fn):
+            try:
+                schemas = fn(call_cfg)
+                if isinstance(schemas, list) and schemas:
+                    return schemas
+            except Exception as e:  # noqa: BLE001 — 过滤失败回退全量列表
+                log.debug("工具过滤失败，回退全量: %s: %s", type(e).__name__, e)
+        return TOOLS
+
+    def _system_prompt(self, call_cfg: dict) -> str:
+        """系统提示词 = 基线提示 + （非 2027 环境时的）兼容性附注。
+
+        基线提示里的 API 速查全部来自 2027 实机实测；其他版本上这些结论
+        不应被当作事实使用，所以必须由附注明确声明。
+        """
+        prompt = SYSTEM_PROMPT
+        try:
+            snap = tools_mod.compat_snapshot(call_cfg)
+        except Exception:  # noqa: BLE001 — 快照失败不阻塞对话
+            snap = {}
+        if not snap.get("available"):
+            return prompt
+        version = snap.get("ads_version") or {}
+        year = version.get("year")
+        status = version.get("status")
+        caps = snap.get("capabilities") or {}
+        binding = (caps.get("qt_binding") or {})
+        qt_line = f"Qt 绑定: {binding.get('reason') or binding.get('status')}"
+        if status == "known" and year == 2027:
+            return prompt
+        if status != "known" or not year:
+            return (prompt
+                    + "\n\n## 兼容性附注（重要）\n"
+                    + "当前 ADS 版本无法确认（buildInfo.xml 识别失败）。未配备份证据："
+                      "API 速查与实测结论按『参考』对待，不要当作已验证事实；"
+                      "写/建图/仿真类工具默认被禁用，若调用被拒请直接告知用户原因。\n")
+        return (prompt
+                + f"\n\n## 兼容性附注（ADS {year}，实验性）\n"
+                + f"当前环境是 ADS {year}（Update={version.get('update') or '?'} "
+                  f"build={version.get('build') or '?'}，{qt_line}）。"
+                  "该版本仅完成官方文档与离线验证，**未实机验证**：\n"
+                  "- 底部的 API 速查来自 ADS 2027 实机实测，在本版本上不保证成立；"
+                  "不确定的 API 先用 sig()/ls() 探测，不要直接照抄。\n"
+                  "- 被兼容门禁拒绝的工具请直接向用户说明原因，不要换写法绕过。\n"
+                  "- 引用任何『已实测』结论前先注明它来自 ADS 2027。\n")
+
     def run(self, emit):
         call_cfg = dict(self.cfg)
         if self.model:
             call_cfg["llm_model"] = self.model
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": self._system_prompt(call_cfg)}]
         messages += self.history
         warned = False
 
@@ -539,7 +590,7 @@ class Turn:
                     emit({"type": "content_delta", "text": delta})
 
                 msg, usage = llm.chat_stream(
-                    call_cfg, messages, tools=TOOLS,
+                    call_cfg, messages, tools=self._tool_schemas(call_cfg),
                     on_reasoning=self._reasoning_cb(emit, {"started": False}),
                     on_content=_on_content,
                 )

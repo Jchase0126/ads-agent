@@ -51,6 +51,8 @@
 数据范围，最后只能按量级猜）时判 ``unit_ambiguous``，不确认达标。
 """
 
+from __future__ import annotations
+
 import math
 
 from design_job import FREQ_UNITS, canonical_freq_unit, freq_scale

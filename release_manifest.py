@@ -33,6 +33,7 @@ ENTRY_LABELS = {
 
 #: 后端：LLM 对话循环 + 设计任务 + 本地服务。只用标准库。
 BACKEND_FILES = [
+    "adscompat.py",      # 跨版本兼容档案 + 门禁策略（版本/能力唯一事实来源）
     "adslocate.py",      # ADS 目录 / 解释器定位（安装器与启动器共用）
     "ads_auth.py",       # 回环令牌 + 配置文件唯一写入通道
     "adslog.py",         # 结构化文件日志
@@ -54,10 +55,12 @@ ADDON_FILES = [
     "ads_ops.py",        # 建图/改图/仿真的真实实现
     "authbridge.py",     # 按文件路径加载共享令牌模块
     "backend_launcher.py",  # 拉起并监护后端进程
+    "capability.py",     # 运行时能力检测 + 工具门禁（只读探测，三态）
     "mdplain.py",        # 面板用的极简 Markdown
     "netlist_check.py",  # 网表等价性核对
-    "panel.py",          # PySide6 聊天面板
+    "panel.py",          # 聊天面板（Qt 绑定经 qtcompat，PySide2/6 自适应）
     "pathbridge.py",     # 按文件路径加载共享路径模块
+    "qtcompat.py",       # Qt 绑定适配（PySide6/PySide2 二选一，绝不混用）
     "registration.py",   # 注册状态查询（ADS 进程内的官方 API）
     "project_store.py",  # 会话原子保存
     "result_page.py",    # 设计结果页

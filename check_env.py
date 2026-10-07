@@ -14,6 +14,8 @@
 6. 回归测试 —— 不需要 ADS 的那些
 """
 
+from __future__ import annotations
+
 import configparser
 import json
 import os
@@ -56,10 +58,11 @@ def _loopback_get(url, timeout=3):
 
 
 try:
+    import adscompat  # noqa: E402
     import adslocate  # noqa: E402
     import paths  # noqa: E402
 except Exception as e:  # noqa: BLE001
-    print(f"[FAIL] 无法加载共享模块 backend/paths.py / adslocate.py：{e}")
+    print(f"[FAIL] 无法加载共享模块 backend/paths.py / adslocate.py / adscompat.py：{e}")
     print("       请在**解压出来的完整安装包**里运行本脚本。")
     raise SystemExit(1)
 
@@ -84,22 +87,71 @@ check("可用解释器（优先 ADS 自带）", interpreter_check)
 
 def ads_dir_check():
     found = adslocate.detect_ads_dirs(scan=not QUICK)
-    targets = [i for i in found if i.get("info", {}).get("is_target")]
     if not found:
         raise RuntimeError(
             "没有探测到 ADS 安装。可用 python install_addon.py --ads-dir <目录> 指定。"
         )
-    best = targets[0] if targets else found[0]
-    if not targets:
+    best = found[0]
+    ver = adslocate.describe_version(best["dir"])
+    status = ver.get("status")
+    year = ver.get("year")
+    if status != "known":
         raise RuntimeError(
-            f"只找到 {best['dir']}（年份 {best['year'] or '?'}），没有找到 ADS "
-            f"{adslocate.TARGET_YEAR}。请用 install_addon.py --ads-dir 显式指定。"
+            f"未识别出版本（{best['dir']}）。插件将按未知版本保守降级"
+            f"（仅只读能力）。确认这是 ADS 2024–2027 的安装目录；"
+            f"卸载表里查不到时请核对安装是否完整。"
         )
-    return (f"{best['dir']}  来源={best['source']}  自带 Python="
-            f"{'有' if best['info']['python'] else '**没有**'}")
+    if year == 2027:
+        return (f"{best['dir']}  版本=2027（{ver.get('build') or 'DisplayVersion 未知'}）"
+                f"  适配状态=已实机验证基线  来源={best['source']}")
+    return (f"{best['dir']}  版本={year}"
+            f"{' Update ' + ver['update'] if ver.get('update') else ''}"
+            f"（{ver.get('build') or 'DisplayVersion 未知'}）"
+            f"  适配状态=实验性（未实机验证；写/建图/仿真需 [compat] "
+            f"experimental_{year} 显式开启）  来源={best['source']}")
 
 
-check(f"ADS {adslocate.TARGET_YEAR} 安装目录", ads_dir_check)
+check(f"ADS 安装目录（2024–2027，权威识别见下）", ads_dir_check)
+
+
+def arch_check():
+    arch = adscompat.arch_report()
+    if not arch["os_64bit"]:
+        raise RuntimeError(
+            f"32 位 Windows（{arch['machine']}）：ADS 2024–2027 官方仅提供 "
+            "64 位版本，不支持此环境。"
+        )
+    detail = (f"系统={arch['machine']}（64 位）  "
+              f"本进程 Python={arch['python_bitness']} 位")
+    if arch["python_bitness"] != 64:
+        detail += "（32 位启动器运行自检；ADS 自带解释器为 64 位，功能不受影响）"
+    return detail
+
+
+check("平台架构（Windows x64）", arch_check)
+
+
+def version_profile_check():
+    found = adslocate.detect_ads_dirs(scan=False)
+    if not found:
+        raise RuntimeError("未探测到 ADS 安装，无法核对版本档案")
+    ver = adslocate.describe_version(found[0]["dir"])
+    profile = adscompat.profile_for(ver.get("year"))
+    if profile is None:
+        raise RuntimeError(
+            f"ADS {ver.get('year') or '?'} 不在适配范围（2024–2027）。"
+            "插件会按未知版本保守降级。"
+        )
+    exp = [y for y in (2024, 2025, 2026) if y != 2027]
+    note = (f"ADS {ver['year']} 档案：Qt={profile['qt_binding']}  "
+            f"Python={profile['python_official'] or profile['python_measured'] or '官方未公开'}  "
+            f"状态={profile['status']}")
+    if profile["status"] == "experimental":
+        note += f"（写/建图/仿真需 [compat] experimental_{ver['year']} = true）"
+    return note
+
+
+check("版本适配档案", version_profile_check)
 
 
 # --------------------------------------------------------------------------

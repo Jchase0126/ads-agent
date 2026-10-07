@@ -12,6 +12,8 @@ that speaks the /chat/completions protocol with function calling.
 非流式相同的 message 结构；chat() 只是 chat_stream 的便捷封装。
 """
 
+from __future__ import annotations
+
 import json
 import time
 import urllib.error

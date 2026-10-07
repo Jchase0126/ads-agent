@@ -31,19 +31,27 @@ _SIGNATURE = ("config", "circuit", "tools")
 
 ADS_DIR_ENV = "HPEESOF_DIR"
 
-#: 本插件面向的 ADS 版本。其它年份不是不能用，但要明确提示（API 契约
-#: ``setup_addon`` / ``generate_menu`` 早在 2024 版就有了，跨版本并不必然坏，
-#: 不过只有 2027 是实测过的）。
+#: 首选 ADS 版本（唯一有实机回归基线的年份）。其它年份（2024–2026）也是
+#: 合法安装目标，但由 backend/adscompat.py 的档案与门禁按"实验性"处理；
+#: 未知版本一律保守降级。
 TARGET_YEAR = "2027"
 _YEAR_RE = re.compile(r"(20\d{2})")
 
+#: 官方支持平台表覆盖的版本年份（安装器/自检用它提示支持范围）
+SUPPORTED_YEARS = (2024, 2025, 2026, 2027)
+
 
 def detect_year(install_dir: str) -> str:
-    """从目录名 / buildInfo.xml 推断 ADS 年份；推断不出返回空串。"""
-    name = os.path.basename(os.path.normpath(install_dir or ""))
-    m = _YEAR_RE.search(name)
-    if m:
-        return m.group(1)
+    """识别 ADS 年份：**卸载表权威优先**（adscompat.detect_version），
+    目录名年份只作排序提示的最后兜底。识别不出返回空串。"""
+    try:
+        import adscompat
+
+        info = adscompat.detect_version(install_dir or "")
+        if info.get("year"):
+            return str(info["year"])
+    except Exception:  # noqa: BLE001 — 兼容档案不可用时退回保守路径
+        pass
     for candidate in ("buildInfo.xml", os.path.join("config", "buildInfo.xml")):
         path = os.path.join(install_dir or "", candidate)
         try:
@@ -54,6 +62,33 @@ def detect_year(install_dir: str) -> str:
         if m:
             return m.group(1)
     return ""
+
+
+def describe_version(install_dir: str) -> dict:
+    """完整版本描述（年份 + Update + 版本号 + 识别来源 + 弱证据标记），
+    供安装器与自检展示。"""
+    try:
+        import adscompat
+
+        info = adscompat.detect_version(install_dir or "")
+    except Exception as e:  # noqa: BLE001
+        info = {"year": None, "update": "", "build": "", "status": "unknown",
+                "source": None, "weak": False, "display_name": "",
+                "error": f"{type(e).__name__}: {e}"}
+    out = {
+        "year": info.get("year"),
+        "update": info.get("update") or "",
+        "build": info.get("build") or "",
+        "status": info.get("status") or "unknown",
+        "source": info.get("source"),
+        "weak": bool(info.get("weak")),
+        "display_name": info.get("display_name") or "",
+        "dir_hint": "",
+    }
+    m = _YEAR_RE.search(os.path.basename(os.path.normpath(install_dir or "")))
+    if m:
+        out["dir_hint"] = m.group(1)
+    return out
 
 
 def validate_ads_dir(path: str) -> dict:
@@ -95,6 +130,17 @@ def validate_ads_dir(path: str) -> dict:
         info["writable_tree"] = False
     info["year"] = detect_year(p)
     info["is_target"] = info["year"] == TARGET_YEAR
+    try:
+        import adscompat
+
+        ver = adscompat.detect_version(p)
+        info["update"] = ver.get("update") or ""
+        info["build"] = ver.get("build") or ""
+        info["version_status"] = ver.get("status") or "unknown"
+    except Exception:  # noqa: BLE001
+        info["update"] = ""
+        info["build"] = ""
+        info["version_status"] = "unknown"
     info["valid"] = bool(info["addons_xml_exists"])
     if not info["valid"]:
         info["reason"] = "没有 config\\eesof_addons.xml（不是 ADS 或安装不完整）"

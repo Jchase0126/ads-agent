@@ -1,5 +1,7 @@
 """项目会话的原子保存与备份恢复（不依赖 Qt）。"""
 
+from __future__ import annotations
+
 import json
 import os
 import secrets

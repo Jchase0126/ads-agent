@@ -4,6 +4,8 @@ Usage: python tools/export_source.py --out "D:\\Antenna\\ADS Agent GitHub"
 Existing destinations are refused. Continue development in the exported checkout.
 """
 
+from __future__ import annotations
+
 import argparse
 import shutil
 import sys

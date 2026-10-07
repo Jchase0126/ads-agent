@@ -26,6 +26,8 @@ LLM 只能提供设计与指标定义 —— 见 design_service 的说明。
 Run:  python backend/server.py
 """
 
+from __future__ import annotations
+
 import json
 import os
 import queue

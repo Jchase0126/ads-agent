@@ -15,6 +15,8 @@ Qt-free on purpose: usable from tests and from any thread.
 不会闷头连到一个说不清是谁的服务上（详见该模块的说明）。
 """
 
+from __future__ import annotations
+
 import configparser
 import os
 import subprocess

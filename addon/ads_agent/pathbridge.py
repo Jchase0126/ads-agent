@@ -8,6 +8,8 @@ ADS 插件的 ``sys.path`` 里是 addon 目录，``backend/`` 不在也不应该
 否则会出现"后端写日志到 A 处、面板读 B 处配置"这种查不出来的问题。
 """
 
+from __future__ import annotations
+
 import importlib.util
 import os
 import sys

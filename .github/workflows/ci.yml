@@ -2,7 +2,7 @@ name: Test and build
 
 on:
   push:
-    branches: [master]
+    branches: [master, compat/ads-2024-2027]
   pull_request:
   workflow_dispatch:
 
@@ -16,11 +16,20 @@ jobs:
     env:
       PYTHONUTF8: '1'
       QT_QPA_PLATFORM: offscreen
+    strategy:
+      fail-fast: false
+      matrix:
+        # 版本选择依据（docs/版本证据报告.md）：
+        #   3.12 —— ADS 2025 官方发行说明明示 "Python version 3.12 is included
+        #           in ADS installation"（官方证据）
+        #   3.14 —— ADS 2027 自带解释器实机核实为 3.14.6
+        # 不为 2024/2026 建立版本映射（官方未公开其 DE Python 版本号）。
+        python-version: ['3.12', '3.14']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
       - name: Install UI test dependency
         run: python -m pip install PySide6==6.8.3
       - name: Run offline regression tests
@@ -29,6 +38,6 @@ jobs:
         run: python tools/build_release.py
       - uses: actions/upload-artifact@v4
         with:
-          name: ADSAgent-test-build
+          name: ADSAgent-test-build-${{ matrix.python-version }}
           path: dist/ADSAgent-*.zip
           if-no-files-found: error

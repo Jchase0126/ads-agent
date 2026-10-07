@@ -60,6 +60,11 @@ CASES = [
     ("test_instance.py", "实例身份校验：不以外来服务当自己人 / 多开检测", "logic", False),
     ("test_tool_identity.py", "工具服务身份校验 / 端口冲突人话化 / 退出清登记", "logic", False),
     ("test_packaging.py", "打包白名单 / 不含密钥 / 解出来的包能独立运行", "logic", False),
+    # ---- 跨版本兼容（2026-10-07 新增）----
+    ("test_adscompat.py", "版本识别（注册表权威） / 官方档案 / 门禁矩阵 / 位数判定", "logic", False),
+    ("test_capability.py", "运行时能力检测：假 keysight 接口树 / 三态 / fail-closed", "logic", False),
+    ("test_qtcompat.py", "Qt 绑定适配：已加载优先 / 终身缓存 / Qt5-Qt6 shim", "logic", False),
+    ("test_install_multiversion.py", "多版本安装：分别注册 / 登记表 / 卸载隔离 / 中文空格路径", "logic", False),
     # ---------------- qt ----------------
     ("test_project_isolation.py", "项目会话隔离 / 如实报告仿真行为", "qt", True),
     ("test_design_isolation.py", "设计结果页：项目隔离与重启恢复", "qt", True),

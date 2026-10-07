@@ -15,6 +15,8 @@ All HTTP (backend + SSE) runs in QThread workers; the ADS main thread only
 paints widgets.
 """
 
+from __future__ import annotations
+
 import configparser
 import json
 import os
@@ -23,30 +25,43 @@ import time
 import urllib.error
 import urllib.request
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject, QRect, QSize
-from PySide6.QtWidgets import (
-    QApplication,
-    QAbstractItemView,
-    QCheckBox,
-    QComboBox,
-    QDockWidget,
-    QFileDialog,
-    QFormLayout,
-    QFrame,
-    QGridLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QPlainTextEdit,
-    QPushButton,
-    QSizePolicy,
-    QToolButton,
-    QVBoxLayout,
-    QWidget,
-)
+# Qt 绑定经 qtcompat 选择（ADS 2024/2025 为 PySide2，2026 起为 PySide6，
+# 官方证据见 backend/adscompat.py）；跟随宿主进程已加载的绑定，绝不混用。
+import qtcompat
+
+QtCore = qtcompat.QtCore()
+QtGui = qtcompat.QtGui()
+QtWidgets = qtcompat.QtWidgets()
+
+Qt = QtCore.Qt
+QThread = QtCore.QThread
+Signal = QtCore.Signal
+QTimer = QtCore.QTimer
+QObject = QtCore.QObject
+QRect = QtCore.QRect
+QSize = QtCore.QSize
+
+QApplication = QtWidgets.QApplication
+QAbstractItemView = QtWidgets.QAbstractItemView
+QCheckBox = QtWidgets.QCheckBox
+QComboBox = QtWidgets.QComboBox
+QDockWidget = QtWidgets.QDockWidget
+QFileDialog = QtWidgets.QFileDialog
+QFormLayout = QtWidgets.QFormLayout
+QFrame = QtWidgets.QFrame
+QGridLayout = QtWidgets.QGridLayout
+QHBoxLayout = QtWidgets.QHBoxLayout
+QLabel = QtWidgets.QLabel
+QLineEdit = QtWidgets.QLineEdit
+QListWidget = QtWidgets.QListWidget
+QListWidgetItem = QtWidgets.QListWidgetItem
+QMainWindow = QtWidgets.QMainWindow
+QPlainTextEdit = QtWidgets.QPlainTextEdit
+QPushButton = QtWidgets.QPushButton
+QSizePolicy = QtWidgets.QSizePolicy
+QToolButton = QtWidgets.QToolButton
+QVBoxLayout = QtWidgets.QVBoxLayout
+QWidget = QtWidgets.QWidget
 
 import uiscale as U
 import project_store
@@ -133,8 +148,14 @@ def _draw_icon(name: str, color: str, size: int = 16):
 
     文字符号（✂ ⧉ ▤ 🧹）在不同系统字体下粗细/缺字都不一致，改用手绘路径。
     """
-    from PySide6.QtCore import QPointF, QRectF, Qt
-    from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+    QPointF = QtCore.QPointF
+    QRectF = QtCore.QRectF
+    QColor = QtGui.QColor
+    QIcon = QtGui.QIcon
+    QPainter = QtGui.QPainter
+    QPainterPath = QtGui.QPainterPath
+    QPen = QtGui.QPen
+    QPixmap = QtGui.QPixmap
 
     pm = QPixmap(size * 2, size * 2)
     pm.setDevicePixelRatio(2)
@@ -546,7 +567,8 @@ def _measure_text(text: str, font, text_w: int) -> tuple:
     if hit is not None:
         return hit
 
-    from PySide6.QtGui import QTextDocument, QTextOption
+    QTextDocument = QtGui.QTextDocument
+    QTextOption = QtGui.QTextOption
 
     doc = QTextDocument()
     doc.setDefaultFont(font)
@@ -581,7 +603,7 @@ def _soft_break_text(text: str, font, content_w: int) -> str:
     """
     import re
 
-    from PySide6.QtGui import QFontMetrics
+    QFontMetrics = QtGui.QFontMetrics
 
     fm = QFontMetrics(font)
     limit = max(content_w, 1)
@@ -930,8 +952,10 @@ class _VerticalTabButton(QPushButton):
         return QSize(U.px(30), U.px(160))
 
     def paintEvent(self, event):  # noqa: N802 — 默认横排文字会被窄宽度裁掉
-        from PySide6.QtGui import QPainter, QPalette
-        from PySide6.QtWidgets import QStyle, QStyleOptionButton
+        QPainter = QtGui.QPainter
+        QPalette = QtGui.QPalette
+        QStyle = QtWidgets.QStyle
+        QStyleOptionButton = QtWidgets.QStyleOptionButton
 
         opt = QStyleOptionButton()
         self.initStyleOption(opt)
@@ -1459,7 +1483,7 @@ class AgentPanelWidget(QWidget):
             self.status.setText(f"已切换到项目：{name}")
 
     def _new_project(self):
-        from PySide6.QtWidgets import QInputDialog
+        QInputDialog = QtWidgets.QInputDialog
 
         name, ok = QInputDialog.getText(self, "新建项目", "项目名称：")
         name = (name or "").strip()
@@ -2150,7 +2174,7 @@ class AgentPanelWidget(QWidget):
         self.status.setText("会话已清空")
 
     def eventFilter(self, obj, event):  # noqa: N802 — Enter-to-send
-        from PySide6.QtCore import QEvent
+        QEvent = QtCore.QEvent
 
         if obj is self.input and event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
@@ -2712,6 +2736,23 @@ def _expand_panel() -> None:
         _handle.setVisible(False)
 
 
+def _compat_title_suffix() -> str:
+    """实验性 / 未知版本时给窗口标题加的后缀 —— 开启≠验证通过，必须可见。"""
+    try:
+        import capability
+
+        snap = capability.snapshot()
+        version = snap.get("ads_version") or {}
+        year = version.get("year")
+        if version.get("status") == "known" and year in (2024, 2025, 2026):
+            return f"（实验性 · ADS {year} 未实机验证）"
+        if version.get("status") != "known":
+            return "（实验性 · ADS 版本未识别）"
+    except Exception:  # noqa: BLE001 — 横幅拿不到不影响面板本身
+        pass
+    return ""
+
+
 def open_panel():
     """Show (and dock on first use) the agent panel inside the ADS main window."""
     global _panel, _handle, _handle_tab
@@ -2723,13 +2764,22 @@ def open_panel():
         _expand_panel()
         return _panel
 
-    from keysight.ads.de.app import window as app_window
+    # main_pyside_widget 是 2027 实测接口；2024/2025 上可能不存在或行为不同。
+    # 获取失败时退化为独立窗口，**不能**让整个面板打开动作崩溃。
+    try:
+        from keysight.ads.de.app import window as app_window
+
+        main_win = app_window.main_pyside_widget()
+    except Exception as e:  # noqa: BLE001
+        print(f"[ADS Agent] 未获取到 ADS 主窗口（{type(e).__name__}: {e}），"
+              "面板将使用独立窗口模式")
+        main_win = None
 
     panel_widget = AgentPanelWidget()
-    main_win = app_window.main_pyside_widget()
+    title = DOCK_TITLE + _compat_title_suffix()
 
     if isinstance(main_win, QMainWindow):
-        dock = QDockWidget(DOCK_TITLE, main_win)
+        dock = QDockWidget(title, main_win)
         dock.setObjectName(DOCK_OBJECT_NAME)
         dock.setWidget(panel_widget)
         dock.setFeatures(
@@ -2769,7 +2819,7 @@ def open_panel():
     else:
         # fallback: standalone window (main window not found)
         win = QMainWindow()
-        win.setWindowTitle(DOCK_TITLE)
+        win.setWindowTitle(title)
         win.setCentralWidget(panel_widget)
         win.resize(U.px(470), U.px(740))
         win.show()

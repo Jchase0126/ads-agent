@@ -15,23 +15,40 @@
 依赖就多一层装不上的风险；曲线用 QPainter 自绘，离线平台（offscreen）也能测。
 """
 
-from PySide6.QtCore import Qt, QRect, QSize, QPointF
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QPolygonF
-from PySide6.QtWidgets import (
-    QComboBox,
-    QDialog,
-    QFrame,
-    QGridLayout,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
-)
+from __future__ import annotations
+
+# Qt 绑定经 qtcompat 选择（2024/2025=PySide2，2026+=PySide6），见 qtcompat.py
+import qtcompat
+
+QtCore = qtcompat.QtCore()
+QtGui = qtcompat.QtGui()
+QtWidgets = qtcompat.QtWidgets()
+
+Qt = QtCore.Qt
+QRect = QtCore.QRect
+QSize = QtCore.QSize
+QPointF = QtCore.QPointF
+
+QColor = QtGui.QColor
+QFont = QtGui.QFont
+QPainter = QtGui.QPainter
+QPen = QtGui.QPen
+QBrush = QtGui.QBrush
+QPolygonF = QtGui.QPolygonF
+
+QComboBox = QtWidgets.QComboBox
+QDialog = QtWidgets.QDialog
+QFrame = QtWidgets.QFrame
+QGridLayout = QtWidgets.QGridLayout
+QHBoxLayout = QtWidgets.QHBoxLayout
+QLabel = QtWidgets.QLabel
+QPushButton = QtWidgets.QPushButton
+QScrollArea = QtWidgets.QScrollArea
+QSizePolicy = QtWidgets.QSizePolicy
+QTableWidget = QtWidgets.QTableWidget
+QTableWidgetItem = QtWidgets.QTableWidgetItem
+QVBoxLayout = QtWidgets.QVBoxLayout
+QWidget = QtWidgets.QWidget
 
 import uiscale as U
 
@@ -413,7 +430,7 @@ class PointsDialog(QDialog):
 
     def _copy(self):
         """把当前曲线的数据点复制成 CSV（可直接粘到 Excel 或写进报告）。"""
-        from PySide6.QtWidgets import QApplication
+        QApplication = QtWidgets.QApplication
 
         name = self.picker.currentData()
         t = self._traces.get(name) or {}

@@ -44,7 +44,7 @@ import uuid
 # ---------------------------------------------------------------------------
 
 #: 插件发布版本（打进 ZIP 包名、卸载提示、/health 身份里）
-PLUGIN_VERSION = "1.0.1"
+PLUGIN_VERSION = "1.1.0"
 
 #: 数据格式版本。仅当 data_root 下的数据结构发生**不兼容**变化时递增，
 #: 用于升级时判断要不要做转换。**不是**插件版本。
@@ -110,10 +110,29 @@ def _local_app_data() -> str:
 
 
 def installed_app_root() -> str:
-    """安装布局下的默认程序根目录（不是系统的 Program Files，无需管理员）。"""
+    """安装布局下的默认程序根目录（不是系统的 Program Files，无需管理员）。
+
+    兼容 1.0.x 的共享根目录；多版本安装（1.1.0 起）请用
+    :func:`installed_app_root_for`，按 ADS 年份隔离程序文件。
+    """
     if os.name == "nt":
         return os.path.join(_local_app_data(), "Programs", WINDOWS_APP_DIRNAME)
     return os.path.join(_local_app_data(), "ads-agent")
+
+
+def installed_app_root_for(ads_year) -> str:
+    """某个 ADS 版本专用的程序根目录（``.../Programs/ADSAgent/ADS2027``）。
+
+    为什么按版本隔离：不同 ADS 版本可以各装一份插件程序（各自注册、各自
+    升级/卸载，互不覆盖）；用户数据（会话/配置/设计任务）仍然**共享**同一
+    个数据根目录 —— 升级不丢数据的前提。``ads_year`` 为空时退回共享根
+    （兼容旧布局与旧测试）。
+    """
+    base = installed_app_root()
+    year = str(ads_year or "").strip()
+    if not year:
+        return base
+    return os.path.join(base, f"ADS{year}")
 
 
 def default_data_root() -> str:
@@ -459,6 +478,62 @@ def save_install_state(**fields) -> dict:
                 pass
             raise
         return dict(state)
+
+
+def _norm_install_key(ads_dir: str) -> str:
+    return os.path.normcase(os.path.normpath(ads_dir or ""))
+
+
+def record_ads_install(ads_dir: str, year=None, update: str = "", build: str = "",
+                       program_dir: str = "", registered_at: str = "") -> dict:
+    """把一次安装登记进 ``install_state.json`` 的 ``ads_installs`` 表。
+
+    键是 ADS 安装目录（normcase），值含版本识别结果（来自 buildInfo.xml）与
+    本插件的程序目录 —— 多个 ADS 版本各占一条，**互不覆盖**。1.0.x 的旧
+    单值字段 ``ads_dir`` 在首次写入时迁移进表里（原字段保留只读兼容）。
+    """
+    key = _norm_install_key(ads_dir)
+    if not key:
+        return load_install_state()
+    state = load_install_state()
+    installs = state.get("ads_installs")
+    if not isinstance(installs, dict):
+        installs = {}
+        legacy = state.get("ads_dir")
+        if legacy:
+            installs[_norm_install_key(str(legacy))] = {
+                "ads_dir": str(legacy),
+                "migrated_from": "ads_dir",
+            }
+    entry = dict(installs.get(key) or {})
+    entry.update({
+        "ads_dir": os.path.normpath(ads_dir),
+        "year": int(year) if year else entry.get("year"),
+        "update": update or entry.get("update") or "",
+        "build": build or entry.get("build") or "",
+        "program_dir": program_dir or entry.get("program_dir") or "",
+        "registered_at": registered_at or _now(),
+    })
+    installs[key] = entry
+    return save_install_state(ads_installs=installs)
+
+
+def remove_ads_install(ads_dir: str) -> dict:
+    """从登记表里移除一个 ADS 版本的记录（卸载用）。"""
+    key = _norm_install_key(ads_dir)
+    state = load_install_state()
+    installs = state.get("ads_installs")
+    if isinstance(installs, dict) and key in installs:
+        installs.pop(key)
+        return save_install_state(ads_installs=installs)
+    return state
+
+
+def ads_installs() -> dict:
+    """全部已登记的 ADS 安装（键：normcase 目录）。"""
+    state = load_install_state()
+    installs = state.get("ads_installs")
+    return installs if isinstance(installs, dict) else {}
 
 
 def touch_install_state(**fields) -> dict:
