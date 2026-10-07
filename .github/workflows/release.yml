@@ -1,0 +1,49 @@
+name: Build release draft
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify tag matches plugin version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python -c "import os, sys; sys.path.insert(0, 'backend'); import paths; assert os.environ['RELEASE_TAG'] == 'v' + paths.PLUGIN_VERSION, 'Tag does not match PLUGIN_VERSION'"
+      - name: Install UI test dependency
+        run: python -m pip install PySide6==6.8.3
+      - name: Run offline regression tests
+        run: python tests/run_tests.py
+      - name: Build distribution and checksum
+        run: |
+          python tools/build_release.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $package = @(Get-ChildItem dist/ADSAgent-*.zip)
+          if ($package.Count -ne 1) { throw 'Expected exactly one package' }
+          $digest = (Get-FileHash -LiteralPath $package[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'dist/SHA256SUMS.txt'), "$digest  $($package[0].Name)`n", [System.Text.UTF8Encoding]::new($false))
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $notes = "docs/releases/$version.md"
+          if (-not (Test-Path -LiteralPath $notes)) { throw "Missing release notes: $notes" }
+          gh release create $env:RELEASE_TAG "dist/ADSAgent-$version.zip" dist/SHA256SUMS.txt --verify-tag --draft --title "ADS Agent $env:RELEASE_TAG" --notes-file $notes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
