@@ -1,0 +1,44 @@
+# ---- 运行期生成 / 会话数据（绝不入库）----
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 令牌与密钥在这里（config.example.ini 是入库的模板）
+config.ini
+
+# 日志 / 任务数据 / 仿真产物 / 会话数据
+logs/
+logs*.log
+design_jobs/
+projects.json
+projects.json.bak
+ads_agent_sim/
+ads_agent_backups/
+
+# ADS / 本地工具的运行现场
+*.cfg.bak
+hpeesofsim/
+simulation/
+
+# 工作区元数据与本地助手缓存
+.workbuddy/
+.workbuddy-ai/
+.zcode/
+
+# 生成的截图与预览（验收截图按需手动放入 docs/）
+tests/preview/
+
+# ADS 内部文件
+*_hpeesofsim*
+netlist.log
+dbo/
+
+# 发布产物只上传 GitHub Releases，不提交到源码仓库
+dist/
+build/
+
+# 本地任务笔记
+/task_plan.md
+/findings.md
+/progress.md
