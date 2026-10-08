@@ -19,6 +19,7 @@ from __future__ import annotations
 import configparser
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -993,6 +994,24 @@ class ChipButton(QPushButton):
         return QSize(U.px(60), s.height())
 
 
+class StatusSource(QLabel):
+    changed = Signal()
+
+    def setText(self, text):
+        super().setText(text)
+        self.changed.emit()
+
+
+class ElidedStatusLabel(QLabel):
+    def setText(self, text):
+        self._full_text = text
+        super().setText(self.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, self.width()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setText(getattr(self, '_full_text', ''))
+
+
 class FeedbackLabel(QLabel):
     """Keep empty request feedback out of the form's layout."""
     def __init__(self, text='', parent=None):
@@ -1225,9 +1244,10 @@ class AgentPanelWidget(QWidget):
         self.chat = ChatList()
         right.addWidget(self.chat, 1)
 
-        self.status = QLabel("就绪")
-        self.status.setWordWrap(True)
-        right.addWidget(self.status)
+        self.status = StatusSource("就绪", self)
+        self.status.hide()
+        self._run_error = ""
+        self._run_error_project = None
         body.addWidget(self.chat_column, 1)
         conversation_layout.addLayout(body, 1)
 
@@ -1237,6 +1257,28 @@ class AgentPanelWidget(QWidget):
         frame_layout = QVBoxLayout(self.input_frame)
         frame_layout.setContentsMargins(U.P("lg"), U.P("md"), U.P("md"), U.P("md"))
         frame_layout.setSpacing(U.P("xs"))
+
+        self.run_status_row = QWidget()
+        status_layout = QHBoxLayout(self.run_status_row)
+        status_layout.setContentsMargins(U.px(3), 0, U.px(3), U.px(4))
+        status_layout.setSpacing(U.px(8))
+        self.run_status_dot = QLabel("●")
+        self.run_status_dot.setFixedWidth(U.px(12))
+        status_layout.addWidget(self.run_status_dot)
+        self.run_status_text = ElidedStatusLabel()
+        self.run_status_text.setMinimumWidth(0)
+        self.run_status_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        status_layout.addWidget(self.run_status_text, 1)
+        self.run_stop_btn = QToolButton()
+        self.run_stop_btn.setText("停止")
+        self.run_stop_btn.setAccessibleName("停止本轮回复")
+        self.run_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.run_stop_btn.setFixedWidth(U.px(48))
+        self.run_stop_btn.clicked.connect(self._stop_run)
+        status_layout.addWidget(self.run_stop_btn)
+        frame_layout.addWidget(self.run_status_row)
+        self.run_status_row.hide()
+        self.status.changed.connect(self._sync_composer_status)
 
         self.input = QPlainTextEdit()
         self.input.setPlaceholderText("描述你的设计问题…")
@@ -1292,9 +1334,6 @@ class AgentPanelWidget(QWidget):
         foot.addWidget(self.send)
         frame_layout.addLayout(foot)
         right.addWidget(self.input_frame)
-        self.compose_hint = QLabel("Enter 发送 · Shift+Enter 换行")
-        self.compose_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        right.addWidget(self.compose_hint)
 
         # settings box is created after theme so widgets exist for styling
         self._build_settings()
@@ -1718,7 +1757,7 @@ class AgentPanelWidget(QWidget):
         self.proj_del_btn.setStyleSheet(_button_css(pal, 'ghost'))
         self.project_undo.setStyleSheet(_button_css(pal, 'soft'))
         self.project_search.setStyleSheet(_lineedit_css(pal))
-        for hint in (self.active_project_label, self.compose_hint):
+        for hint in (self.active_project_label,):
             hint.setStyleSheet(f"color:{pal['subtle']};font-size:{U.fs('tiny')}px;background:transparent;")
         self.logo.setStyleSheet(
             f"background:{pal['accent']};"
@@ -1755,10 +1794,10 @@ class AgentPanelWidget(QWidget):
             " font-weight:bold;}"
             f"QToolButton:hover{{background:{pal['accent_hover']};}}"
             f"QToolButton:disabled{{background:{pal['card_border']}; color:{pal['subtle']};}}"
-            # 运行中切换成红色停止键：属性选择器 + _set_run_state() 里的
+            # 运行中发送键显示中性禁用态：属性选择器 + _set_run_state() 里的
             # unpolish/polish 触发重算，主题重刷也不会把运行态样式冲掉
-            f"QToolButton[busy=\"true\"]{{background:{pal['stop_bg']};}}"
-            f"QToolButton[busy=\"true\"]:hover{{background:{pal['stop_bg_hover']};}}"
+            f"QToolButton[busy=\"true\"]{{background:{pal['hover']};}}"
+            f"QToolButton[busy=\"true\"]:hover{{background:{pal['hover']};}}"
         )
         # 矢量线条图标按主题着色（深/浅切换时重画）
         for button in (self.cut_btn, self.copy_btn, self.paste_btn, self.clear_btn):
@@ -1780,6 +1819,14 @@ class AgentPanelWidget(QWidget):
             f"color:{pal['subtle']}; font-size:{U.fs('tiny')}px;"
             "background:transparent;" + base
         )
+        self.run_status_text.setStyleSheet(
+            f"color:{pal['subtle']};font-size:{U.fs('small')}px;background:transparent;{base}")
+        self.run_status_dot.setStyleSheet(
+            f"color:{pal['accent']};font-size:{U.fs('micro')}px;background:transparent;")
+        self.run_stop_btn.setStyleSheet(
+            f"QToolButton{{color:{pal['subtle']};background:transparent;border:none;"
+            f"padding:{U.px(4)}px;border-radius:{U.R('xs')}px;{base}}}"
+            f"QToolButton:hover{{color:{pal['error']};background:{pal['hover']};}}")
         for button, name in ((self.side_btn, "menu"), (self.settings_btn, "sliders"),
                              (self.settings_close, "back"),
                              (self.theme_btn, "sun" if self.dark else "moon"), (self.key_eye, "eye")):
@@ -1799,9 +1846,10 @@ class AgentPanelWidget(QWidget):
         self.settings_close.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.settings_close.setFixedWidth(U.px(112))
         self.model_shortcut.setStyleSheet(
-            f"QPushButton{{background:{pal['card_bg']};color:{pal['subtle']};border:none;"
+            f"QPushButton{{background:{pal['input_bg']};color:{pal['text']};border:1px solid transparent;"
             f"border-radius:{U.R('sm')}px;padding:{U.px(6)}px {U.px(10)}px;font-size:{U.fs('small')}px;{base}}}"
-            f"QPushButton:hover{{background:{pal['accent_soft']};color:{pal['accent']};}}")
+            f"QPushButton:hover,QPushButton:pressed{{background:{pal['accent_soft']};color:{pal['accent']};}}"
+            f"QPushButton:focus{{border-color:{pal['accent']};}}")
         self.model_shortcut.setIcon(_draw_icon('chevron_up', pal['subtle']))
         self._style_settings(pal)
         _restyle_handle(pal)
@@ -2408,13 +2456,33 @@ class AgentPanelWidget(QWidget):
 
     def _build_input_model_menu(self):
         menu = QMenu(self.model_shortcut)
+        menu.setObjectName('inputModelMenu')
+        menu.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        menu.setFont(U.qfont('small'))
+        menu.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        menu.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        menu.setMinimumWidth(max(U.px(220), self.model_shortcut.width()))
         pal = self._pal()
+        check = U.icon_path('check', pal['accent'])
         menu.setStyleSheet(
-            f"QMenu{{background:{pal['card_bg']};color:{pal['text']};border:1px solid {pal['card_border']};"
-            f"padding:{U.px(6)}px;border-radius:{U.R('md')}px;menu-scrollable:1;{U.font_css()}}}"
-            f"QMenu::item{{padding:{U.px(9)}px {U.px(22)}px;border-radius:{U.R('sm')}px;}}"
-            f"QMenu::item:selected{{background:{pal['hover']};}}")
-        menu.addSection(self._provider_names.get(self._active_model, '当前供应商'))
+            f"QMenu#inputModelMenu{{background:{pal['input_bg']};color:{pal['text']};"
+            f"border:1px solid {pal['input_border']};padding:{U.px(6)}px;"
+            f"border-radius:{U.R('md')}px;menu-scrollable:1;{U.font_css()}}}"
+            f"QMenu#inputModelMenu::item{{background:transparent;color:{pal['text']};"
+            f"padding:{U.px(9)}px {U.px(18)}px;border-radius:{U.R('sm')}px;}}"
+            f"QMenu#inputModelMenu::item:checked{{background:{pal['accent_soft']};color:{pal['accent']};}}"
+            f"QMenu#inputModelMenu::item:selected{{background:{pal['accent_soft']};color:{pal['accent']};}}"
+            f"QMenu#inputModelMenu::item:disabled{{background:transparent;color:{pal['subtle']};"
+            f"padding:{U.px(5)}px {U.px(18)}px;}}"
+            f"QMenu#inputModelMenu::indicator{{width:{U.px(14)}px;height:{U.px(14)}px;}}"
+            f"QMenu#inputModelMenu::indicator:unchecked{{image:none;}}"
+            f'QMenu#inputModelMenu::indicator:checked{{image:url("{check}");}}'
+            f"QMenu#inputModelMenu::separator{{height:1px;background:{pal['input_border']};"
+            f"margin:{U.px(6)}px {U.px(10)}px;}}")
+        heading = menu.addAction(self._provider_names.get(self._active_model, '当前供应商'))
+        heading.setEnabled(False)
+        heading.setFont(U.qfont('tiny'))
         for model in self._provider_models_for(self._active_model):
             action = menu.addAction(model)
             action.setData(model)
@@ -2914,8 +2982,10 @@ class AgentPanelWidget(QWidget):
         self._worker.failed.connect(lambda msg, p=project: self._on_failed(msg, p))
         self._worker.finished.connect(lambda p=project: self._on_worker_done(p))
         self._worker.start()
+        self._run_error = ""
+        self._run_error_project = None
         self._set_run_state(True)
-        self.status.setText(f"Agent 工作中（模型: {self._active_model}）…")
+        self.status.setText("正在连接模型…")
 
     def _on_worker_done(self, project: str | None = None):
         self._finish_activity(project)
@@ -2936,6 +3006,8 @@ class AgentPanelWidget(QWidget):
             self._dropped_events = 0
         elif project and project != self.projects_data.get("active"):
             self.status.setText(f"项目「{project}」的回复已完成（切回该项目可查看）")
+        if self._run_error and self._run_error_project == self.projects_data.get("active"):
+            self.status.setText(self._run_error)
         self._save_projects()
 
     def _on_send_clicked(self):
@@ -2953,21 +3025,53 @@ class AgentPanelWidget(QWidget):
         # 正在执行的 ADS 工具无法强杀，会在安全边界收尾（读线程随后退出）
         self.status.setText("正在停止后续步骤…")
         self.send.setEnabled(False)
+        self.run_stop_btn.setEnabled(False)
         self._worker.stop()
 
     def _set_run_state(self, running: bool):
-        """运行中把发送键换成红色停止方块，结束后换回向上箭头。"""
+        """停止操作由输入框顶部状态栏提供，发送键保留发送图标。"""
         self.send.setProperty("busy", running)
-        self.send.setToolTip("停止生成" if running else "发送 (Enter)")
-        self.send.setAccessibleName("停止生成" if running else "发送消息")
-        color = '#ffffff' if running or not self.dark else self._pal()['panel_bg']
-        self.send.setIcon(_draw_icon("stop" if running else "send", color, size=U.px(18)))
+        self.send.setEnabled(not running)
+        self.send.setToolTip("回复进行中，可在状态栏停止" if running else "发送 (Enter)")
+        self.send.setAccessibleName("发送消息")
+        color = '#ffffff' if not self.dark else self._pal()['panel_bg']
+        self.send.setIcon(_draw_icon("send", color, size=U.px(18)))
         # 属性选择器不会因 setProperty 自动重算，必须手动重新 polish
         style = self.send.style()
         style.unpolish(self.send)
         style.polish(self.send)
+        self._sync_composer_status()
+
+    def _sync_composer_status(self):
+        if not hasattr(self, 'send'):
+            return
+        raw = self.status.text()
+        active = self.projects_data.get('active')
+        running = bool(self.send.property('busy')) and self._turn_project in (None, active)
+        text = re.sub(r'（第\s*\d+\s*/\s*\d+\s*步）', '', raw).strip()
+        if text.startswith('正在思考'):
+            text = '正在分析问题…'
+        if raw.startswith('执行 ') and self._tool_name:
+            phases = {'run_simulation': '正在运行仿真', 'publish_design_result': '正在整理设计结果',
+                      'read_dataset': '正在读取数据', 'read_traces': '正在读取曲线',
+                      'get_workspace_info': '正在读取工作区', 'list_designs': '正在读取电路',
+                      'get_design_variables': '正在读取电路参数', 'build_schematic': '正在构建电路',
+                      'set_design_variables': '正在修改电路参数', 'run_python': '正在执行脚本'}
+            text = phases.get(self._tool_name, '正在执行工具') + '…'
+            elapsed = re.search(r'已用 (\d+)s', raw)
+            if elapsed:
+                text += ' · ' + elapsed.group(1) + ' 秒'
+        finished = raw in ('', '就绪', '完成', '已停止本轮回复')
+        self.run_status_row.setVisible(bool(raw) and not finished)
+        self.run_status_text.setText(text)
+        self.run_status_text.setToolTip(raw)
+        self.run_status_text.setAccessibleDescription(raw)
+        self.run_status_dot.setVisible(running and not finished)
+        self.run_stop_btn.setVisible(running and not finished)
+        self.run_stop_btn.setEnabled(not self._stopping)
 
     # ------------------------------------------------- 长耗时工具的可见状态
+
     def _start_tool_timer(self, name: str, project: str | None) -> None:
         """工具执行期间在状态栏显示实时耗时。
 
@@ -3185,10 +3289,16 @@ class AgentPanelWidget(QWidget):
                 self._refresh_activity(entry, project)
             self._start_tool_timer(ev.get("name", ""), project)
         elif t == "reasoning":
+            if foreground and not self._stopping:
+                self.status.setText("正在分析问题…")
             self._append_reasoning(ev.get("text", ""), project)
         elif t == "reasoning_delta":
+            if foreground and not self._stopping and self.status.text() != "正在分析问题…":
+                self.status.setText("正在分析问题…")
             self._append_reasoning_delta(ev.get("text", ""), bool(ev.get("first")), project)
         elif t == "content_delta":
+            if foreground and not self._stopping and self.status.text() != "正在生成回复…":
+                self.status.setText("正在生成回复…")
             self._append_content_delta(ev.get("text", ""), project)
         elif t == "tool_result":
             self._stop_tool_timer()
@@ -3208,8 +3318,9 @@ class AgentPanelWidget(QWidget):
                 summary = job.get("summary") or {}
                 if job.get("save_errors"):
                     # "算完了"和"存上了"是两回事：保存失败必须让用户看见
-                    self.status.setText(
-                        "结果已完成，但保存到磁盘失败（重启后可能找不回该结果页）")
+                    self._run_error = "结果已完成，但保存到磁盘失败（重启后可能找不回该结果页）"
+                    self._run_error_project = project
+                    self.status.setText(self._run_error)
                 else:
                     self.status.setText(
                         "设计结果页已生成："
@@ -3225,7 +3336,7 @@ class AgentPanelWidget(QWidget):
                     "stat", _format_stats(stats, ev.get("message") or ""), project
                 )
             if foreground:
-                self.status.setText("完成")
+                self.status.setText(self._run_error if self._run_error_project == project and self._run_error else "完成")
         elif t == "cancelled":
             # 后端已停止本轮后续步骤（停止按钮 → /chat/cancel 的回执）。
             # 文案必须如实：正在执行的操作会在安全边界收尾，不是"一切已中断"。
@@ -3241,11 +3352,19 @@ class AgentPanelWidget(QWidget):
             self._stop_tool_timer()
             self._finish_activity(project)
             self._add_entry("note", f"错误：{ev.get('message', '')}", project)
+            if foreground:
+                self._run_error = "执行失败：" + ev.get('message', '')
+                self._run_error_project = project
+                self.status.setText(self._run_error)
 
     def _on_failed(self, message: str, project: str | None = None):
         self._stop_tool_timer()
         self._finish_activity(project)
         self._add_entry("note", f"连接失败：{message}", project)
+        if project == self.projects_data.get('active'):
+            self._run_error = "连接失败：" + message
+            self._run_error_project = project
+            self.status.setText(self._run_error)
         self._auto_revive()  # auto-start the backend so the next send works
 
     # ------------------------------------------------- 设计结果页的三个动作
