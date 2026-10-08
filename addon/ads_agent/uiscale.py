@@ -31,14 +31,14 @@ _AUTO_MIN, _AUTO_MAX = 1.0, 1.75      # 自动推导的取值范围
 _MANUAL_MIN, _MANUAL_MAX = 0.75, 2.0  # 手动覆盖允许的取值范围
 
 # 圆角令牌：整体偏圆润，刻度统一
-_RADII = {"xs": 6, "sm": 9, "md": 12, "lg": 16, "xl": 22, "pill": 9999}
+_RADII = {"xs": 4, "sm": 8, "md": 10, "lg": 12, "xl": 16, "pill": 9999}
 
 # 内边距 / 间距令牌
 _PADS = {"xs": 2, "sm": 4, "md": 6, "lg": 8, "xl": 10, "xxl": 14}
 
 # 字号令牌（px @1.0x）
-_FONTS = {"micro": 10, "tiny": 11, "small": 12, "body": 13,
-          "title": 15, "hero": 18, "logo": 34}
+_FONTS = {"micro": 11, "tiny": 12, "small": 13, "body": 14,
+          "title": 16, "hero": 20, "logo": 34}
 
 # 优先字体：圆润现代 + 中文字形完整；Qt 找不到时依次回退
 _UI_FONT_PREFERENCE = [
@@ -213,3 +213,173 @@ def qfont(token: str = "body", bold: bool = False):
 def refresh() -> None:
     """配置改过（scale / font）后调用，清掉缓存。"""
     _cache.clear()
+
+
+_icon_assets = None
+
+
+def icon_path(name: str, color: str = '#ffffff') -> str:
+    """Cache tiny painted Qt assets for stylesheet indicators; no external files required."""
+    import tempfile
+    import qtcompat
+    core, gui = qtcompat.QtCore(), qtcompat.QtGui()
+    QPointF, Qt = core.QPointF, core.Qt
+    QColor, QPainter, QPen, QPixmap = gui.QColor, gui.QPainter, gui.QPen, gui.QPixmap
+
+    global _icon_assets
+    if _icon_assets is None:
+        _icon_assets = tempfile.TemporaryDirectory(prefix='ads_ui_icons_')
+    path = os.path.join(_icon_assets.name, name + color.replace('#', '_') + '.png')
+    if not os.path.exists(path):
+        image = QPixmap(32, 32)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(color), 3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        points = [(7, 16), (13, 22), (25, 10)] if name == 'check' else [(9, 13), (16, 20), (23, 13)]
+        painter.drawLine(QPointF(*points[0]), QPointF(*points[1]))
+        painter.drawLine(QPointF(*points[1]), QPointF(*points[2]))
+        painter.end()
+        image.save(path)
+    return path.replace('\\', '/')
+
+
+def indicator_css(pal: dict, owner: str = 'QCheckBox') -> str:
+    check = icon_path('check')
+    return (
+        f"{owner}::indicator{{width:{px(16)}px;height:{px(16)}px;"
+        f"border:1px solid {pal['input_border']};border-radius:{R('xs')}px;background:{pal['input_bg']};}}"
+        f"{owner}::indicator:hover{{border-color:{pal['accent']};}}"
+        f"{owner}::indicator:checked{{background:{pal['accent']};border-color:{pal['accent']};image:url(\"{check}\");}}"
+        f"{owner}::indicator:disabled{{background:{pal['card_bg']};border-color:{pal['card_border']};}}"
+    )
+
+
+def field_css(pal: dict, combo: bool = False) -> str:
+    selector = 'QComboBox' if combo else 'QLineEdit'
+    css = (
+        f"{selector}{{background:{pal['input_bg']};color:{pal['text']};"
+        f"border:1px solid {pal['input_border']};border-radius:{R('sm')}px;"
+        f"min-height:{px(18)}px;padding:{px(8)}px {px(10)}px;font-size:{fs('small')}px;{font_css()}}}"
+        f"{selector}:hover{{border-color:{pal['subtle']};}}"
+        f"{selector}:focus{{border-color:{pal['accent']};}}"
+    )
+    if combo:
+        arrow = icon_path('chevron', pal['subtle'])
+        css += (
+            f"QComboBox::drop-down{{border:none;width:{px(28)}px;}}"
+            f"QComboBox::down-arrow{{image:url(\"{arrow}\");width:{px(12)}px;height:{px(12)}px;}}"
+            f"QComboBox QLineEdit{{background:transparent;color:{pal['text']};border:none;padding:0;margin:0;}}"
+            f"QComboBox QAbstractItemView{{background:{pal['input_bg']};color:{pal['text']};"
+            f"border:1px solid {pal['card_border']};padding:{px(4)}px;"
+            f"selection-background-color:{pal['accent_soft']};selection-color:{pal['text']};}}"
+        )
+    return css
+
+
+def action_css(pal: dict, primary: bool = False) -> str:
+    bg = pal['accent'] if primary else pal['input_bg']
+    fg = '#ffffff' if primary else pal['text']
+    hover = pal['accent_hover'] if primary else pal['hover']
+    return (
+        f"QPushButton{{background:{bg};color:{fg};border:1px solid {pal['accent'] if primary else pal['card_border']};"
+        f"border-radius:{R('sm')}px;padding:{px(8)}px {px(12)}px;"
+        f"min-height:{px(18)}px;"
+        f"font-size:{fs('small')}px;{font_css()}}}"
+        f"QPushButton:hover{{background:{hover};}}"
+        f"QPushButton:focus{{border-color:{pal['accent']};}}"
+        f"QPushButton:disabled{{background:{pal['card_bg']};color:{pal['subtle']};}}"
+    )
+
+
+def dialog_css(pal: dict) -> str:
+    return (
+        f"QDialog{{background:{pal['panel_bg']};{font_css()}}}"
+        f"QLabel{{color:{pal['text']};font-size:{fs('small')}px;{font_css()}}}"
+        f"QTextEdit,QPlainTextEdit{{background:{pal['input_bg']};color:{pal['text']};"
+        f"border:1px solid {pal['card_border']};padding:{px(8)}px;{mono_css()}}}"
+        f"QComboBox::drop-down{{border:none;width:{px(24)}px;}}"
+        f"QComboBox QAbstractItemView{{background:{pal['input_bg']};color:{pal['text']};"
+        f"selection-background-color:{pal['accent_soft']};selection-color:{pal['text']};}}"
+        f"QTableWidget{{background:{pal['input_bg']};alternate-background-color:{pal['card_bg']};"
+        f"color:{pal['text']};border:1px solid {pal['card_border']};"
+        f"gridline-color:{pal['card_border']};font-size:{fs('small')}px;{mono_css()}}}"
+        f"QTableWidget::item{{padding:{px(6)}px;}}"
+        f"QTableWidget::item:selected{{background:{pal['accent_soft']};color:{pal['text']};}}"
+        f"QHeaderView::section{{background:{pal['card_bg']};color:{pal['subtle']};"
+        f"border:none;border-bottom:1px solid {pal['card_border']};padding:{px(8)}px;{font_css()}}}"
+        f"QScrollBar:vertical{{background:transparent;width:{px(10)}px;}}"
+        f"QScrollBar::handle:vertical{{background:{pal['scroll']};border-radius:{px(5)}px;min-height:{px(24)}px;}}"
+        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+        "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}"
+        + field_css(pal) + field_css(pal, combo=True) + action_css(pal)
+    )
+
+
+def message_dialog(title: str, text: str, details: str = "", warning: bool = False,
+                   parent=None, pal=None):
+    """A themed native status/error dialog with optional technical details."""
+    import qtcompat
+    core, widgets = qtcompat.QtCore(), qtcompat.QtWidgets()
+    Qt, QTimer = core.Qt, core.QTimer
+    QMessageBox, QPushButton, QTextEdit = widgets.QMessageBox, widgets.QPushButton, widgets.QTextEdit
+
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setText(text)
+    box.setIcon(QMessageBox.Icon.Warning if warning else QMessageBox.Icon.Information)
+    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    box.button(QMessageBox.StandardButton.Ok).setText("知道了")
+    if details:
+        box.setDetailedText(details)
+        def localize_details():
+            for button in box.findChildren(QPushButton):
+                if button is box.button(QMessageBox.StandardButton.Ok):
+                    continue
+                button.setText("查看详情")
+                button.clicked.connect(lambda _=False, b=button: b.setText(
+                    "收起详情" if any(edit.isVisible() for edit in box.findChildren(QTextEdit)) else "查看详情"))
+        QTimer.singleShot(0, localize_details)
+    box.setStyleSheet(dialog_css(pal or PALETTES['light']))
+    return box
+
+
+# Shared colors for the panel and its child dialogs.
+PALETTES = {
+    "light": {
+        "panel_bg": "#ffffff", "chat_bg": "#ffffff",
+        "header_bg": "#edf3fb", "sidebar_bg": "#f2f4f7",
+        "text": "#172234", "subtle": "#65758b",
+        "user_bubble": "#edf3ff", "user_bubble_to": "#edf3ff",
+        "user_bubble_border": "#edf3ff", "user_text": "#203b66",
+        "ai_bubble": "#ffffff", "ai_bubble_border": "#ffffff", "ai_text": "#172234",
+        "card_bg": "#f4f6fa", "card_border": "#dfe5ee",
+        "accent": "#246bdb", "accent_hover": "#1d5dbc", "accent_soft": "#edf3ff",
+        "avatar_user": "#246bdb", "avatar_user_to": "#246bdb", "avatar_user_ring": "#edf3ff",
+        "avatar_ai": "#edf3ff", "avatar_ai_ring": "#edf3ff",
+        "input_bg": "#ffffff", "input_border": "#d6dfea",
+        "chip_bg": "#ffffff", "chip_text": "#172234", "chip_hover": "#edf3ff",
+        "hover": "#f0f3f8", "scroll": "#c5ceda", "error": "#c43d4b",
+        "stop_bg": "#c43d4b", "stop_bg_hover": "#ad3040",
+    },
+    "dark": {
+        "panel_bg": "#191919", "chat_bg": "#171717",
+        "header_bg": "#202020", "sidebar_bg": "#1c1c1c",
+        "text": "#e7e7e7", "subtle": "#a1a1a1",
+        "user_bubble": "#22364f", "user_bubble_to": "#22364f",
+        "user_bubble_border": "#22364f", "user_text": "#e0ebff",
+        "ai_bubble": "#171717", "ai_bubble_border": "#171717", "ai_text": "#e7e7e7",
+        "card_bg": "#222222", "card_border": "#343434",
+        "accent": "#7d9ff0", "accent_hover": "#9bb5f5", "accent_soft": "#22364f",
+        "avatar_user": "#7d9ff0", "avatar_user_to": "#7d9ff0", "avatar_user_ring": "#22364f",
+        "avatar_ai": "#22364f", "avatar_ai_ring": "#22364f",
+        "input_bg": "#242424", "input_border": "#383838",
+        "chip_bg": "#242424", "chip_text": "#e7e7e7", "chip_hover": "#2c2c2c",
+        "hover": "#2e2e2e", "scroll": "#484848", "error": "#ff8a92",
+        "stop_bg": "#b84c59", "stop_bg_hover": "#a5404e",
+    },
+}

@@ -420,6 +420,10 @@ def test_sim_status_shows_elapsed_time():
 
 def test_config_loaded_reads_sim_flag_from_backend():
     w = _new_panel(("A",), active="A")
+    # Configuration load now also reads the selected model's connection.
+    # Keep this simulation-status test offline, including that follow-up request.
+    w._spawn_cfg_worker = lambda payload, path, callback: callback(
+        {"model": payload["model"], "base_url": "http://127.0.0.1:1", "api_key": ""})
     w._on_config_loaded({
         "base_url": "http://127.0.0.1:1", "model": "m", "models": ["m"],
         "has_key": False, "api_key_hint": "",

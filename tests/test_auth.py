@@ -377,6 +377,112 @@ def test_panel_hint_does_not_contain_the_token():
     contains(hint, "config.ini")
 
 
+def test_model_credentials_require_auth_and_remain_out_of_status_and_logs():
+    for token in (None, 'wrong-profile-token'):
+        status, raw = _call('/config/model', method='POST', token=token,
+                            body={'model': 'test-model'})
+        eq(status, 401)
+        not_contains(raw, 'test-key-not-a-real-secret')
+    for name, address, key in (
+        ('profile-a', 'https://a.invalid/v1', 'fake-profile-key-a'),
+        ('profile-b', 'https://b.invalid/v1', 'fake-profile-key-b'),
+    ):
+        status, raw = _call('/config', method='POST', token=TOKEN,
+                            body=dict(model=name, base_url=address, api_key=key,
+                                      provider_name='自定义供应商-' + name,
+                                      models=['profile-a', 'profile-b']))
+        eq(status, 200)
+        not_contains(raw, key)
+    for name, address, key in (
+        ('profile-a', 'https://a.invalid/v1', 'fake-profile-key-a'),
+        ('profile-b', 'https://b.invalid/v1', 'fake-profile-key-b'),
+    ):
+        status, raw = _call('/config/model', method='POST', token=TOKEN, body={'model': name})
+        eq(status, 200)
+        eq(_json(raw)['base_url'], address)
+        eq(_json(raw)['api_key'], key)
+        eq(_json(raw)['provider_name'], '自定义供应商-' + name)
+        status, raw = _call('/config', method='POST', token=TOKEN, body={'model': name})
+        eq(status, 200)
+        eq(_json(raw)['base_url'], address)
+        eq(server.CFG['llm_api_key'], key)
+        eq(_json(raw)['profile_labels'][name], '自定义供应商-' + name)
+    for path in ('/config', '/logs', '/health'):
+        _, raw = _call(path, token=TOKEN)
+        not_contains(raw, 'fake-profile-key-a')
+        not_contains(raw, 'fake-profile-key-b')
+    status, _ = _call('/config/model', method='POST', token=TOKEN, body={'model': 'missing-model'})
+    eq(status, 404)
+
+
+def test_new_empty_key_does_not_reuse_active_model_key():
+    status, _ = _call('/config', method='POST', token=TOKEN,
+                      body=dict(model='new-keyless', base_url='https://local.invalid/v1', api_key=''))
+    eq(status, 200)
+    eq(server.CFG['llm_api_key'], '')
+    status, raw = _call('/config/model', method='POST', token=TOKEN, body={'model': 'profile-a'})
+    eq(status, 200)
+    eq(_json(raw)['api_key'], 'fake-profile-key-a')
+
+
+def test_legacy_shared_connections_migrate_without_overwriting_other_models():
+    original = _cfg_text()
+    try:
+        with open(_CFG, 'w', encoding='utf-8') as file:
+            file.write('[llm]\nmodel = legacy-a\nmodels = legacy-a, legacy-b\n'
+                       'base_url = https://legacy.invalid/v1\napi_key = fake-legacy-key\n'
+                       f'[ads]\ntoken = {TOKEN}\n')
+        server.config_mod.update_llm_settings(model='legacy-a', base_url='https://new.invalid/v1',
+                                              api_key='fake%new-key')
+        untouched = server.config_mod.model_profile('legacy-b')
+        eq(untouched['base_url'], 'https://legacy.invalid/v1')
+        eq(untouched['api_key'], 'fake-legacy-key')
+        saved = server.config_mod.model_profile('legacy-a')
+        eq(saved['base_url'], 'https://new.invalid/v1')
+        eq(saved['api_key'], 'fake%new-key')
+        server.config_mod.update_llm_settings(model='legacy-b')
+        cfg = server.config_mod.load()
+        eq(cfg['llm_base_url'], untouched['base_url'])
+        eq(cfg['llm_api_key'], untouched['api_key'])
+        eq(server.config_mod.model_profile('legacy-a'), saved)
+    finally:
+        with open(_CFG, 'w', encoding='utf-8') as file:
+            file.write(original)
+
+
+def test_provider_multiple_models_share_updates_and_model_only_switch():
+    first = dict(model='multi-a', base_url='https://multi.invalid/v1', api_key='fake-multi-key',
+                 provider_name='多模型供应商', provider_models=['multi-a', 'multi-b'])
+    status, raw = _call('/config', method='POST', token=TOKEN, body=first)
+    eq(status, 200)
+    groups = _json(raw)['provider_groups']
+    eq(next(g['models'] for g in groups if 'multi-a' in g['models']), ['multi-a', 'multi-b'])
+    second = dict(first, provider_model='multi-a', api_key='fake-updated-key')
+    status, _ = _call('/config', method='POST', token=TOKEN, body=second)
+    eq(status, 200)
+    for name in ('multi-a', 'multi-b'):
+        _, raw = _call('/config/model', method='POST', token=TOKEN, body={'model': name})
+        eq(_json(raw)['api_key'], 'fake-updated-key')
+        eq(_json(raw)['models'], ['multi-a', 'multi-b'])
+    status, raw = _call('/config', method='POST', token=TOKEN, body={'model': 'multi-b'})
+    eq(status, 200)
+    eq(server.CFG['llm_api_key'], 'fake-updated-key')
+    eq(_json(raw)['base_url'], 'https://multi.invalid/v1')
+    ok('fake-updated-key' not in raw)
+    status, _ = _call('/config', method='POST', token=TOKEN, body=dict(
+        model='other-account', base_url=first['base_url'], api_key='fake-other-key',
+        provider_name=first['provider_name']))
+    eq(status, 200)
+    _, raw = _call('/config', token=TOKEN)
+    groups = _json(raw)['provider_groups']
+    eq(next(g['models'] for g in groups if 'other-account' in g['models']), ['other-account'])
+    # Selecting an owned model from another provider must not overwrite its connection.
+    status, _ = _call('/config', method='POST', token=TOKEN, body=dict(second,
+        provider_models=['multi-a', 'other-account']))
+    eq(status, 500)
+    eq(server.config_mod.model_profile('other-account')['api_key'], 'fake-other-key')
+
+
 if __name__ == "__main__":
     try:
         code = run(globals(), "后端接口鉴权")

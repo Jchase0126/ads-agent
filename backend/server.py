@@ -7,6 +7,7 @@ Endpoints (除 /health 外都需要请求头 X-Ads-Agent-Token，见 ads_auth.py
   GET  /tools   -> 可用工具名
   GET  /design/job?id=<job_id> -> 设计任务（结果页）的完整记录
   POST /config  -> 保存 LLM 设置
+  POST /config/model -> 鉴权后读取指定模型的连接参数（含密钥）
   POST /chat    -> SSE event stream; body: {"messages": [...], "allow_python": bool}
   POST /test_connection -> 探测 base_url 可用性并拉取模型列表
   POST /design/run        -> 跑仿真 + 读真实曲线 + 确定性评估，返回结果页数据
@@ -165,6 +166,8 @@ def _config_status() -> dict:
         "models": CFG["llm_models"],
         "has_key": bool(CFG.get("llm_api_key")),
         "api_key_hint": config_mod.key_hint(CFG.get("llm_api_key", "")),
+        "profile_labels": config_mod.profile_labels(CFG),
+        "provider_groups": config_mod.provider_groups(CFG),
         # 面板用它在状态栏如实描述"仿真期间界面会不会卡"
         "sim_off_main_thread": CFG["sim_off_main_thread"],
         "sim_timeout": CFG["sim_timeout"],
@@ -183,6 +186,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
@@ -533,6 +537,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "known": True, "ads": cancel_info})
             return
 
+        if self.path == "/config/model":
+            body = self._read_json(limit=200_000)
+            if body is None:
+                return
+            name = body.get("model")
+            if not isinstance(name, str) or not name.strip():
+                self._send_json({"error": "请选择模型"}, 400)
+                return
+            profile = config_mod.model_profile(name.strip())
+            self._send_json(profile if profile is not None else {"error": "模型配置不存在"},
+                            200 if profile is not None else 404)
+            return
+
         if self.path == "/config":
             body = self._read_json(limit=200_000)
             if body is None:
@@ -543,6 +560,9 @@ class Handler(BaseHTTPRequestHandler):
                     api_key=body.get("api_key"),
                     model=body.get("model"),
                     models=body.get("models"),
+                    provider_name=body.get("provider_name"),
+                    provider_models=body.get("provider_models"),
+                    provider_model=body.get("provider_model"),
                 )
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": f"保存配置失败: {type(e).__name__}: {e}"}, 500)
@@ -556,7 +576,7 @@ class Handler(BaseHTTPRequestHandler):
             if body is None:
                 return
             base_url = (body.get("base_url") or CFG["llm_base_url"]).strip()
-            api_key = (body.get("api_key") or CFG.get("llm_api_key") or "").strip()
+            api_key = (body.get("api_key", CFG.get("llm_api_key")) or "").strip()
             try:
                 import time as _time
 
