@@ -28,6 +28,7 @@ import os
 import socket
 import time
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     import paths
@@ -75,6 +76,9 @@ def identity(extra: dict | None = None) -> dict:
         "pid": os.getpid(),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    ads_dir = (os.environ.get(paths.ENV_ADS_DIR) or '').strip().strip('"')
+    if ads_dir:
+        info['ads_dir'] = os.path.normpath(ads_dir)
     if extra:
         info.update(extra)
     return info
@@ -283,10 +287,16 @@ def foreign_install_instances(kind: str) -> list:
 def probe(url: str, timeout: float = 2.0) -> dict:
     """取一次 ``/health``。返回 ``{"reachable", "payload", "error"}``。
 
+    接受服务根地址或 /health 地址，路径只拼接一次。
     只做 HTTP GET，不做任何判断 —— 判断在 :func:`evaluate` 里。
     """
     try:
-        with _opener().open(url.rstrip("/") + "/health", timeout=timeout) as resp:
+        endpoint = urlsplit(url)
+        path = endpoint.path.rstrip('/')
+        if not path.endswith('/health'):
+            path += '/health'
+        health_url = urlunsplit((endpoint.scheme, endpoint.netloc, path, '', ''))
+        with _opener().open(health_url, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         payload = json.loads(raw)
         if not isinstance(payload, dict):
@@ -381,10 +391,12 @@ def evaluate(probed: dict, kind: str) -> dict:
     # 同一份插件安装（同 install_id）被 ADS 2024–2027 共用时，同一时刻只能
     # 服务一个 ADS 版本：工具服务与 DE 数据库是一一对应的，连错版本会把指令
     # 发到另一个 ADS 里去。两侧都上报了 ads_dir 且不同 → 明确拒绝，不误连。
-    their_ads_dir = os.path.normcase(os.path.normpath(str(ident.get("ads_dir") or "")))
-    my_ads_dir = os.path.normcase(os.path.normpath(
-        (os.environ.get(paths.ENV_ADS_DIR) or "").strip().strip('"')
-    ))
+    their_ads_dir = str(ident.get("ads_dir") or "").strip().strip('"')
+    my_ads_dir = (os.environ.get(paths.ENV_ADS_DIR) or "").strip().strip('"')
+    if their_ads_dir:
+        their_ads_dir = os.path.normcase(os.path.normpath(their_ads_dir))
+    if my_ads_dir:
+        my_ads_dir = os.path.normcase(os.path.normpath(my_ads_dir))
     if their_ads_dir and my_ads_dir and their_ads_dir != my_ads_dir:
         out["reason"] = "cross_version_conflict"
         out["conflict"] = True

@@ -137,7 +137,7 @@ def probe_backend(timeout: float = 2.0) -> dict:
     只有 ``usable=True`` 才算"可以复用"。
     """
     inst = _instance()
-    probed = inst.probe(_base_url() + "/health", timeout=timeout)
+    probed = inst.probe(_base_url(), timeout=timeout)
     verdict = inst.evaluate(probed, "backend")
     return {"reachable": probed["reachable"], "verdict": verdict,
             "payload": probed.get("payload")}

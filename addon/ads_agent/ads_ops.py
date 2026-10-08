@@ -5764,7 +5764,8 @@ def _activate_window(cell: str):
     由调用方如实告诉用户"请手动打开"。绝不因此报错。
     """
     try:
-        from qtcompat import QtWidgets
+        import qtcompat
+        QtWidgets = qtcompat.QtWidgets()
 
         QApplication = QtWidgets.QApplication
 

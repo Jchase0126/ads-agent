@@ -66,6 +66,7 @@ CASES = [
     ("test_qtcompat.py", "Qt 绑定适配：已加载优先 / 终身缓存 / Qt5-Qt6 shim", "logic", False),
     ("test_install_multiversion.py", "多版本安装：分别注册 / 登记表 / 卸载隔离 / 中文空格路径", "logic", False),
     # ---------------- qt ----------------
+    ("test_startup_health.py", "真实 Qt 启动 / 健康探测 / 端口释放", "qt", True),
     ("test_ui_navigation.py", "模型管理 / 供应商隔离 / 输入栏选择与响应式布局", "qt", True),
     ("test_project_isolation.py", "项目会话隔离 / 如实报告仿真行为", "qt", True),
     ("test_design_isolation.py", "设计结果页：项目隔离与重启恢复", "qt", True),

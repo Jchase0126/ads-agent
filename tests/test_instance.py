@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import add_path, contains, eq, ne, ok, run  # noqa: E402
@@ -210,6 +211,28 @@ def test_port_in_use_detection():
             sock.close()
         # 关掉之后应当立刻可用（端口释放）
         ok(not instance.port_in_use("127.0.0.1", port), "关闭后端口应回到空闲")
+
+
+def test_missing_ads_directory_is_not_a_cross_version_conflict():
+    with DataEnv():
+        for theirs, mine, expected in (
+                ('', '', 'ok'), ('', 'C:/ADS/2027', 'ok'),
+                ('C:/ADS/2026', '', 'ok'),
+                ('C:/ADS/2027', 'C:/ADS/2027', 'ok'),
+                ('C:/ADS/2026', 'C:/ADS/2027', 'cross_version_conflict')):
+            probed = _payload(install_id=paths.install_id(), ads_dir=theirs)
+            with patch.dict(os.environ, {paths.ENV_ADS_DIR: mine}):
+                verdict = instance.evaluate(probed, 'backend')
+            eq(verdict['reason'], expected)
+            eq(verdict['usable'], expected == 'ok')
+
+
+def test_identity_reports_only_present_ads_directory():
+    with DataEnv():
+        with patch.dict(os.environ, {paths.ENV_ADS_DIR: ''}):
+            ok('ads_dir' not in instance.identity())
+        with patch.dict(os.environ, {paths.ENV_ADS_DIR: '"C:/ADS/2027"'}):
+            eq(instance.identity()['ads_dir'], os.path.normpath('C:/ADS/2027'))
 
 
 def test_identity_has_no_secrets():

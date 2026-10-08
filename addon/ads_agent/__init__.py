@@ -185,7 +185,8 @@ def setup_addon(addon) -> None:
 
         if _ui_setting("auto_open", "true").lower() in ("1", "true", "yes", "on"):
             delay = int(_ui_setting("auto_open_delay_ms", "3000") or 3000)
-            from qtcompat import QtCore
+            import qtcompat
+            QtCore = qtcompat.QtCore()
 
             QtCore.QTimer.singleShot(max(delay, 0), lambda: _auto_open(retries=15))
     except Exception as e:  # noqa: BLE001 — never break ADS startup
@@ -205,7 +206,8 @@ def _auto_open(retries: int) -> None:
         print("[ADS Agent] 面板已自动打开")
     except Exception as e:  # noqa: BLE001
         if retries > 0:
-            from qtcompat import QtCore
+            import qtcompat
+            QtCore = qtcompat.QtCore()
 
             QtCore.QTimer.singleShot(2000, lambda: _auto_open(retries - 1))
         else:
@@ -296,7 +298,8 @@ def generate_menu(addon, win_def) -> None:
     # 能力检测（只读）在主线程预热：/health 的 compat 快照能立刻可用，
     # 后端第一次握手就能拿到版本与工具门禁，而不是拿到空快照。
     try:
-        from qtcompat import QtCore
+        import qtcompat
+        QtCore = qtcompat.QtCore()
 
         QtCore.QTimer.singleShot(0, _warmup_compat)
     except Exception:  # noqa: BLE001 — Qt 不可用时门禁会在首次调用时兜底探测
@@ -315,7 +318,8 @@ def _warmup_compat() -> None:
 
 
 def _show_compat_status() -> None:
-    from qtcompat import QtWidgets
+    import qtcompat
+    QtWidgets = qtcompat.QtWidgets()
 
     try:
         import capability
@@ -358,7 +362,8 @@ def _open_panel() -> None:
 
         panel.open_panel()
     except Exception as e:  # noqa: BLE001
-        from qtcompat import QtWidgets
+        import qtcompat
+        QtWidgets = qtcompat.QtWidgets()
 
         QtWidgets.QMessageBox.critical(None, "ADS Agent", f"无法打开面板：\n{type(e).__name__}: {e}")
 
@@ -371,7 +376,8 @@ def _ensure_server() -> str:
 
 
 def _show_server_status() -> None:
-    from qtcompat import QtWidgets
+    import qtcompat
+    QtWidgets = qtcompat.QtWidgets()
 
     QMessageBox = QtWidgets.QMessageBox
     try:

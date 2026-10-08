@@ -853,7 +853,8 @@ def ensure_started() -> str:
         _log("ERROR", f"初始化回环令牌失败: {type(e).__name__}: {e}")
 
     if _pump_timer is None:
-        from qtcompat import QtCore
+        import qtcompat
+        QtCore = qtcompat.QtCore()
 
         _pump_timer = QtCore.QTimer()
         _pump_timer.timeout.connect(pump)
@@ -880,9 +881,14 @@ def ensure_started() -> str:
 
 
 def shutdown() -> None:
-    global _server, _server_thread
+    global _server, _server_thread, _pump_timer
+    if _pump_timer is not None:
+        _pump_timer.stop()
+        _pump_timer.deleteLater()
+        _pump_timer = None
     if _server is not None:
         _server.shutdown()
+        _server.server_close()
         _server = None
         _server_thread = None
         # 正常退出必须清掉登记：否则下一次启动会看到一个 pid 已死的陈旧记录，
