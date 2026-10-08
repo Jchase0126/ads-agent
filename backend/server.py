@@ -563,6 +563,7 @@ class Handler(BaseHTTPRequestHandler):
                     provider_name=body.get("provider_name"),
                     provider_models=body.get("provider_models"),
                     provider_model=body.get("provider_model"),
+                    provider_enabled=body.get("provider_enabled"),
                 )
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": f"保存配置失败: {type(e).__name__}: {e}"}, 500)
@@ -575,7 +576,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json(limit=200_000)
             if body is None:
                 return
-            base_url = (body.get("base_url") or CFG["llm_base_url"]).strip()
+            base_url = llm_mod.normalize_base_url(body.get("base_url") or CFG["llm_base_url"])
             api_key = (body.get("api_key", CFG.get("llm_api_key")) or "").strip()
             try:
                 import time as _time
@@ -618,6 +619,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not messages:
             self._send_json({"error": "messages is empty"}, 400)
+            return
+
+        selected_model = model or CFG["llm_model"]
+        if any(not g.get("enabled", True) and selected_model in g["models"]
+               for g in config_mod.provider_groups(CFG)):
+            self._send_json({"error": "该供应商已停用，请启用供应商或选择其他模型。"}, 400)
             return
 
         turn_id = str(body.get("turn_id") or "").strip() or _new_turn_id()

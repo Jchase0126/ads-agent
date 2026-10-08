@@ -389,5 +389,36 @@ def test_content_deltas_are_forwarded_without_duplicate_final():
         agent.llm = real_llm
 
 
+def test_stepfun_root_uses_versioned_models_and_chat_paths():
+    from unittest.mock import patch
+    class ModelsResponse:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return b'{"data":[{"id":"test-model"}]}'
+    requests = []
+    def respond(req, timeout=None):
+        requests.append(req.full_url)
+        if req.full_url.endswith("/models"):
+            return ModelsResponse()
+        return _FakeResp(_sse(_content_chunk("ok")) + ["data: [DONE]"])
+    for host in ("api.stepfun.com", "api.stepfun.ai"):
+        with patch.object(llm_mod.urllib.request, "urlopen", respond):
+            eq(llm_mod.list_models("https://" + host, "test-key"), ["test-model"])
+            cfg = dict(CFG, llm_base_url="https://" + host)
+            llm_mod.chat_stream(cfg, [{"role": "user", "content": "hello"}])
+        eq(requests[-2:], ["https://" + host + "/v1/models",
+                           "https://" + host + "/v1/chat/completions"])
+
+
+def test_base_url_normalization_preserves_custom_paths():
+    eq(llm_mod.normalize_base_url(" https://api.stepfun.com/ "),
+       "https://api.stepfun.com/v1")
+    for url in ("https://api.stepfun.com/v1", "https://api.stepfun.com/step-plan",
+                "https://open.bigmodel.cn/api/paas/v4", "https://api.deepseek.com",
+                "http://127.0.0.1:8080", "https://api.stepfun.com.example.org",
+                "https://api.stepfun.com?route=custom"):
+        eq(llm_mod.normalize_base_url(url), url)
+
+
 if __name__ == "__main__":
     sys.exit(run(globals(), "LLM 流完整性与上下文管理"))

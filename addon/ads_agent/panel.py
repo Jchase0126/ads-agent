@@ -1126,6 +1126,36 @@ class WelcomeRow(QWidget):
 # panel widget
 # ---------------------------------------------------------------------------
 
+class ProviderSwitch(QCheckBox):
+    """Keyboard-accessible supplier switch with a generous hit target."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(U.px(48), U.px(30))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.colors = {}
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event):
+        QPainter, QColor, QRectF = QtGui.QPainter, QtGui.QColor, QtCore.QRectF
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = self.colors
+        track = QRectF(U.px(4), U.px(5), U.px(40), U.px(20))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#32b54a' if self.isChecked() else pal.get('input_border', '#8793a5')))
+        painter.drawRoundedRect(track, U.px(10), U.px(10))
+        painter.setBrush(QColor('#ffffff'))
+        painter.drawEllipse(QRectF(U.px(26) if self.isChecked() else U.px(6), U.px(7), U.px(16), U.px(16)))
+        if self.hasFocus():
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QColor(pal.get('accent', '#2563eb')))
+            painter.drawRoundedRect(QRectF(1, 1, self.width()-2, self.height()-2), U.px(12), U.px(12))
+        painter.end()
+
+
 class AgentPanelWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1233,12 +1263,12 @@ class AgentPanelWidget(QWidget):
         right.setContentsMargins(U.px(8), U.px(8), U.px(8), U.px(8))
         right.setSpacing(U.P("md"))
         context = QHBoxLayout()
-        self.chat_heading = QLabel("对话")
-        self.chat_heading.setFont(U.qfont('small', bold=True))
-        context.addWidget(self.chat_heading)
-        context.addStretch(1)
         self.active_project_label = QLabel()
+        self.active_project_label.setFont(U.qfont('small', bold=True))
+        self.active_project_label.setMinimumWidth(0)
+        self.chat_heading = self.active_project_label
         context.addWidget(self.active_project_label)
+        context.addStretch(1)
         right.addLayout(context)
 
         self.chat = ChatList()
@@ -1613,7 +1643,7 @@ class AgentPanelWidget(QWidget):
     def _update_project_context(self):
         name = getattr(self, 'projects_data', {}).get('active', '默认')
         self.active_project_label.setText(self.active_project_label.fontMetrics().elidedText(
-            name, Qt.TextElideMode.ElideRight, max(U.px(60), self.chat_column.width() // 2)))
+            name, Qt.TextElideMode.ElideRight, max(U.px(60), self.chat_column.width() - U.px(24))))
         self.active_project_label.setToolTip(f"当前项目：{name}")
 
     def _on_project_selected(self):
@@ -1758,7 +1788,7 @@ class AgentPanelWidget(QWidget):
         self.project_undo.setStyleSheet(_button_css(pal, 'soft'))
         self.project_search.setStyleSheet(_lineedit_css(pal))
         for hint in (self.active_project_label,):
-            hint.setStyleSheet(f"color:{pal['subtle']};font-size:{U.fs('tiny')}px;background:transparent;")
+            hint.setStyleSheet(f"color:{pal['text']};font-size:{U.fs('small')}px;font-weight:bold;background:transparent;")
         self.logo.setStyleSheet(
             f"background:{pal['accent']};"
             f" border-radius:{U.R('md')}px;" + base
@@ -1936,7 +1966,17 @@ class AgentPanelWidget(QWidget):
 
         self.model_editor_heading = QLabel("模型参数")
         self.model_editor_heading.setFont(U.qfont("title", bold=True))
-        sv.addWidget(self.model_editor_heading)
+        self.model_editor_heading.setWordWrap(True)
+        self.model_editor_heading.setMinimumWidth(0)
+        provider_header = QHBoxLayout()
+        provider_header.addWidget(self.model_editor_heading, 1)
+        self.provider_enabled = ProviderSwitch()
+        self.provider_enabled.setChecked(True)
+        self.provider_enabled.setAccessibleName("启用当前供应商")
+        self.provider_enabled.setToolTip("停用后保留配置，隐藏聊天模型；保存并应用后生效")
+        self.provider_enabled.toggled.connect(self._on_provider_enabled)
+        provider_header.addWidget(self.provider_enabled)
+        sv.addLayout(provider_header)
         self.model_editor_hint = QLabel("选择已有模型进行编辑，或添加新的模型。")
         self.model_editor_hint.setWordWrap(True)
         self.model_editor_hint.hide()
@@ -2109,6 +2149,8 @@ class AgentPanelWidget(QWidget):
         self.preset_combo.setStyleSheet(_combo_css(pal))
         self.api_key_edit.setStyleSheet(_lineedit_css(pal))
         self.base_url_edit.setStyleSheet(_lineedit_css(pal))
+        self.provider_enabled.colors = pal
+        self.provider_enabled.update()
         self.provider_name_edit.setStyleSheet(_lineedit_css(pal))
         self.model_search.setStyleSheet(_lineedit_css(pal, radius_token="pill"))
         self.saved_model_search.setStyleSheet(_lineedit_css(pal))
@@ -2169,6 +2211,24 @@ class AgentPanelWidget(QWidget):
             + U.indicator_css(pal, owner='QListWidget') + _scrollbar_css(pal)
         )
 
+    def _on_provider_enabled(self, enabled):
+        self.provider_enabled.update()
+
+    def _input_model_groups(self):
+        if self._provider_groups:
+            return [g for g in self._provider_groups if g.get('enabled', True) and g['models']]
+        groups = {}
+        for model in self._saved_models or ([self._active_model] if self._active_model else []):
+            provider = self._provider_names.get(model, '自定义供应商')
+            groups.setdefault(provider, dict(provider_name=provider, models=[]))['models'].append(model)
+        return list(groups.values())
+
+    def _input_available_models(self):
+        return list(dict.fromkeys(m for g in self._input_model_groups() for m in g['models']))
+
+    def _active_provider_enabled(self):
+        return all(g.get('enabled', True) for g in self._provider_groups if self._active_model in g['models'])
+
     def _update_provider_heading(self, name):
         self.model_editor_heading.setText(name.strip() or ("新增供应商" if self._editor_model is None else "供应商配置"))
         self.model_editor_heading.setWordWrap(True)
@@ -2204,7 +2264,7 @@ class AgentPanelWidget(QWidget):
             members = group['models']
             name = active if active in members else group['model']
             group['model'] = name
-            self.saved_model_selector.addItem(self._provider_names.get(name, "自定义供应商") + f" · {len(members)} 个模型", name)
+            self.saved_model_selector.addItem(self._provider_names.get(name, "自定义供应商"), name)
         self.saved_model_selector.setCurrentIndex(self.saved_model_selector.findData(active))
         self.saved_model_selector.blockSignals(False)
         for group in groups:
@@ -2243,7 +2303,7 @@ class AgentPanelWidget(QWidget):
                 label.setStyleSheet(f"color:{text_color};background:transparent;")
                 texts.addWidget(label)
             row_layout.addLayout(texts, 1)
-            if self._active_model in members:
+            if self._active_model in members and group.get("enabled", True):
                 marker = QLabel('●')
                 marker.setObjectName('activeMarker')
                 marker.setToolTip('当前对话使用的模型')
@@ -2306,6 +2366,7 @@ class AgentPanelWidget(QWidget):
                         self.base_url_edit, self.api_key_edit, self.model_combo, self.key_eye):
             control.setEnabled(not loading)
         self.provider_name_edit.setEnabled(not loading)
+        self.provider_enabled.setEnabled(not loading)
 
     def _reset_key_field(self):
         self.key_eye.setChecked(False)
@@ -2339,6 +2400,7 @@ class AgentPanelWidget(QWidget):
             self.retry_profile_btn.show()
             self.save_btn.setEnabled(False)
             return
+        self.provider_enabled.setChecked(data.get("enabled", True))
         self.base_url_edit.setText(data.get("base_url", ""))
         self._set_editor_provider(data.get("base_url", ""))
         self._reset_key_field()
@@ -2352,6 +2414,7 @@ class AgentPanelWidget(QWidget):
         self.settings_scroll.verticalScrollBar().setValue(0)
 
     def _new_model(self):
+        self.provider_enabled.setChecked(True)
         self._profile_request_id += 1
         self._editor_model = None
         self._editing_provider_models = []
@@ -2443,7 +2506,7 @@ class AgentPanelWidget(QWidget):
             QTimer.singleShot(0, self.reflow)
 
     def _update_model_shortcut(self, *_):
-        model = self._active_model or "选择模型"
+        model = (self._active_model or "选择模型") if self._active_provider_enabled() else "供应商已停用"
         controls = U.px(110)
         if not self.allow_python.isHidden():
             controls += U.px(85)
@@ -2480,15 +2543,22 @@ class AgentPanelWidget(QWidget):
             f'QMenu#inputModelMenu::indicator:checked{{image:url("{check}");}}'
             f"QMenu#inputModelMenu::separator{{height:1px;background:{pal['input_border']};"
             f"margin:{U.px(6)}px {U.px(10)}px;}}")
-        heading = menu.addAction(self._provider_names.get(self._active_model, '当前供应商'))
-        heading.setEnabled(False)
-        heading.setFont(U.qfont('tiny'))
-        for model in self._provider_models_for(self._active_model):
-            action = menu.addAction(model)
-            action.setData(model)
-            action.setCheckable(True)
-            action.setChecked(model == self._active_model)
-            action.triggered.connect(lambda checked=False, name=model: self._switch_input_model(name))
+        groups = self._input_model_groups()
+        for index, group in enumerate(groups):
+            if index:
+                menu.addSeparator()
+            heading = menu.addAction(group.get('provider_name') or self._provider_names.get(group['models'][0], '自定义供应商'))
+            heading.setEnabled(False)
+            heading.setFont(U.qfont('tiny'))
+            for model in group['models']:
+                action = menu.addAction(model)
+                action.setData(model)
+                action.setCheckable(True)
+                action.setChecked(model == self._active_model)
+                action.triggered.connect(lambda checked=False, name=model: self._switch_input_model(name))
+        if not groups:
+            empty = menu.addAction('暂无已启用的模型')
+            empty.setEnabled(False)
         menu.addSeparator()
         menu.addAction('管理供应商和模型…', lambda: self.settings_btn.setChecked(True))
         return menu
@@ -2507,7 +2577,7 @@ class AgentPanelWidget(QWidget):
         menu.popup(QPoint(x, y))
 
     def _switch_input_model(self, model):
-        if model == self._active_model or model not in self._provider_models_for(self._active_model):
+        if model == self._active_model or model not in self._input_available_models():
             return
         self.model_shortcut.setEnabled(False)
         self._spawn_cfg_worker({'model': model}, '/config',
@@ -2558,9 +2628,9 @@ class AgentPanelWidget(QWidget):
         self.cfg_hint.setText("正在连接…")
         request_id = self._profile_request_id
         self._spawn_cfg_worker(payload, "/test_connection",
-                               lambda data: self._on_test_result(data, request_id))
+                               lambda data: self._on_test_result(data, request_id, payload["base_url"]))
 
-    def _on_test_result(self, data: dict, request_id=None):
+    def _on_test_result(self, data: dict, request_id=None, requested_url=None):
         if request_id is not None and request_id != self._profile_request_id:
             return
         self.test_btn.setEnabled(True)
@@ -2568,6 +2638,10 @@ class AgentPanelWidget(QWidget):
         if data.get("backend_down"):
             self._auto_revive(retry=self._test_connection)
             return
+        effective_url = data.get("base_url")
+        if (effective_url and requested_url is not None
+                and self.base_url_edit.text().strip() == requested_url):
+            self.base_url_edit.setText(effective_url)
         if data.get("ok"):
             models = data.get("models") or []
             current = self.model_combo.currentText().strip()
@@ -2586,7 +2660,7 @@ class AgentPanelWidget(QWidget):
             )
             return
         if data.get("reachable"):
-            self.cfg_hint.setText(f"{data.get('error', '接口异常')}——地址可达，但没能取到模型列表。")
+            self.cfg_hint.setText(data.get("error") or "未能获取模型列表，请检查 API 地址或手动添加模型。")
         else:
             self.cfg_hint.setText(f"连接失败：{data.get('error', '未知错误')}")
 
@@ -2719,6 +2793,7 @@ class AgentPanelWidget(QWidget):
             "models": list(dict.fromkeys(self._saved_models + models + [model])),
         }
         payload["api_key"] = self.api_key_edit.text().strip()
+        payload["provider_enabled"] = self.provider_enabled.isChecked()
         payload["provider_name"] = self.provider_name_edit.text().strip() or self.preset_combo.currentText()
         payload['provider_models'] = models
         payload['provider_model'] = self._editor_model
@@ -2959,6 +3034,9 @@ class AgentPanelWidget(QWidget):
         return super().eventFilter(obj, event)
 
     def _on_send(self):
+        if not self._active_provider_enabled():
+            self.status.setText("该供应商已停用，请启用供应商或选择其他模型。")
+            return
         text = self.input.toPlainText().strip()
         if not text:
             return

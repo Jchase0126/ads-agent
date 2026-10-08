@@ -23,6 +23,17 @@ import urllib.request
 import adslog
 
 
+def normalize_base_url(base_url: str) -> str:
+    """Complete known official service roots without changing custom API paths."""
+    base_url = base_url.strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(base_url)
+    if (parsed.scheme in ("http", "https")
+            and parsed.netloc.lower() in ("api.stepfun.com", "api.stepfun.ai")
+            and not parsed.path and not parsed.query and not parsed.fragment):
+        return base_url + "/v1"
+    return base_url
+
+
 class LLMError(RuntimeError):
     pass
 
@@ -99,7 +110,7 @@ def chat_stream(cfg: dict, messages: list, tools: list | None = None, timeout: i
     远程服务缺密钥才报错。
     """
     api_key = cfg.get("llm_api_key", "")
-    base_url = cfg["llm_base_url"].rstrip("/")
+    base_url = normalize_base_url(cfg["llm_base_url"])
     if not api_key and not local_service(base_url):
         raise LLMError(
             "未配置 LLM API Key：请在 config.ini 的 [llm] api_key 填写，"
@@ -272,7 +283,7 @@ def list_models(base_url: str, api_key: str = "", timeout: int = 20) -> list[str
     Raises ApiUnreachable when the host cannot be reached, LLMError otherwise
     (bad auth, missing /models endpoint, malformed payload).
     """
-    url = base_url.rstrip("/") + "/models"
+    url = normalize_base_url(base_url) + "/models"
     headers = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -284,7 +295,7 @@ def list_models(base_url: str, api_key: str = "", timeout: int = 20) -> list[str
         if e.code in (401, 403):
             raise LLMError(f"认证失败（HTTP {e.code}）：API 密钥无效或无权限") from e
         if e.code == 404:
-            raise LLMError("地址可达，但该服务未提供 /models 模型列表接口（可手动填写模型名）") from e
+            raise LLMError("模型列表路径返回 HTTP 404，请检查 API 地址是否包含版本路径（如 /v1）；若服务不支持模型列表，可手动添加模型") from e
         detail = ""
         try:
             detail = e.read().decode("utf-8", errors="replace")[:200]

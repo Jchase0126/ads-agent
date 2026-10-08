@@ -129,6 +129,8 @@ def _read_profiles(parser) -> dict:
             raise ValueError("模型连接配置格式无效")
         if not all(isinstance(profile.get(k, ""), str) for k in ("base_url", "api_key", "provider_name")):
             raise ValueError("模型连接参数必须为字符串")
+        if not isinstance(profile.get("enabled", True), bool):
+            raise ValueError("供应商启用状态必须为布尔值")
     connection = {
         "base_url": parser.get("llm", "base_url", fallback=DEFAULTS["llm_base_url"], raw=True),
         "api_key": parser.get("llm", "api_key", fallback="", raw=True),
@@ -149,6 +151,7 @@ def model_profile(name: str) -> dict | None:
         return None
     return {"model": name, "base_url": profile.get("base_url", ""),
             "api_key": profile.get("api_key", ""), "provider_name": provider_label(profile),
+            "enabled": profile.get("enabled", True),
             "models": next((g['models'] for g in provider_groups(cfg) if name in g['models']), [name])}
 
 
@@ -164,7 +167,8 @@ def provider_groups(cfg):
         if profile is None:
             continue
         identity = _connection_identity(profile)
-        group = grouped.setdefault(identity, dict(model=name, provider_name=provider_label(profile), models=[]))
+        group = grouped.setdefault(identity, dict(model=name, provider_name=provider_label(profile), enabled=profile.get("enabled", True), models=[]))
+        group['enabled'] = group['enabled'] and profile.get("enabled", True)
         group['models'].append(name)
     return list(grouped.values())
 
@@ -203,6 +207,7 @@ def update_llm_settings(
     provider_name: str | None = None,
     provider_models: list | None = None,
     provider_model: str | None = None,
+    provider_enabled: bool | None = None,
 ) -> dict:
     """Persist [llm] settings into config.ini, preserving comments & other keys.
 
@@ -213,6 +218,8 @@ def update_llm_settings(
     否则"保存 LLM 设置"和"轮换令牌"会各自按旧快照整文件写回，
     把对方刚写的字段覆盖掉（典型：刚轮换的令牌被还原成公开默认值）。
     """
+    if provider_enabled is not None and not isinstance(provider_enabled, bool):
+        raise ValueError("供应商启用状态必须为布尔值")
     updates: dict[str, str] = {}
     if base_url is not None and base_url.strip():
         updates["base_url"] = base_url.strip()
@@ -242,6 +249,8 @@ def update_llm_settings(
             connection["api_key"] = api_key.strip()
         if provider_name is not None:
             connection["provider_name"] = provider_name.strip()
+        if provider_enabled is not None:
+            connection["enabled"] = provider_enabled
         if provider_models is not None:
             if not isinstance(provider_models, list) or not provider_models or not all(
                     isinstance(n, str) and n.strip() for n in provider_models):

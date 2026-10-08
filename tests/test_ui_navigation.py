@@ -575,21 +575,27 @@ def test_provider_search_matches_names_and_models_and_preserves_selection():
     widget.close()
 
 
-def test_grouped_sidebar_and_input_menu_use_active_provider_only():
+def test_grouped_input_menu_lists_all_enabled_providers_and_switches_between_them():
     widget = make(760, 850)
     widget._active_model = 'a'
     widget._ingest_provider_groups({'provider_groups': [
         dict(model='a', models=['a', 'b'], provider_name='同一供应商'),
-        dict(model='c', models=['c'], provider_name='另一个供应商')]})
-    widget._refresh_saved_models(['a', 'b', 'c'], {'a': '同一供应商', 'b': '同一供应商', 'c': '另一个供应商'})
-    eq(widget.saved_model_list.count(), 2)
+        dict(model='c', models=['c'], provider_name='另一个供应商'),
+        dict(model='d', models=['d'], provider_name='停用供应商', enabled=False)]})
+    widget._refresh_saved_models(['a', 'b', 'c', 'd'], {'a': '同一供应商', 'b': '同一供应商', 'c': '另一个供应商'})
+    eq(widget.saved_model_list.count(), 3)
     menu = widget._build_input_model_menu()
-    eq([a.data() for a in menu.actions() if a.data()], ['a', 'b'])
+    eq([a.data() for a in menu.actions() if a.data()], ['a', 'b', 'c'])
     eq([a.data() for a in menu.actions() if a.isChecked()], ['a'])
     requests = []
     widget._spawn_cfg_worker = lambda payload, path, callback: requests.append((payload, callback))
-    widget._switch_input_model('c')
+    widget._switch_input_model('d')
     eq(len(requests), 0)
+    widget._switch_input_model('c')
+    payload, callback = requests.pop()
+    eq(payload, {'model': 'c'})
+    callback(dict(model='c'))
+    eq(widget._active_model, 'c')
     widget._switch_input_model('b')
     payload, callback = requests.pop()
     eq(payload, {'model': 'b'})
@@ -641,6 +647,51 @@ def test_composer_status_tracks_phases_stops_and_preserves_errors():
     ok(widget.run_status_row.isVisible())
     eq(widget.run_status_text._full_text, '执行失败：连接中断')
     ok(widget.run_stop_btn.isHidden())
+    widget.close()
+
+
+def test_connection_normalized_address_preserves_credentials_and_new_draft():
+    widget = make()
+    root = 'https://api.stepfun.com'
+    effective = root + '/v1'
+    widget.base_url_edit.setText(root)
+    widget.api_key_edit.setText('test-key')
+    widget._on_test_result(dict(ok=True, base_url=effective, models=['test-model']),
+                           widget._profile_request_id, root)
+    eq(widget.base_url_edit.text(), effective)
+    eq(widget.api_key_edit.text(), 'test-key')
+    widget.base_url_edit.setText('https://custom.invalid/v2')
+    widget._on_test_result(dict(ok=False, reachable=True, base_url=effective,
+                               error='HTTP 404'), widget._profile_request_id, root)
+    eq(widget.base_url_edit.text(), 'https://custom.invalid/v2')
+    eq(widget.cfg_hint.text(), 'HTTP 404')
+    widget._on_test_result(dict(ok=True, base_url=effective, models=['other']),
+                           widget._profile_request_id - 1, 'https://custom.invalid/v2')
+    eq(widget.base_url_edit.text(), 'https://custom.invalid/v2')
+    widget.close()
+
+
+def test_supplier_switch_hides_models_and_preserves_editor_credentials():
+    widget = make()
+    widget._active_model = 'off-model'
+    widget._ingest_provider_groups(dict(provider_groups=[
+        dict(models=['off-model'], enabled=False), dict(models=['on-model'], enabled=True)]))
+    widget._on_profile_loaded(dict(base_url='https://test.invalid/v1', api_key='test-key',
+                                  enabled=False, models=['off-model']),
+                              widget._editor_model, widget._profile_request_id)
+    ok(not widget.provider_enabled.isChecked())
+    eq(widget._input_available_models(), ['on-model'])
+    eq([a.data() for a in widget._build_input_model_menu().actions() if a.data()], ['on-model'])
+    widget.input.setPlainText('hello')
+    widget._on_send()
+    eq(widget.input.toPlainText(), 'hello')
+    ok('已停用' in widget.status.text())
+    widget.provider_enabled.setFocus()
+    QTest.keyClick(widget.provider_enabled, Qt.Key.Key_Space)
+    ok(widget.provider_enabled.isChecked())
+    eq(widget.api_key_edit.text(), 'test-key')
+    widget._new_model()
+    ok(widget.provider_enabled.isChecked())
     widget.close()
 
 

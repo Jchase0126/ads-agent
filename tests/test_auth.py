@@ -483,6 +483,34 @@ def test_provider_multiple_models_share_updates_and_model_only_switch():
     eq(server.config_mod.model_profile('other-account')['api_key'], 'fake-other-key')
 
 
+def test_provider_switch_persists_shared_state_and_blocks_chat():
+    connection = dict(base_url='https://toggle.invalid/v1', api_key='fake-toggle-key',
+                      provider_name='Toggle', model='toggle-a',
+                      provider_models=['toggle-a', 'toggle-b'], provider_enabled=False)
+    status, raw = _call('/config', method='POST', token=TOKEN, body=connection)
+    eq(status, 200)
+    group = next(g for g in _json(raw)['provider_groups'] if 'toggle-a' in g['models'])
+    eq(group['enabled'], False)
+    for model in ('toggle-a', 'toggle-b'):
+        _, raw = _call('/config/model', method='POST', token=TOKEN, body=dict(model=model))
+        eq(_json(raw)['enabled'], False)
+        eq(_json(raw)['api_key'], 'fake-toggle-key')
+        status, raw = _call('/chat', method='POST', token=TOKEN,
+                            body=dict(model=model, messages=[dict(role='user', content='hello')]))
+        eq(status, 400)
+        contains(_json(raw)['error'], '已停用')
+    connection.update(provider_model='toggle-a', provider_enabled=True)
+    status, raw = _call('/config', method='POST', token=TOKEN, body=connection)
+    eq(status, 200)
+    group = next(g for g in _json(raw)['provider_groups'] if 'toggle-b' in g['models'])
+    eq(group['enabled'], True)
+    eq(server.config_mod.load()['llm_profiles']['toggle-b']['api_key'], 'fake-toggle-key')
+    connection['provider_enabled'] = 'false'
+    status, raw = _call('/config', method='POST', token=TOKEN, body=connection)
+    eq(status, 500)
+    eq(server.config_mod.model_profile('toggle-a')['enabled'], True)
+
+
 if __name__ == "__main__":
     try:
         code = run(globals(), "后端接口鉴权")
