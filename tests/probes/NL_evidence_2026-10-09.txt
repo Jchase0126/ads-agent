@@ -1,0 +1,990 @@
+########## NL_q1_workspace ##########
+PROBE_Q1_BEGIN
+{
+  "import_de": "ok",
+  "workspace_is_open": true,
+  "active_workspace": {
+    "path": "E:\\ADS\\Work_AI\\BFR106_wrk",
+    "is_open": true,
+    "lib_defs_file": "E:\\ADS\\Work_AI\\BFR106_wrk\\lib.defs",
+    "library_names": [
+      "BFR106_lib",
+      "Infineon_RF",
+      "Infineon_RF_tech",
+      "Simulation_Sequencing",
+      "TDK_Component_Library_v2019.10",
+      "TDK_Component_Library_v2019.10_tech",
+      "ads_behavioral",
+      "ads_bondwires",
+      "ads_builtin",
+      "ads_common_cmps",
+      "ads_datacmps",
+      "ads_designs",
+      "ads_pelib",
+      "ads_quantum",
+      "ads_rflib",
+      "ads_schematic_layers",
+      "ads_schematic_layers_ic",
+      "ads_schematic_ports_ic",
+      "ads_serdes_ref_channel",
+      "ads_simulation",
+      "ads_sources",
+      "ads_standard_layers",
+      "ads_standard_layers_ic",
+      "ads_textfonts",
+      "ads_tlines",
+      "empro_standard_layers"
+    ],
+    "writable_library_names": [
+      "BFR106_lib"
+    ]
+  }
+}
+PROBE_Q1_END
+
+
+########## NL_q2_library_cfg ##########
+PROBE_Q2_BEGIN
+{
+  "libraries": {
+    "TDK_Component_Library_v2019.10": {
+      "path": "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\TDK_Component_Library_v2019.10",
+      "lib_name": "TDK_Component_Library_v2019.10",
+      "is_read_only": true,
+      "is_an_ads_library": false,
+      "cfg_substituted": {
+        "BOOT_AEL": "../de/ael/boot",
+        "DESIGN_KIT_NAME": "TDK_Component_Library",
+        "DESIGN_KIT_ROOT": "../",
+        "VERSION": "v2019.10",
+        "LIB_BROWSER_CTL": "../circuit/records/TDK_Component_Library.ctl",
+        "INPUT_DATA_PATH": "../circuit/data;../circuit/models",
+        "DEFAULTS_DESIGNS": "",
+        "UNBOOT_AEL_FUNC": "",
+        "TECH_DESC": ""
+      },
+      "cfg_raw": {
+        "BOOT_AEL": "../de/ael/boot",
+        "DESIGN_KIT_ROOT": "../"
+      },
+      "boot_ael_probe": {
+        "../de/ael/boot": false,
+        "../de/ael/boot.ael": false,
+        "../de/ael/boot.atf": false
+      },
+      "eesof_lib_cfg_exists": true
+    },
+    "TDK_Component_Library_v2019.10_tech": {
+      "path": "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\TDK_Component_Library_v2019.10_tech",
+      "lib_name": "TDK_Component_Library_v2019.10_tech",
+      "is_read_only": true,
+      "is_an_ads_library": false,
+      "cfg_substituted": {
+        "BOOT_AEL": "",
+        "DESIGN_KIT_NAME": "",
+        "DESIGN_KIT_ROOT": "",
+        "VERSION": "",
+        "LIB_BROWSER_CTL": "",
+        "INPUT_DATA_PATH": "",
+        "DEFAULTS_DESIGNS": "",
+        "UNBOOT_AEL_FUNC": "",
+        "TECH_DESC": ""
+      },
+      "cfg_raw": {
+        "BOOT_AEL": "",
+        "DESIGN_KIT_ROOT": ""
+      },
+      "boot_ael_probe": {
+        "": false,
+        ".ael": false,
+        ".atf": false
+      },
+      "eesof_lib_cfg_exists": false
+    }
+  }
+}
+PROBE_Q2_END
+
+
+########## NL_q3_palette ##########
+PROBE_Q3_BEGIN
+{
+  "boot_decls": {
+    "TDK_DK_PATH": "ERR: RuntimeError('Did not find AEL word \"TDK_DK_PATH\" in default vocabulary.')",
+    "TDK_DK_CIRCUIT_DATA_DIR": "ERR: RuntimeError('Did not find AEL word \"TDK_DK_CIRCUIT_DATA_DIR\" in default vocabulary.')",
+    "TDK_DK_BITMAP_DIR": "ERR: RuntimeError('Did not find AEL word \"TDK_DK_BITMAP_DIR\" in default vocabulary.')",
+    "TDK_DK_CIRCUIT_AEL_DIR": "ERR: RuntimeError('Did not find AEL word \"TDK_DK_CIRCUIT_AEL_DIR\" in default vocabulary.')",
+    "TDK_DK_DE_AEL_DIR": "ERR: RuntimeError('Did not find AEL word \"TDK_DK_DE_AEL_DIR\" in default vocabulary.')",
+    "TDK_DK_CIRCUIT_MODELS_DIR": "ERR: RuntimeError('Did not find AEL word \"TDK_DK_CIRCUIT_MODELS_DIR\" in default vocabulary.')",
+    "DEMOKIT_MMWAVE_NAME": "ERR: RuntimeError('Did not find AEL word \"DEMOKIT_MMWAVE_NAME\" in default vocabulary.')",
+    "adstempvar": "ERR: RuntimeError('Did not find AEL word \"adstempvar\" in default vocabulary.')"
+  },
+  "ael_funcs": {
+    "de_define_library_palette": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_define_palette_group": {
+      "is_null": false,
+      "type": "function"
+    },
+    "dk_define_palette_group": {
+      "is_null": false,
+      "type": "function"
+    },
+    "deitem_get_visible_palette_name": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_get_palette_groups": "ERR: RuntimeError('Did not find AEL word \"de_get_palette_groups\" in default vocabulary.')",
+    "de_current_palette_group": "ERR: RuntimeError('Did not find AEL word \"de_current_palette_group\" in default vocabulary.')",
+    "de_undefine_library_palette": "ERR: RuntimeError('Did not find AEL word \"de_undefine_library_palette\" in default vocabulary.')",
+    "de_define_library_palette_group": "ERR: RuntimeError('Did not find AEL word \"de_define_library_palette_group\" in default vocabulary.')",
+    "de_get_visible_palette_name": "ERR: RuntimeError('Did not find AEL word \"de_get_visible_palette_name\" in default vocabulary.')",
+    "de_get_palettes": "ERR: RuntimeError('Did not find AEL word \"de_get_palettes\" in default vocabulary.')",
+    "de_add_library_to_workspace_read_only_mode": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_open_library_read_only_mode": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_is_library_open": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_get_open_libraries": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_get_library_config_file_var": {
+      "is_null": false,
+      "type": "function"
+    }
+  },
+  "windows": {
+    "MAIN_WINDOW": [
+      {
+        "title": "Advanced Design System 2027 (Main)",
+        "type": 0
+      }
+    ],
+    "SCHEMATIC_WINDOW": [
+      {
+        "title": "FM_SC [BFR106_lib:FM_SC:schematic] [EDITING] (Schematic)",
+        "type": 1
+      }
+    ],
+    "LAYOUT_WINDOW": [],
+    "SYMBOL_WINDOW": [],
+    "BROWSER_WINDOW": [],
+    "SUBSTRATE_WINDOW": [],
+    "NOTEBOOK_WINDOW": [],
+    "CONFIG_VIEW_WINDOW": []
+  }
+}
+PROBE_Q3_END
+
+
+########## NL_q3b_calib ##########
+PROBE_Q3B_BEGIN
+{
+  "calibration": {
+    "create_item": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_version_number_int": {
+      "is_null": false,
+      "type": "function"
+    },
+    "designKitRecord": {
+      "is_null": true,
+      "type": ""
+    },
+    "SCHEMATIC_WINDOW": {
+      "is_null": false,
+      "type": "int"
+    },
+    "LAYOUT_WINDOW": {
+      "is_null": false,
+      "type": "int"
+    },
+    "SCHEM_WIN": {
+      "is_null": false,
+      "type": "int"
+    },
+    "LAYOUT_WIN": {
+      "is_null": false,
+      "type": "int"
+    },
+    "TRUE": {
+      "is_null": false,
+      "type": "int"
+    },
+    "NULL": "ERR: RuntimeError('Did not find AEL word \"NULL\" in default vocabulary.')",
+    "analogRFnet": {
+      "is_null": false,
+      "type": "int"
+    }
+  },
+  "visible_palette_0args": {
+    "ok": false,
+    "err": "RuntimeError('AEL function call error: Expected window or design context parameter (not \"NULL\").')"
+  },
+  "dm_find_item_definition": {
+    "TDK_ACM12V": {
+      "is_null": false,
+      "str": "\"TDK_Component_Library_v2019.10:TDK_ACM12V\" "
+    },
+    "TDK_ALT3232M_151_T001": {
+      "is_null": false,
+      "str": "\"TDK_Component_Library_v2019.10:TDK_ALT3232M_151_T001\" "
+    },
+    "demo_mmWave_Res": "ERR: AttributeError(\"'NoneType' object has no attribute 'is_null'\")"
+  }
+}
+PROBE_Q3B_END
+
+
+########## NL_q3c_palette_name ##########
+PROBE_Q3C_BEGIN
+{
+  "probe": {
+    "current_window": {
+      "title": "FM_SC [BFR106_lib:FM_SC:schematic] [EDITING] (Schematic)",
+      "type": 1
+    },
+    "ael_current_window": "ERR: AttributeError(\"'Window' object has no attribute 'is_null'\")",
+    "vpn_with_ael_current_window": "ERR: RuntimeError('AEL function call error: Parameter 1 of de_format_lib_cell_view_name is NULL. Expected a string.')",
+    "vpn_with_win_py": "ERR: RuntimeError('AEL function call error: Parameter 1 of de_format_lib_cell_view_name is NULL. Expected a string.')",
+    "windows_same_lib_TDK": "ERR: AttributeError(\"'NoneType' object has no attribute 'is_null'\")"
+  }
+}
+PROBE_Q3C_END
+
+
+########## NL_q3d_vpn_combos ##########
+PROBE_Q3D_BEGIN
+{
+  "probe": {
+    "vpn_win_only": "ERR: RuntimeError('AEL function call error: Parameter 1 of de_format_lib_cell_view_name is NULL. Expected a string.')",
+    "vpn_win+cell": "ERR: RuntimeError('AEL function call error: Parameter 2 of de_format_lib_cell_view_name is NULL. Expected a string.')",
+    "vpn_win+lcv": "ERR: RuntimeError('AEL function call error: Parameter 2 of de_format_lib_cell_view_name is NULL. Expected a string.')",
+    "vpn_win+lib+cell": "ERR: AttributeError(\"'str' object has no attribute 'is_null'\")",
+    "vpn_win+lib+cell+view": "ERR: AttributeError(\"'str' object has no attribute 'is_null'\")",
+    "candidate_getters": {
+      "de_get_palette_list": "missing",
+      "de_get_palette_group_list": "missing",
+      "de_palette_group_names": "missing",
+      "de_get_visible_palettes": "missing",
+      "de_get_active_palette": "missing",
+      "de_get_window_palette": "missing",
+      "de_get_current_palette": "missing",
+      "de_get_palette_names": "missing",
+      "de_list_palettes": "missing",
+      "deitem_get_palette_name": "missing",
+      "de_get_library_palettes": "missing",
+      "de_get_palette_items": "missing"
+    }
+  }
+}
+PROBE_Q3D_END
+
+
+########## NL_q3e_vpn_value ##########
+PROBE_Q3E_BEGIN
+{
+  "vpn": {
+    "TDK_Component_Library_v2019.10::TDK_ACM12V": {
+      "str": "TDK Common Mode Filters",
+      "repr": "'TDK Common Mode Filters'"
+    },
+    "TDK_Component_Library_v2019.10::TDK_ALT3232M_151_T001": {
+      "str": "TDK Pulse Transformers",
+      "repr": "'TDK Pulse Transformers'"
+    },
+    "TDK_Component_Library_v2019.10::TDK_SGNE04": {
+      "str": "TDK Multilayer Chip Protectors",
+      "repr": "'TDK Multilayer Chip Protectors'"
+    },
+    "TDK_Component_Library_v2019.10::TDK_MMZ0402": {
+      "str": "TDK Chip Beads",
+      "repr": "'TDK Chip Beads'"
+    },
+    "TDK_Component_Library_v2019.10::TDK_Netlist_Include": {
+      "str": "TDK Chip Beads",
+      "repr": "'TDK Chip Beads'"
+    },
+    "TDK_Component_Library_v2019.10::NO_SUCH_CELL_XYZ": {
+      "str": "None",
+      "repr": "None"
+    },
+    "ads_rflib::R": {
+      "str": "Basic Components",
+      "repr": "'Basic Components'"
+    }
+  }
+}
+PROBE_Q3E_END
+
+
+########## NL_q456_api_boot ##########
+PROBE_Q456_BEGIN
+{
+  "app_public_names": [
+    "Action",
+    "Addon",
+    "AddonLocale",
+    "Application",
+    "Button",
+    "DesignModifiedCallback",
+    "DesignOpenedCallback",
+    "DesignWindowCallback",
+    "DesignWindowChange",
+    "Dialog",
+    "Menu",
+    "MenuBar",
+    "MenuState",
+    "PopupMenu",
+    "Separator",
+    "Widget",
+    "Window",
+    "WindowDefinition",
+    "WindowType",
+    "_addon_support",
+    "_cleanup_at_exit",
+    "_design_window",
+    "_main_window",
+    "_palette",
+    "_pde_app",
+    "_popup",
+    "_workspace",
+    "action",
+    "add_memory_addon",
+    "add_user_addon",
+    "addon",
+    "atexit",
+    "callbacks",
+    "create_layout_palette",
+    "create_schematic_palette",
+    "current_window",
+    "current_window_definition",
+    "dds",
+    "enable_addon",
+    "exit_application",
+    "experimental",
+    "find_addon",
+    "find_windows_by_type",
+    "get_design_in_dbu_from_window",
+    "get_design_in_uu_from_window",
+    "import_addon_as_module",
+    "is_design_window",
+    "logging",
+    "main_window",
+    "menu",
+    "os",
+    "prompt_and_save_modified_workspace",
+    "register_design_modified_callback",
+    "register_design_opened_callback",
+    "register_design_window_callback",
+    "remove_memory_addon",
+    "remove_user_addon",
+    "start_server",
+    "unregister_design_modified_callback",
+    "unregister_design_opened_callback",
+    "unregister_design_window_callback",
+    "update_wrapping_types",
+    "widget",
+    "window",
+    "window_definition_by_type"
+  ],
+  "pde_app_names": {
+    "top": [
+      "Addon",
+      "AddonLocale",
+      "CommandClickType",
+      "CommandCoordinateSource",
+      "CommandEndReason",
+      "CommandEvent",
+      "CommandInfo",
+      "CommandKeyEvent",
+      "CommandMouseButton",
+      "CommandPreprocessAction",
+      "CommandPreprocessEvent",
+      "CommandPreprocessResult",
+      "CommandResult",
+      "CommandSnapTo45Mode",
+      "CustomPythonHandle",
+      "DesignCommand",
+      "DesignCommandHandle",
+      "DesignModifiedCallback",
+      "DesignOpenedCallback",
+      "DesignTrackingPainter",
+      "DesignWidgetBase",
+      "DesignWidgetCore",
+      "DesignWindowCallback",
+      "DesignWindowChange",
+      "EdgeTracker",
+      "Handle",
+      "HandleTracker",
+      "HandleType",
+      "VersionControlShowDialogCallback",
+      "VertexTracker",
+      "add_memory_addon",
+      "add_user_addon",
+      "addon",
+      "ael",
+      "check_parameter_sync",
+      "create_command_info",
+      "create_custom_handle_for_instance",
+      "create_edge_tracker",
+      "create_vertex_tracker",
+      "enable_addon",
+      "exit_application",
+      "find_addon",
+      "get_active_command_handle",
+      "get_design_from_window",
+      "get_design_widget_from_window",
+      "is_alt_pressed",
+      "is_control_pressed",
+      "is_shift_pressed",
+      "object_properties",
+      "register_design_modified_callback",
+      "register_design_opened_callback",
+      "register_design_window_callback",
+      "register_handle_generator",
+      "register_version_control_show_dialog_callback",
+      "remove_memory_addon",
+      "remove_user_addon",
+      "start_design_command",
+      "ui",
+      "unregister_callbacks_from_module",
+      "unregister_design_modified_callback",
+      "unregister_design_opened_callback",
+      "unregister_design_window_callback",
+      "unregister_handle_generators_for_library",
+      "unregister_version_control_show_dialog_callback",
+      "vc"
+    ],
+    "ui": [
+      "ActionItemDef",
+      "Button",
+      "ColorScheme",
+      "Combo",
+      "ContextMenuSelectedObjectInfo",
+      "Dialog",
+      "Edit",
+      "Group",
+      "Label",
+      "List",
+      "ListBase",
+      "Menu",
+      "MenuBar",
+      "MenuState",
+      "MsgDialog",
+      "PopupMenu",
+      "RadioBox",
+      "SeparatorActionItem",
+      "SpinBox",
+      "Tool",
+      "Widget",
+      "WidgetType",
+      "WinInstance",
+      "WindowDefinition",
+      "WindowType",
+      "WorkspaceItem",
+      "WorkspaceItemType",
+      "_get_current_color_scheme",
+      "add_to_message_list_widget",
+      "clear_callbacks",
+      "context_menu_callback_is_set",
+      "create_actionitemdef",
+      "create_button",
+      "create_cascade_menu",
+      "create_combo",
+      "create_dlg",
+      "create_edit",
+      "create_list",
+      "create_msg_dlg",
+      "create_popup_menu",
+      "create_separatoractionitem",
+      "create_tool",
+      "create_toolbar",
+      "current_window_definition",
+      "current_window_instance",
+      "execute_in_main_thread",
+      "main_popup_callback_is_set",
+      "popup_callback_is_set",
+      "register_window_toolbar",
+      "selected_workspace_item_types",
+      "selected_workspace_items",
+      "set_context_menu_callback",
+      "set_main_popup_callback",
+      "set_popup_callback",
+      "window_definition_by_type",
+      "windows_by_type"
+    ]
+  },
+  "menu_actions": {
+    "ERR": "AttributeError(\"'MenuBar' object has no attribute 'get_menu_actions'\")"
+  },
+  "boot_funcs": {
+    "de_boot_design_kit": "missing",
+    "de_load_library": "missing",
+    "dk_boot": "missing",
+    "de_design_kit_boot": "missing",
+    "de_load_design_kit": "missing",
+    "de_boot_library": "missing",
+    "de_reload_library": "missing",
+    "de_refresh_library": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_get_current_ads_ael_addon_boot_ael_filepath": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_current_ads_ael_addon_is_loading": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_open_library_read_only_mode": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_add_library_to_workspace_read_only_mode": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_close_library": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_new_library": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_get_open_libraries": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_is_library_open": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_get_path_to_open_library": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_library_config_file_exists": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_create_window": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_get_window": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_window_is_open": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_bring_context_to_top_or_open_new_window": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_show_context_in_new_window": {
+      "is_null": false,
+      "type": "function"
+    },
+    "de_get_windows_with_same_library": {
+      "is_null": false,
+      "type": "function"
+    }
+  }
+}
+PROBE_Q456_END
+
+
+########## NL_q4b_menu ##########
+PROBE_Q4B_BEGIN
+{
+  "menubar": {
+    "menubar_type": "MenuBar",
+    "menubar_dir": [
+      "_from_impl",
+      "_impl",
+      "actions",
+      "add_action",
+      "add_menu",
+      "bitmap_path",
+      "find_action",
+      "find_menu",
+      "insert_action",
+      "insert_menu",
+      "is_checkable",
+      "is_separator",
+      "menus",
+      "name",
+      "original_shortcut",
+      "remove_action",
+      "remove_all_menus",
+      "remove_menu",
+      "shortcut",
+      "tooltip"
+    ],
+    "impl_type": "MenuBar",
+    "impl_has_get_menu_actions": true,
+    "total_paths": 218,
+    "hits": [
+      "\\File\\New\\Library...",
+      "\\File\\Open\\Library...",
+      "\\File\\Manage Libraries...",
+      "\\File\\Copy Library...",
+      "\\File\\Rename Library...",
+      "\\DesignKits\\Unzip Design Kit...",
+      "\\DesignKits\\Manage Favorite Design Kits...",
+      "\\DesignKits\\Manage Libraries...",
+      "\\DesignKits\\Foundries and Vendors\\Component Vendor Partner Webpage"
+    ],
+    "sample": [
+      "\\File",
+      "\\File\\New",
+      "\\File\\New\\Workspace...",
+      "\\File\\New\\Library...",
+      "\\File\\New\\Schematic...",
+      "\\File\\New\\Layout...",
+      "\\File\\New\\Symbol...",
+      "\\File\\New\\Notebook...",
+      "\\File\\New\\EM Setup...",
+      "\\File\\New\\Substrate...",
+      "\\File\\New\\Hierarchy Policy...",
+      "\\File\\New\\VerilogA View...",
+      "\\File\\New\\Config View...",
+      "\\File\\Open",
+      "\\File\\Open\\Workspace...",
+      "\\File\\Open\\Library...",
+      "\\File\\Open\\Schematic...",
+      "\\File\\Open\\Layout...",
+      "\\File\\Open\\Symbol...",
+      "\\File\\Open\\EM Cosimulation View...",
+      "\\File\\Open\\EM Data...",
+      "\\File\\Open\\EM Model...",
+      "\\File\\Open\\EM Setup View...",
+      "\\File\\Open\\EMPro View...",
+      "\\File\\Open\\EmToolPro View...",
+      "\\File\\Open\\Nexus View...",
+      "\\File\\Open\\SIPro/PIPro Setup...",
+      "\\File\\Open\\SMI...",
+      "\\File\\Open\\TCD Project View...",
+      "\\File\\Open\\Notebook..."
+    ]
+  },
+  "bootpath": {
+    "de_get_current_ads_ael_addon_boot_ael_filepath": "ERR: RuntimeError('AEL value is not a string.')",
+    "de_current_ads_ael_addon_is_loading": "ERR: RuntimeError('AEL value is not a string.')"
+  }
+}
+PROBE_Q4B_END
+
+
+########## NL_q4c_win_menus ##########
+PROBE_Q4C_BEGIN
+{
+  "window_menus": {
+    "MAIN_WINDOW#0": {
+      "total": 218,
+      "hits": [
+        "\\File\\New\\Library...",
+        "\\File\\Open\\Library...",
+        "\\File\\Manage Libraries...",
+        "\\File\\Copy Library...",
+        "\\File\\Rename Library...",
+        "\\DesignKits\\Manage Libraries...",
+        "\\DesignKits\\Foundries and Vendors\\Component Vendor Partner Webpage"
+      ]
+    },
+    "SCHEMATIC_WINDOW#0": {
+      "total": 519,
+      "hits": [
+        "\\Edit\\Move\\Move Component Text",
+        "\\Edit\\Increment Component Orientation By -90",
+        "\\Edit\\Component",
+        "\\Edit\\Component\\Edit Component Parameters...",
+        "\\Edit\\Component\\Edit Component Artwork...",
+        "\\Edit\\Component\\",
+        "\\Edit\\Component\\Deactivate/Activate",
+        "\\Edit\\Component\\Deactivate and Short/Activate",
+        "\\Edit\\Component\\Choose View for Simulation...",
+        "\\Edit\\Component\\",
+        "\\Edit\\Component\\Group Edit Parameter Value...",
+        "\\Edit\\Component\\Swap Components...",
+        "\\Edit\\Component\\Swap Views...",
+        "\\Edit\\Component\\Search/Replace Reference...",
+        "\\Edit\\Component\\Update Component Definitions...",
+        "\\Edit\\Component\\Create Hierarchy...",
+        "\\Edit\\Component\\Override Net Connections...",
+        "\\Edit\\Component\\",
+        "\\Edit\\Component\\Hide/Display Component Name",
+        "\\View\\Annotations\\Component Parameters",
+        "\\View\\Docking Windows\\Component Palette",
+        "\\Insert\\Component",
+        "\\Insert\\Component\\Component Library...",
+        "\\Insert\\Component\\",
+        "\\Insert\\Component\\Set Component Orientation UP",
+        "\\Insert\\Component\\Set Component Orientation DOWN",
+        "\\Insert\\Component\\Set Component Orientation LEFT",
+        "\\Insert\\Component\\Set Component Orientation RIGHT",
+        "\\Insert\\Component\\",
+        "\\Insert\\Component\\Edit Component Menu...",
+        "\\Insert\\Component\\",
+        "\\Insert\\Text Display\\Library Name",
+        "\\Options\\Component Palette Configuration...",
+        "\\Options\\Reroute entire wire attached to moved component",
+        "\\Options\\Route around component text",
+        "\\Options\\Route around component symbol",
+        "\\Tools\\Memory Interface Toolkit\\Connect DDR Components...",
+        "\\Tools\\LineCalc\\Send Selected Component To LineCalc",
+        "\\Tools\\LineCalc\\Update Selected Component From LineCalc",
+        "\\Tools\\LineCalc\\Place New Synthesized Component",
+        "\\Tools\\Model Composer\\Create/Modify Library...",
+        "\\Tools\\HSPICE Compatibility Component",
+        "\\Tools\\HSPICE Compatibility Component\\Wizard...",
+        "\\Tools\\HSPICE Compatibility Component\\Encrypt",
+        "\\Tools\\Netlist Export\\Edit Component Definitions...",
+        "\\Tools\\SnP Utilities\\Automatically add pins to component",
+        "\\Layout\\Place Components From Schem To Layout",
+        "\\Layout\\Fix Component Position",
+        "\\Layout\\Lock Component Position",
+        "\\Layout\\Free Component Position",
+        "\\Layout\\Show Equivalent Component",
+        "\\Layout\\Show Unplaced Components",
+        "\\Layout\\Show Components With No Artwork",
+        "\\Layout\\Clear Highlighted Components",
+        "\\Layout\\Show Connected Components",
+        "\\Layout\\Show Fixed/Locked Components"
+      ]
+    }
+  }
+}
+PROBE_Q4C_END
+
+
+########## NL_q4d_action_trigger ##########
+PROBE_Q4D_BEGIN
+{
+  "component_menu_actions": {
+    "\\View\\Docking Windows\\Component Palette": {
+      "type": "ActionItemDef",
+      "dir": [
+        "as_ael_value",
+        "bitmap_path",
+        "find_action_by_name",
+        "find_action_by_name_top_level_only",
+        "get_cascade_menu_item",
+        "get_label_with_hotkey",
+        "get_label_without_hotkey",
+        "get_menu_bar",
+        "is_checkable",
+        "is_separator",
+        "item_path",
+        "name",
+        "original_shortcut_string",
+        "shortcut_string",
+        "tooltip",
+        "visible"
+      ],
+      "has_trigger": false,
+      "has_execute": false,
+      "qwidget": null
+    },
+    "\\Insert\\Component\\Component Library...": {
+      "type": "ActionItemDef",
+      "dir": [
+        "as_ael_value",
+        "bitmap_path",
+        "find_action_by_name",
+        "find_action_by_name_top_level_only",
+        "get_cascade_menu_item",
+        "get_label_with_hotkey",
+        "get_label_without_hotkey",
+        "get_menu_bar",
+        "is_checkable",
+        "is_separator",
+        "item_path",
+        "name",
+        "original_shortcut_string",
+        "shortcut_string",
+        "tooltip",
+        "visible"
+      ],
+      "has_trigger": false,
+      "has_execute": false,
+      "qwidget": null
+    },
+    "\\Options\\Component Palette Configuration...": {
+      "type": "ActionItemDef",
+      "dir": [
+        "as_ael_value",
+        "bitmap_path",
+        "find_action_by_name",
+        "find_action_by_name_top_level_only",
+        "get_cascade_menu_item",
+        "get_label_with_hotkey",
+        "get_label_without_hotkey",
+        "get_menu_bar",
+        "is_checkable",
+        "is_separator",
+        "item_path",
+        "name",
+        "original_shortcut_string",
+        "shortcut_string",
+        "tooltip",
+        "visible"
+      ],
+      "has_trigger": false,
+      "has_execute": false,
+      "qwidget": null
+    }
+  }
+}
+PROBE_Q4D_END
+
+
+########## NL_q6b_groups ##########
+PROBE_Q6B_BEGIN
+{
+  "files": {
+    "libdir": "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\TDK_Component_Library_v2019.10",
+    "kit_root": "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10",
+    "eesof_lib_cfg": {
+      "path": "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\TDK_Component_Library_v2019.10\\eesof_lib.cfg",
+      "exists": true
+    },
+    "boot_ael": {
+      "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\de/ael/boot": false,
+      "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\de/ael/boot.ael": false,
+      "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\de/ael/boot.atf": true
+    },
+    "palette_ael": {
+      "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\de/ael/palette.ael": false,
+      "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\de/ael/palette.atf": true
+    },
+    "circuit_ael_dir": {
+      "path": "E:\\ADS\\Work_AI\\BFR106_wrk\\TDK_Library_for_ADS_v2019.10\\circuit/ael",
+      "exists": true
+    },
+    "circuit_ael_count": 417,
+    "sample_files": [
+      "TDK_ACM1211.atf",
+      "TDK_ACM12V.atf",
+      "TDK_ACM1513.atf",
+      "TDK_ACM2012.atf",
+      "TDK_ACM2012DH.atf"
+    ]
+  },
+  "groups": {
+    "queried": 417,
+    "resolved": 417,
+    "group_count": 10,
+    "groups": {
+      "TDK Common Mode Filters": {
+        "items": 27,
+        "sample": [
+          "TDK_ACM1211",
+          "TDK_ACM12V",
+          "TDK_ACM1513",
+          "TDK_ACM2012"
+        ]
+      },
+      "TDK Inductors": {
+        "items": 152,
+        "sample": [
+          "TDK_ADL3225V",
+          "TDK_ADL3225VT",
+          "TDK_CLF10040_D",
+          "TDK_CLF10060NI_D"
+        ]
+      },
+      "TDK Pulse Transformers": {
+        "items": 3,
+        "sample": [
+          "TDK_ALT3232M_151_T001",
+          "TDK_ALT4532M_171_T001",
+          "TDK_ALT4532M_201_T001"
+        ]
+      },
+      "TDK Varistors": {
+        "items": 10,
+        "sample": [
+          "TDK_AVRH10",
+          "TDK_AVRL04",
+          "TDK_AVRL06",
+          "TDK_AVRL10"
+        ]
+      },
+      "TDK Multilayer Ceramic Chip Capacitors": {
+        "items": 171,
+        "sample": [
+          "TDK_C0510X7R",
+          "TDK_C0816X5R",
+          "TDK_C0816X7S",
+          "TDK_C1005C0G"
+        ]
+      },
+      "TDK 3-Terminal Feed Through Multilayer Ceramic Capacitors": {
+        "items": 3,
+        "sample": [
+          "TDK_CKD610JB",
+          "TDK_CKD61BJB",
+          "TDK_CKD710JB"
+        ]
+      },
+      "TDK Chip Beads": {
+        "items": 22,
+        "sample": [
+          "TDK_KMZ1608_HR",
+          "TDK_KPZ1608_HR",
+          "TDK_MMZ0402",
+          "TDK_MMZ0603"
+        ]
+      },
+      "TDK 3-Terminal Filters": {
+        "items": 23,
+        "sample": [
+          "TDK_MEA1608L",
+          "TDK_MEA1608LC",
+          "TDK_MEA1608PE",
+          "TDK_MEA1608PH"
+        ]
+      },
+      "TDK Multilayer Chip Protectors": {
+        "items": 2,
+        "sample": [
+          "TDK_SGNE04",
+          "TDK_SGNE06"
+        ]
+      },
+      "TDK Noise Suppression Filters": {
+        "items": 3,
+        "sample": [
+          "TDK_VAF201610FA_1",
+          "TDK_VFS5045",
+          "TDK_VFS6045"
+        ]
+      }
+    },
+    "none_cells": [
+      "TDK_Common_Data"
+    ],
+    "errors": []
+  }
+}
+PROBE_Q6B_END
+
+
