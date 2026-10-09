@@ -435,7 +435,7 @@ def active_jobs() -> list:
 _ADS_OPS_PATH = os.path.join(_HERE, "ads_ops.py")
 # ads_ops 依赖的本地纯计算模块：ads_ops 热重载前要先重载它们，
 # 否则 reload(ads_ops) 里的 import 命中 sys.modules 缓存，改了也不生效
-_ADS_OPS_DEPS = ("rf_audit",)
+_ADS_OPS_DEPS = ("rf_audit", "model_ops")
 
 
 def _get_ads_ops():

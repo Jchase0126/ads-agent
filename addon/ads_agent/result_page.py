@@ -15,43 +15,26 @@
 依赖就多一层装不上的风险；曲线用 QPainter 自绘，离线平台（offscreen）也能测。
 """
 
-from __future__ import annotations
-
-# Qt 绑定经 qtcompat 选择（2024/2025=PySide2，2026+=PySide6），见 qtcompat.py
-import qtcompat
-
-QtCore = qtcompat.QtCore()
-QtGui = qtcompat.QtGui()
-QtWidgets = qtcompat.QtWidgets()
-
-Qt = QtCore.Qt
-QRect = QtCore.QRect
-QSize = QtCore.QSize
-QPointF = QtCore.QPointF
-
-QColor = QtGui.QColor
-QFont = QtGui.QFont
-QPainter = QtGui.QPainter
-QPen = QtGui.QPen
-QBrush = QtGui.QBrush
-QPolygonF = QtGui.QPolygonF
-
-QAbstractItemView = QtWidgets.QAbstractItemView
-QBoxLayout = QtWidgets.QBoxLayout
-QHeaderView = QtWidgets.QHeaderView
-QComboBox = QtWidgets.QComboBox
-QDialog = QtWidgets.QDialog
-QFrame = QtWidgets.QFrame
-QGridLayout = QtWidgets.QGridLayout
-QHBoxLayout = QtWidgets.QHBoxLayout
-QLabel = QtWidgets.QLabel
-QPushButton = QtWidgets.QPushButton
-QScrollArea = QtWidgets.QScrollArea
-QSizePolicy = QtWidgets.QSizePolicy
-QTableWidget = QtWidgets.QTableWidget
-QTableWidgetItem = QtWidgets.QTableWidgetItem
-QVBoxLayout = QtWidgets.QVBoxLayout
-QWidget = QtWidgets.QWidget
+from PySide6.QtCore import Qt, QRect, QSize, QPointF
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QPolygonF
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QBoxLayout,
+    QComboBox,
+    QDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
 import uiscale as U
 
@@ -87,6 +70,18 @@ def _fmt(v, digits: int = 3) -> str:
     if f == int(f) and abs(f) < 1e9:
         return str(int(f))
     return f"{f:.{digits}g}"
+
+
+def _hz(value) -> str:
+    """频率数值 -> 人能一眼读懂的单位（展示用，不做任何判定）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    for scale, unit in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")):
+        if abs(v) >= scale:
+            return f"{v / scale:g}{unit}"
+    return f"{v:g}Hz"
 
 
 def _nice_ticks(lo: float, hi: float, count: int = 5) -> list:
@@ -476,7 +471,7 @@ class PointsDialog(QDialog):
 
     def _copy(self):
         """把当前曲线的数据点复制成 CSV（可直接粘到 Excel 或写进报告）。"""
-        QApplication = QtWidgets.QApplication
+        from PySide6.QtWidgets import QApplication
 
         name = self.picker.currentData()
         t = self._traces.get(name) or {}
@@ -580,6 +575,7 @@ class ResultPageRow(QWidget):
 
         self._build_header(lay)
         self._build_design_ref(lay)
+        self._build_model_conditions(lay)
         self._build_metrics(lay)
         self._build_chart(lay)
         self._build_footer(lay)
@@ -665,6 +661,73 @@ class ResultPageRow(QWidget):
         self.open_btn.clicked.connect(self._emit_open)
         row.addWidget(self.open_btn, 0)
         lay.addLayout(row)
+
+    def _build_model_conditions(self, lay):
+        """模型来源与有效条件（原厂模型必须让用户看见"数据从哪来、在什么条件下有效"）。
+
+        为什么专门一块：指标表里"达标"两个字看不出背后是不是拿超出模型有效
+        频段的插值/外推曲线判的。这里把模型来源、有效频段、参考阻抗、偏压
+        写清楚，门禁没过时用警示色标出"未判达标的原因"。
+        """
+        sim = self._job.get("sim") or {}
+        deps = sim.get("model_deps") or {}
+        conditions = sim.get("model_conditions") or []
+        gate = sim.get("model_gate") or {}
+        if not deps and not conditions and not gate:
+            return
+
+        heading = QLabel("模型来源与有效条件")
+        heading.setFont(U.qfont("small", bold=True))
+        heading.setStyleSheet(f"color:{self._pal['text']};")
+        lay.addWidget(heading)
+
+        lines = []
+        state = str(deps.get("state") or "")
+        state_text = {
+            "none": "本次仿真没有引用外部模型文件",
+            "complete": f"已核对 {deps.get('n_deps', 0)} 个模型文件的内容哈希",
+            "incomplete": "模型依赖无法完整确认（按保守策略处理）",
+            "missing": "模型依赖缺失（有文件在盘上找不到）",
+        }.get(state, "")
+        if state_text:
+            lines.append((f"模型依赖：{state_text}", self._pal['subtle']))
+        for cond in conditions:
+            part = cond.get("part") or cond.get("variant") or "（未识别型号）"
+            source = cond.get("source") or "来源未知"
+            if not cond.get("available"):
+                lines.append((f"{part}（{source}）：有效条件未知 —— "
+                              f"{cond.get('reason') or '索引里没有可引用数据'}",
+                              self._pal['subtle']))
+                continue
+            bits = []
+            if cond.get("freq_start_hz") and cond.get("freq_stop_hz"):
+                bits.append("有效频段 %s–%s" % (_hz(cond["freq_start_hz"]),
+                                                _hz(cond["freq_stop_hz"])))
+            else:
+                bits.append("有效频段未知")
+            if cond.get("reference_impedance_ohm"):
+                bits.append("Z0 %gΩ" % cond["reference_impedance_ohm"])
+            if cond.get("bias"):
+                bits.append("偏压 " + ", ".join(
+                    f"{k}={v}" for k, v in dict(cond["bias"]).items()))
+            if cond.get("package_id"):
+                bits.append(f"包 {cond['package_id']}")
+            lines.append((f"{part}（{source}）：" + "，".join(bits),
+                          self._pal['subtle']))
+        if gate:
+            color = self._pal['error'] if gate.get("block") else self._pal['subtle']
+            lines.append((str(gate.get("message") or ""), color))
+
+        for text, color in lines:
+            label = QLabel(text)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setStyleSheet(
+                f"color:{color}; background:{self._pal['card_bg']};"
+                f"border:none; border-radius:{U.R('sm')}px;"
+                f"padding:{U.px(6)}px {U.P('sm')}px; font-size:{U.fs('micro')}px;")
+            lay.addWidget(label)
 
     def _build_metrics(self, lay):
         heading = QLabel("指标评估")
@@ -841,7 +904,7 @@ class ResultPageRow(QWidget):
     def _show_points(self):
         dlg = PointsDialog(self._job, self,
                            on_export_full=self._on_export_full, pal=self._pal)
-        qtcompat.dialog_exec(dlg)
+        dlg.exec()
 
     def set_busy(self, busy: bool, text: str = ""):
         for btn in (self.resim_btn, self.refresh_btn):

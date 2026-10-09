@@ -240,8 +240,28 @@ class DesignJob:
         self.eval_options: dict = {}
         # 仿真时的设计版本（网表指纹）与工作区 —— 结果复用验证与跨工作区防护
         self.design_version: dict = {}
+        # 优化记录（只有**用户明确要求**优化时才会有内容，见
+        # design_service.run_optimization）：候选 / 每轮的仿真证据与指标 /
+        # 最佳已验证结果 / 停止原因。导入模型**不会**自动产生它。
+        self.optimization: dict = {}
 
     # -- 状态 ---------------------------------------------------------------
+    def set_optimization(self, **fields) -> "DesignJob":
+        """合并写入优化记录（不清空已有轮次）。"""
+        for key, value in fields.items():
+            self.optimization[key] = value
+        self._touch()
+        return self
+
+    def add_optimization_iteration(self, record: dict) -> "DesignJob":
+        entry = dict(record or {})
+        rounds = list(self.optimization.get("iterations") or [])
+        entry.setdefault("n", len(rounds) + 1)
+        entry.setdefault("at", utc_now())
+        rounds.append(entry)
+        self.optimization["iterations"] = rounds
+        self._touch()
+        return self
     def can_transition(self, stage: str) -> bool:
         return stage in TRANSITIONS.get(self.stage, ())
 
@@ -388,6 +408,7 @@ class DesignJob:
             "timing": self.timing,
             "eval_options": self.eval_options,
             "design_version": self.design_version,
+            "optimization": self.optimization,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -414,6 +435,7 @@ class DesignJob:
         job.timing = dict(data.get("timing") or {})
         job.eval_options = dict(data.get("eval_options") or {})
         job.design_version = dict(data.get("design_version") or {})
+        job.optimization = dict(data.get("optimization") or {})
         job.updated_at = data.get("updated_at") or job.created_at
         if job.stage not in STAGES:
             job.stage = STAGE_DRAFT

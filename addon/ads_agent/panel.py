@@ -14,8 +14,6 @@ All HTTP (backend + SSE) runs in QThread workers; the ADS main thread only
 paints widgets.
 """
 
-from __future__ import annotations
-
 import configparser
 import json
 import os
@@ -25,8 +23,6 @@ import time
 import urllib.error
 import urllib.request
 
-# Qt 绑定经 qtcompat 选择（ADS 2024/2025 为 PySide2，2026 起为 PySide6，
-# 官方证据见 backend/adscompat.py）；跟随宿主进程已加载的绑定，绝不混用。
 import qtcompat
 
 QtCore = qtcompat.QtCore()
@@ -42,36 +38,48 @@ QRect = QtCore.QRect
 QSize = QtCore.QSize
 QPoint = QtCore.QPoint
 
-QApplication = QtWidgets.QApplication
-QAbstractItemView = QtWidgets.QAbstractItemView
-QCheckBox = QtWidgets.QCheckBox
-QComboBox = QtWidgets.QComboBox
-QDockWidget = QtWidgets.QDockWidget
-QFileDialog = QtWidgets.QFileDialog
-QFormLayout = QtWidgets.QFormLayout
-QFrame = QtWidgets.QFrame
-QGridLayout = QtWidgets.QGridLayout
-QHBoxLayout = QtWidgets.QHBoxLayout
-QLabel = QtWidgets.QLabel
-QLineEdit = QtWidgets.QLineEdit
-QListWidget = QtWidgets.QListWidget
-QListWidgetItem = QtWidgets.QListWidgetItem
-QMainWindow = QtWidgets.QMainWindow
-QMenu = QtWidgets.QMenu
-QScrollArea = QtWidgets.QScrollArea
-QStackedWidget = QtWidgets.QStackedWidget
-QPlainTextEdit = QtWidgets.QPlainTextEdit
-QPushButton = QtWidgets.QPushButton
-QSizePolicy = QtWidgets.QSizePolicy
-QToolButton = QtWidgets.QToolButton
-QVBoxLayout = QtWidgets.QVBoxLayout
-QWidget = QtWidgets.QWidget
+(
+    QApplication,
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDockWidget,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QPlainTextEdit,
+    QScrollArea,
+    QStackedWidget,
+    QPushButton,
+    QSizePolicy,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+) = (QtWidgets.QApplication, QtWidgets.QAbstractItemView,
+     QtWidgets.QCheckBox, QtWidgets.QComboBox, QtWidgets.QDockWidget,
+     QtWidgets.QFileDialog, QtWidgets.QFormLayout, QtWidgets.QFrame,
+     QtWidgets.QGridLayout, QtWidgets.QHBoxLayout, QtWidgets.QLabel,
+     QtWidgets.QLineEdit, QtWidgets.QListWidget, QtWidgets.QListWidgetItem,
+     QtWidgets.QMainWindow, QtWidgets.QMenu, QtWidgets.QPlainTextEdit,
+     QtWidgets.QScrollArea, QtWidgets.QStackedWidget, QtWidgets.QPushButton,
+     QtWidgets.QSizePolicy, QtWidgets.QToolButton, QtWidgets.QVBoxLayout,
+     QtWidgets.QWidget)
 
 import uiscale as U
 import project_store
 from mdplain import to_plain
 
 from result_page import ResultPageRow
+import model_attachments as MA
+from model_attachments import AttachmentRow
 
 # 后端在本机回环上，请求必须**绕过 HTTP 代理**：企业网络常设 HTTP_PROXY，
 # urllib 会连 127.0.0.1 的请求也发给代理，于是面板报"后端未启动"（其实是通的）。
@@ -109,19 +117,39 @@ _BUBBLE_AI_RATIO = 0.94
 _BUBBLE_MIN, _BUBBLE_MAX = 200, 720
 
 
+class ZipAwareInput(QPlainTextEdit):
+    """把剪贴板中的本地文件交给附件处理，避免把 file:// 路径贴进正文。"""
+
+    def __init__(self, on_files, parent=None):
+        super().__init__(parent)
+        self._on_files = on_files
+
+    def insertFromMimeData(self, source):  # noqa: N802 — Qt virtual method
+        paths, has_files = MA.local_paths(source)
+        if not has_files and source is not None and source.hasText():
+            # 某些 Windows 剪贴板只暴露 text/uri-list；只把整段都是本地
+            # file URL 的内容识别为文件，普通文本与网页链接仍按原样粘贴。
+            QUrl = QtCore.QUrl
+            lines = [line.strip() for line in source.text().splitlines() if line.strip()]
+            urls = [QUrl(line) for line in lines]
+            if urls and all(url.isLocalFile() for url in urls):
+                paths = [url.toLocalFile() for url in urls if url.toLocalFile()]
+                has_files = bool(paths)
+        if has_files:
+            self._on_files(paths)
+            return
+        super().insertFromMimeData(source)
+
+
 def _draw_icon(name: str, color: str, size: int = 16):
     """绘制线性矢量图标：16x16 网格、1.5px 圆头描边，2x 像素密度保证 HiDPI 清晰。
 
     文字符号（✂ ⧉ ▤ 🧹）在不同系统字体下粗细/缺字都不一致，改用手绘路径。
     """
-    QPointF = QtCore.QPointF
-    QRectF = QtCore.QRectF
-    QColor = QtGui.QColor
-    QIcon = QtGui.QIcon
-    QPainter = QtGui.QPainter
-    QPainterPath = QtGui.QPainterPath
-    QPen = QtGui.QPen
-    QPixmap = QtGui.QPixmap
+    QPointF, QRectF = QtCore.QPointF, QtCore.QRectF
+    QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap = (
+        QtGui.QColor, QtGui.QIcon, QtGui.QPainter, QtGui.QPainterPath,
+        QtGui.QPen, QtGui.QPixmap)
 
     pm = QPixmap(size * 2, size * 2)
     pm.setDevicePixelRatio(2)
@@ -285,6 +313,21 @@ def _draw_icon(name: str, color: str, size: int = 16):
         right.lineTo(13.6, 8.0)
         right.lineTo(10.2, 11.4)
         p.drawPath(right)
+    elif name == "document":    # 文件卡片中的文档
+        p.drawRoundedRect(QRectF(3.5, 1.5, 9, 13), 1.5, 1.5)
+        line(6, 6, 10, 6)
+        line(6, 9, 10, 9)
+        line(6, 12, 9, 12)
+    elif name == "attach":       # 回形针（附件：添加模型压缩包）
+        # 回形针用两条弧 + 一段斜杆，比文字符号 📎 在各字体下都一致
+        body = QPainterPath()
+        body.moveTo(6.2, 9.4)
+        body.lineTo(10.6, 5.0)
+        body.cubicTo(12.6, 3.0, 11.0, 1.4, 9.4, 3.0)
+        body.lineTo(4.4, 8.0)
+        body.cubicTo(2.4, 10.0, 4.0, 12.2, 6.0, 10.2)
+        body.lineTo(10.4, 5.8)
+        p.drawPath(body)
     p.end()
     return QIcon(pm)
 
@@ -356,6 +399,14 @@ def _auth_header() -> dict:
         return {authbridge.header_name(): authbridge.token()}
     except Exception:  # noqa: BLE001 — 令牌取不到也要把请求发出去，由后端拒绝
         return {}
+
+
+def _safe_size(path: str) -> int:
+    """读本地文件大小；读不到就返回 0（卡片会显示"大小未知"，不假装有）。"""
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
 
 
 def _unauthorized_hint() -> str:
@@ -597,8 +648,7 @@ def _measure_text(text: str, font, text_w: int) -> tuple:
     if hit is not None:
         return hit
 
-    QTextDocument = QtGui.QTextDocument
-    QTextOption = QtGui.QTextOption
+    QTextDocument, QTextOption = QtGui.QTextDocument, QtGui.QTextOption
 
     doc = QTextDocument()
     doc.setDefaultFont(font)
@@ -964,10 +1014,8 @@ class _VerticalTabButton(QPushButton):
         return QSize(U.px(30), U.px(160))
 
     def paintEvent(self, event):  # noqa: N802 — 默认横排文字会被窄宽度裁掉
-        QPainter = QtGui.QPainter
-        QPalette = QtGui.QPalette
-        QStyle = QtWidgets.QStyle
-        QStyleOptionButton = QtWidgets.QStyleOptionButton
+        QPainter, QPalette = QtGui.QPainter, QtGui.QPalette
+        QStyle, QStyleOptionButton = QtWidgets.QStyle, QtWidgets.QStyleOptionButton
 
         opt = QStyleOptionButton()
         self.initStyleOption(opt)
@@ -1172,7 +1220,7 @@ class AgentPanelWidget(QWidget):
         self._loading_models = False
         self._reviving = False
         self._revive_bridge = None
-        self._revive_retry = None
+        self._revive_retries: list = []
         self._side_wanted = True      # 用户是否想看到侧栏（窄面板会临时隐藏）
         self._compact_projects = False
         # 会话隔离：本轮对话固定的项目名（异步事件据此回写），
@@ -1205,6 +1253,22 @@ class AgentPanelWidget(QWidget):
         # 设计结果页：job_id -> job 字典（内存缓存；磁盘上还有 design_jobs/<id>.json）
         self._jobs: dict = {}
         self._deleted_project = None
+        # 模型压缩包附件：上传/导入的 worker 句柄、导入轮询定时器、
+        # 以及"已上传但还没发给 LLM"的附件（用户可以只发附件不打字）
+        self._attach_workers: list = []
+        self._attach_poll = QTimer(self)
+        self._attach_poll.setInterval(MA.POLL_INTERVAL_MS)
+        self._attach_poll.timeout.connect(self._on_attach_poll_tick)
+        self._attach_poll_ticks: dict = {}     # package_id -> 已轮询次数
+        self._attach_op: dict = {}             # package_id -> 后端 op_id（取消用）
+        self._attach_inflight: set = set()     # package_id -> 已有清单请求在途
+        # 待发送附件**按聊天项目分开存**：A 项目刚上传的附件不能因为在 B 项目里
+        # 按了发送就被带进 B 的对话。project -> [{package_id, meta}]
+        self._pending_attachments: dict = {}
+        # 输入框上方的 ZIP 预览卡片。记录只保存在运行内存中，与待发送附件一样
+        # 按聊天项目隔离；会话历史中的正式附件卡片仍由 entries 管理。
+        self._composer_attachments: list = []
+        self._composer_removed_entries: set = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(U.px(12), U.px(12), U.px(12), U.px(12))
@@ -1310,7 +1374,15 @@ class AgentPanelWidget(QWidget):
         self.run_status_row.hide()
         self.status.changed.connect(self._sync_composer_status)
 
-        self.input = QPlainTextEdit()
+        self.composer_attachment_strip = QWidget()
+        self.composer_attachment_strip.setVisible(False)
+        self.composer_attachment_layout = QHBoxLayout(self.composer_attachment_strip)
+        self.composer_attachment_layout.setContentsMargins(0, 0, 0, 0)
+        self.composer_attachment_layout.setSpacing(U.P("sm"))
+        self.composer_attachment_layout.addStretch(1)
+        frame_layout.addWidget(self.composer_attachment_strip)
+
+        self.input = ZipAwareInput(self._on_pasted_files)
         self.input.setPlaceholderText("描述你的设计问题…")
         self.input.setToolTip("Enter 发送 · Shift+Enter 换行")
         self.input.setFrameShape(QPlainTextEdit.Shape.NoFrame)
@@ -1336,6 +1408,13 @@ class AgentPanelWidget(QWidget):
         self.model_shortcut.clicked.connect(self._show_input_model_menu)
         foot.addWidget(self.model_shortcut)
         foot.addStretch(1)
+        # 📎 附件按钮放在剪贴板组**之前**：附件是这一排里唯一的"输入"类动作
+        # （其余都是编辑/视图），排在前面符合"输入 → 附加 → 发送"的视觉顺序。
+        self.attach_btn = self._round_tool_button(
+            "", "添加模型压缩包附件（只支持 .zip，也可以直接把 ZIP 拖进来）")
+        self.attach_btn.setProperty("icon_name", "attach")
+        self.attach_btn.clicked.connect(self._on_pick_zip)
+        foot.addWidget(self.attach_btn)
         # 图标走 _draw_icon 矢量绘制（见 _apply_theme 的上色），不再用文字符号
         self.cut_btn = self._round_tool_button("", "剪切选中文字 (Ctrl+X)")
         self.copy_btn = self._round_tool_button("", "复制选中文字 (Ctrl+C)")
@@ -1367,6 +1446,7 @@ class AgentPanelWidget(QWidget):
 
         # settings box is created after theme so widgets exist for styling
         self._build_settings()
+        self._install_drop_targets()
         self._apply_theme()
         self._load_projects_state()
         self.reload_config()
@@ -1565,6 +1645,8 @@ class AgentPanelWidget(QWidget):
 
         self._apply_project(active, create=True)
         self._refresh_project_list()
+        # 重启后核对附件引用：聊天项目只存引用，资产是否还在要问后端
+        QTimer.singleShot(0, self._verify_attachments)
 
     def _save_projects(self):
         try:
@@ -1595,6 +1677,7 @@ class AgentPanelWidget(QWidget):
         self.entries = proj.setdefault("entries", [])
         self.history = proj.setdefault("history", [])
         self._update_project_context()
+        self._refresh_composer_attachments()
         self._rebuild()
         return True
 
@@ -1656,6 +1739,8 @@ class AgentPanelWidget(QWidget):
             self._refresh_project_list()
             self._save_projects()
             self.status.setText(f"已切换到项目：{name}")
+            # 切到别的项目也要核对该项目里的附件引用（重启恢复的路径一样）
+            QTimer.singleShot(0, self._verify_attachments)
         if self.width() < U.px(560) and self._compact_projects:
             self.side_btn.setChecked(False)
 
@@ -1673,7 +1758,7 @@ class AgentPanelWidget(QWidget):
 
     def _new_project(self):
         dialog = self._project_name_dialog()
-        ok = qtcompat.dialog_exec(dialog)
+        ok = dialog.exec()
         name = dialog.textValue()
         name = (name or "").strip()
         if not ok or not name:
@@ -1702,6 +1787,9 @@ class AgentPanelWidget(QWidget):
             return
         self._deleted_project = (name, projects[name])
         del projects[name]
+        # 该项目还没发出去的附件一并丢掉：留着的话，下一次发送会把**已删除
+        # 项目**的附件带进当前对话。
+        self._pending_attachments.pop(name, None)
         self.project_undo.setVisible(True)
         pending = self._turn_project == name
         if self.projects_data.get("active") == name:
@@ -1824,20 +1912,21 @@ class AgentPanelWidget(QWidget):
             " font-weight:bold;}"
             f"QToolButton:hover{{background:{pal['accent_hover']};}}"
             f"QToolButton:disabled{{background:{pal['card_border']}; color:{pal['subtle']};}}"
-            # 运行中发送键显示中性禁用态：属性选择器 + _set_run_state() 里的
+            # 运行中发送键切换为可点击停止态：属性选择器 + _set_run_state() 里的
             # unpolish/polish 触发重算，主题重刷也不会把运行态样式冲掉
             f"QToolButton[busy=\"true\"]{{background:{pal['hover']};}}"
             f"QToolButton[busy=\"true\"]:hover{{background:{pal['hover']};}}"
         )
         # 矢量线条图标按主题着色（深/浅切换时重画）
-        for button in (self.cut_btn, self.copy_btn, self.paste_btn, self.clear_btn):
+        for button in (self.cut_btn, self.copy_btn, self.paste_btn, self.clear_btn,
+                     self.attach_btn):
             button.setIcon(_draw_icon(str(button.property("icon_name")), pal["subtle"]))
             button.setIconSize(QSize(U.px(16), U.px(16)))
         self.allow_python.setIcon(_draw_icon("code", pal["subtle"]))
         self.allow_python.setIconSize(QSize(U.px(15), U.px(15)))
         # 矢量线条图标按主题着色（深/浅切换时重画）；发送键随运行态换图标
-        busy = self._worker is not None and self._worker.isRunning()
-        send_color = '#ffffff' if busy or not self.dark else pal['panel_bg']
+        busy = bool(self.send.property("busy"))
+        send_color = pal['text'] if busy else ('#ffffff' if not self.dark else pal['panel_bg'])
         self.send.setIcon(_draw_icon("stop" if busy else "send", send_color, size=U.px(18)))
         self.send.setIconSize(QSize(U.px(18), U.px(18)))
         self.model_combo.setStyleSheet(_combo_css(pal, radius_token="pill"))
@@ -2125,8 +2214,7 @@ class AgentPanelWidget(QWidget):
         page_layout.addLayout(footer)
         self.pages.addWidget(self.settings_page)
         self.settings_page.installEventFilter(self)
-        QKeySequence = QtGui.QKeySequence
-        QShortcut = QtGui.QShortcut if hasattr(QtGui, "QShortcut") else QtWidgets.QShortcut
+        QKeySequence, QShortcut = QtGui.QKeySequence, QtGui.QShortcut
         self.settings_escape = QShortcut(QKeySequence("Esc"), self)
         self.settings_escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.settings_escape.activated.connect(lambda: self.settings_btn.setChecked(False))
@@ -2838,10 +2926,11 @@ class AgentPanelWidget(QWidget):
             if retry:
                 QTimer.singleShot(0, retry)
             return
+        if retry:
+            self._revive_retries.append(retry)
         if self._reviving:
             return
         self._reviving = True
-        self._revive_retry = retry
         self.cfg_hint.setText("检测到后端未运行，正在自动启动…")
         self._revive_bridge = _ReviveBridge()
         self._revive_bridge.done.connect(self._on_revived)
@@ -2851,17 +2940,870 @@ class AgentPanelWidget(QWidget):
 
     def _on_revived(self, ok: bool, msg: str):
         self._reviving = False
+        retries, self._revive_retries = self._revive_retries, []
         if ok:
-            retry, self._revive_retry = self._revive_retry, None
-            self.cfg_hint.setText("后端已自动启动" + ("，正在重试…" if retry else ""))
-            if retry:
+            self.cfg_hint.setText("后端已自动启动" + ("，正在重试…" if retries else ""))
+            for retry in retries:
                 QTimer.singleShot(0, retry)
         else:
             self.cfg_hint.setText(f"{msg}（可手动运行 start_backend.bat 查看错误）")
 
+    # ------------------------------------------------- 模型压缩包附件
+    # 落点选了三处：会话区（QListWidget 的 viewport 才是真正的拖放接收者）、
+    # 输入框、以及整个面板。三处都装同一个过滤器，用户拖到哪都能放；
+    # 过滤只在"确实是 ZIP"时接管，其余事件原样放行（见 model_attachments）。
+    def _install_drop_targets(self):
+        self._drop_filter = MA.ZipDropFilter(self._on_zip_dropped,
+                                            self._on_non_zip_dropped, self)
+        for widget in (self.chat, self.chat.viewport(), self.input,
+                       self.input_frame):
+            try:
+                widget.setAcceptDrops(True)
+                widget.installEventFilter(self._drop_filter)
+            except (AttributeError, TypeError):
+                pass       # 宿主控件不支持拖放时不该把面板搞崩
+
+    def _on_pick_zip(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择模型压缩包", "", "ZIP 文件 (*.zip)")
+        if path:
+            self._start_zip_upload(path)
+
+    def _on_pasted_files(self, paths: list):
+        """粘贴文件时只接受 ZIP，绝不把本地路径写进聊天正文。"""
+        zips = [path for path in paths if MA.is_zip_path(path)]
+        others = [path for path in paths if not MA.is_zip_path(path)]
+        if zips:
+            self._on_zip_dropped(zips)
+        if others:
+            self._on_non_zip_dropped(others)
+
+    def _refresh_composer_attachments(self):
+        """重绘输入栏里的文件缩略卡片，卡片只显示当前聊天的附件。"""
+        layout = self.composer_attachment_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        active = self.projects_data.get("active")
+        records = [r for r in self._composer_attachments
+                   if r.get("project") == active]
+        pal = self._pal()
+        for record in records:
+            entry = record["entry"]
+            meta = entry.setdefault("meta", {})
+            card = QFrame()
+            card.setObjectName("composerAttachmentCard")
+            card.setFixedSize(U.px(154), U.px(88))
+            card.setToolTip(str(meta.get("filename") or entry.get("text") or "模型 ZIP"))
+            card.setStyleSheet(
+                f"QFrame#composerAttachmentCard{{background:{pal['card_bg']};"
+                f"border:1px solid {pal['card_border']};"
+                f"border-radius:{U.R('md')}px;}}"
+            )
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(U.px(6), U.px(3), U.px(6), U.px(4))
+            card_layout.setSpacing(0)
+            top = QHBoxLayout()
+            top.addStretch(1)
+            remove = QToolButton()
+            remove.setText("×")
+            remove.setAccessibleName("移除待发送附件")
+            remove.setToolTip("从本次消息中移除")
+            remove.setCursor(Qt.CursorShape.PointingHandCursor)
+            remove.setFixedSize(U.px(20), U.px(20))
+            remove.setStyleSheet(f"QToolButton{{color:{pal['subtle']};border:none;"
+                                  f"font-size:{U.fs('body')}px;}}"
+                                  f"QToolButton:hover{{color:{pal['accent']};}}")
+            remove.clicked.connect(lambda _checked=False, r=record:
+                                   self._remove_composer_attachment(r))
+            top.addWidget(remove)
+            card_layout.addLayout(top)
+            icon = QLabel()
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon.setPixmap(_draw_icon("document", pal["subtle"], U.px(24)).pixmap(
+                U.px(24), U.px(24)))
+            card_layout.addWidget(icon, 1)
+            filename = str(meta.get("filename") or entry.get("text") or "模型 ZIP")
+            status = str(meta.get("state_label") or "上传中")
+            if meta.get("state") == "uploading":
+                status = f"上传中 {int(meta.get('upload_percent') or 0)}%"
+            label = QLabel(filename)
+            label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            label.setToolTip(filename)
+            label.setFont(U.qfont("tiny"))
+            label.setStyleSheet(f"color:{pal['text']};background:transparent;border:none;")
+            label.setText(label.fontMetrics().elidedText(
+                filename, Qt.TextElideMode.ElideMiddle, U.px(138)))
+            card_layout.addWidget(label)
+            detail = QLabel(status)
+            detail.setFont(U.qfont("tiny"))
+            detail.setStyleSheet(f"color:{pal['subtle']};background:transparent;border:none;")
+            card_layout.addWidget(detail)
+            layout.addWidget(card)
+        layout.addStretch(1)
+        self.composer_attachment_strip.setVisible(bool(records))
+
+    def _remove_composer_attachment(self, record: dict):
+        """取消这份 ZIP 随下一条消息发送；已上传的会话资产卡片继续保留。"""
+        if record in self._composer_attachments:
+            self._composer_attachments.remove(record)
+        self._composer_removed_entries.add(id(record.get("entry")))
+        package_id = str((record.get("entry", {}).get("meta") or {}).get("package_id") or "")
+        project = record.get("project")
+        if package_id and project in self._pending_attachments:
+            self._pending_attachments[project] = [
+                item for item in self._pending_attachments[project]
+                if str(item.get("package_id") or "") != package_id
+            ]
+        self._refresh_composer_attachments()
+
+    def _on_non_zip_dropped(self, paths: list):
+        """拖进来的不是 ZIP：明确说不支持，不静默忽略（用户会以为发出去了）。"""
+        names = "、".join(os.path.basename(p) for p in paths[:3])
+        self._add_entry("note",
+                        f"首版只支持 ZIP 模型压缩包，收到的是：{names}。"
+                        f"其它压缩格式（tar / rar / 7z）暂不支持。")
+
+    def _on_zip_dropped(self, paths: list):
+        for path in paths:
+            self._start_zip_upload(path)
+
+    def _start_zip_upload(self, path: str, project: str | None = None,
+                          entry: dict | None = None,
+                          automatic_retry: bool = False):
+        """上传一个 ZIP：先落一张"上传中"的卡片，再起后台线程传字节流。
+
+        卡片在**上传开始前**就建出来：几十 MB 的包要传一会儿，用户需要马上
+        看到"这件事正在发生"，而不是点完按钮后界面毫无反应。
+
+        ``project`` 是这条附件归属的聊天项目（重试时必须传**原项目**，不能拿
+        "此刻屏幕上那一个"）；``entry`` 给定时**就地重传同一张卡片**（重试不
+        该再叠一张新卡片出来，否则一次失败就在会话里留下两三个同名包）。
+        """
+        if not MA.is_zip_path(path):
+            self._on_non_zip_dropped([path])
+            return
+        project = project or self.projects_data.get("active")
+        if entry is None:
+            entry = {
+                "kind": "attachment",
+                "text": os.path.basename(path),
+                "meta": {"filename": os.path.basename(path), "state": "uploading",
+                         "state_label": "上传中", "upload_percent": 0,
+                         "size_bytes": _safe_size(path)},
+                "expanded": True,
+            }
+            if not self._add_entry("attachment", entry["text"], project,
+                                   payload=None, raw_entry=entry):
+                return
+        else:
+            meta = entry.setdefault("meta", {})
+            meta.update({"state": "uploading", "state_label": "上传中",
+                         "upload_percent": 0, "error": "", "message": "",
+                         "missing": False, "missing_reason": ""})
+        if not automatic_retry:
+            entry["meta"].pop("automatic_retry_count", None)
+        worker = MA.UploadWorker(
+            path, base=_backend_base(), auth=_auth_header(),
+            session=project or "")
+        # 记住本地路径：上传失败时"重试"要能重传同一个文件。放在 entry 里
+        # 而不是闭包里，是为了让失败回执（另一个回调）也能拿到它。
+        entry["meta"]["local_path"] = path
+        record = next((r for r in self._composer_attachments
+                       if r.get("entry") is entry), None)
+        if record is None and not automatic_retry:
+            self._composer_attachments.append({"project": project, "entry": entry})
+        if not automatic_retry:
+            self._composer_removed_entries.discard(id(entry))
+        self._refresh_composer_attachments()
+        self._touch_attachment(entry, project)
+        # 用默认参数把项目名与 entry 绑进回调：上传期间切换项目，状态仍然
+        # 写回**发起上传时**的那个项目（与 _on_event 的既有做法一致）。
+        worker.result.connect(
+            lambda data, e=entry, p=project: self._on_upload_done(e, p, data))
+        worker.progress.connect(
+            lambda sent, total, e=entry: self._on_upload_progress(e, sent, total))
+        worker.finished.connect(lambda w=worker: self._gc_attach_worker(w))
+        self._attach_workers.append(worker)
+        worker.start()
+        self.status.setText(f"正在上传 {entry['text']} …（只保存文件并检查包结构，"
+                            f"不解压、不挂库）")
+
+    def _gc_attach_worker(self, worker):
+        if worker in self._attach_workers:
+            self._attach_workers.remove(worker)
+
+    def _on_upload_progress(self, entry: dict, sent: int, total: int):
+        meta = entry.setdefault("meta", {})
+        meta["upload_percent"] = int(sent * 100 / max(1, total))
+        found = self._row_for_entry(entry)
+        if found is not None:
+            found[0].set_progress(sent, total)
+        self._refresh_composer_attachments()
+
+    def _row_for_entry(self, entry: dict):
+        """找这条 entry 当前对应的行控件与它的 item（找不到返回 None）。"""
+        for i in range(self.chat.count()):
+            item = self.chat.item(i)
+            widget = self.chat.itemWidget(item)
+            if getattr(widget, "entry", None) is entry:
+                return widget, item
+        return None
+
+    def _on_upload_done(self, entry: dict, project: str | None, data: dict):
+        """上传回执：把真实结果如实写回卡片，不把失败说成成功。"""
+        meta = entry.setdefault("meta", {})
+        if not data.get("ok"):
+            # 409 no_workspace：没有打开工作区时**不**存到任何默认目录
+            if data.get("kind") == "no_workspace":
+                meta["error"] = MA.NO_WORKSPACE_HINT
+                meta["message"] = str(data.get("error") or "")
+                meta["state"], meta["state_label"] = "failed", "未上传"
+                message = "⚠ " + MA.NO_WORKSPACE_HINT
+            else:
+                meta["error"] = str(data.get("error") or "上传失败")
+                meta["state"], meta["state_label"] = "failed", "上传失败"
+                message = f"上传失败：{meta['error']}"
+            self._touch_attachment(entry, project)
+            self._refresh_composer_attachments()
+            if data.get("backend_down"):
+                retry_count = int(meta.get("automatic_retry_count") or 0)
+                path = str(meta.get("local_path") or "")
+                if path and os.path.isfile(path) and retry_count < 1:
+                    meta["automatic_retry_count"] = retry_count + 1
+                    self.status.setText(
+                        f"{entry.get('text') or '模型 ZIP'}上传连接中断，"
+                        "正在恢复连接并自动重试（最多一次）…")
+                    self._auto_revive(retry=lambda p=path, e=entry, owner=project:
+                                      self._start_zip_upload(
+                                          p, project=owner, entry=e,
+                                          automatic_retry=True))
+                else:
+                    reason = "上传连接仍未恢复" if data.get("connection_interrupted") \
+                        else "后端仍无法连接"
+                    self.status.setText(f"{reason}：{meta.get('error') or '请检查后端状态'}；"
+                                        "可点击卡片上的「重试」再次上传。")
+                    self._auto_revive()
+            elif project == self.projects_data.get("active"):
+                self.status.setText(message)
+            return
+
+        package = dict(data.get("package") or {})
+        workspace = str(data.get("workspace") or package.get("workspace") or "")
+        meta.update({
+            "filename": package.get("filename") or meta.get("filename"),
+            "size_bytes": package.get("size_bytes") or meta.get("size_bytes"),
+            "package_kind": package.get("package_kind"),
+            "package_kind_label": package.get("package_kind_label"),
+            "vendor": package.get("vendor"),
+            "version": package.get("version"),
+            "state": package.get("state") or "saved",
+            "state_label": package.get("state_label"),
+            "model_count": package.get("model_count") or 0,
+            "workspace": workspace,
+            "upload_percent": 100,
+            "message": str(data.get("message") or ""),
+            "library_backup": dict(data.get("shared_library_backup") or {}),
+        })
+        if data.get("scan_note"):
+            meta["message"] = ((meta["message"] + " ") if meta["message"] else "") \
+                + str(data["scan_note"])
+        if data.get("backup_note"):
+            meta["message"] = ((meta["message"] + " ") if meta["message"] else "") \
+                + str(data["backup_note"])
+        package_id = str(package.get("package_id") or "")
+        meta["package_id"] = package_id
+        # 本地路径只是"上传失败时重试用"，成功后就没用了 —— 不留在
+        # projects.json 里（那是用户的磁盘布局，不该被会话文件记下来）。
+        meta.pop("local_path", None)
+        meta.pop("automatic_retry_count", None)
+        entry["text"] = str(meta.get("filename") or entry.get("text") or "")
+        queued_for_composer = id(entry) not in self._composer_removed_entries
+        if package_id and queued_for_composer:
+            # 记住待发送：用户可以只点发送、不打字（附件独立发送）。
+            # 挂在**这条附件所属的项目**名下：另一个聊天里按发送不该带上它。
+            self._pending_attachments.setdefault(project or
+                                                 self.projects_data.get("active"),
+                                                 []).append(
+                {"package_id": package_id, "meta": dict(meta)})
+        self._touch_attachment(entry, project)
+        self._refresh_composer_attachments()
+        reused = "（这份 ZIP 之前已上传过，复用了已有记录）" if data.get("reused") else ""
+        if project == self.projects_data.get("active"):
+            self.status.setText(
+                f"已上传 {meta['filename']}{reused} —— 已保存到工作区，"
+                f"未解压、未加载。需要时点卡片上的「解压并导入」。")
+
+    def _touch_attachment(self, entry: dict, project: str | None) -> None:
+        """附件卡片状态变化后重画。
+
+        优先**就地刷新那一行**：导入轮询每1.6s 一次，整表重建会让会话区
+        持续重排，用户正在读的消息也会被反复打断。找不到行（刚插入、切换
+        项目后重建）才退回整表重建。
+        后台项目的附件只更新数据不重绘 —— 与 _on_event 里"事件写回原项目、
+        只在它前台时渲染"是同一条原则。
+        """
+        active = self.projects_data.get("active")
+        if (project or active) != active:
+            self._save_projects()
+            return
+        found = self._row_for_entry(entry)
+        if found is None:
+            self._rebuild()
+        else:
+            row, item = found
+            row.refresh()
+            row.reflow(max(self.chat.viewport().width() - U.P("xs"), U.px(240)), item)
+        self._save_projects()
+
+    # ---------------------------------------------------------- 卡片动作
+    def _attachment_actions(self) -> dict:
+        return {"import": self._attach_import, "view": self._attach_view,
+                "open": self._attach_open,
+                "resume": self._attach_resume,
+                "cancel": self._attach_cancel, "retry": self._attach_retry,
+                "refresh": self._attach_refresh}
+
+    def _attach_resume(self, entry: dict):
+        """从模型包的候选列表中选定 Design Kit 根目录并继续导入。"""
+        QInputDialog = QtWidgets.QInputDialog
+        import uuid as _uuid
+
+        meta = entry.setdefault("meta", {})
+        detection = meta.get("detection") or {}
+        candidates = detection.get("kit_roots") or detection.get("kit_root_candidates") or []
+        candidates = [str(x) for x in candidates if str(x).strip()]
+        if not detection.get("kit_root_ambiguous") or len(candidates) < 2:
+            self.status.setText("没有多个候选套件目录可供选择，请先查看并刷新模型包详情")
+            return
+        selected, accepted = QInputDialog.getItem(
+            self, "选择 Design Kit 目录", "请选择要导入的套件根目录：",
+            candidates, 0, False)
+        if not accepted or not selected:
+            return
+        package_id = str(meta.get("package_id") or "")
+        project = self._owning_project(entry)
+        meta["state"], meta["state_label"] = "importing", "导入中"
+        meta["message"] = f"正在使用所选目录继续导入：{selected}"
+        self._touch_attachment(entry, project)
+        self._attach_poll_ticks[package_id] = 0
+        if not self._attach_poll.isActive():
+            self._attach_poll.start()
+        self._spawn_model_worker(
+            {"package_id": package_id, "kit_root": selected,
+             "request_id": _uuid.uuid4().hex}, "/models/import",
+            lambda data, e=entry, p=project: self._on_import_ack(e, p, data))
+
+    def _attach_import(self, entry: dict):
+        meta = entry.setdefault("meta", {})
+        package_id = str(meta.get("package_id") or "")
+        if not package_id:
+            self.status.setText("这张附件没有 package_id（上传还没完成或已失败），"
+                                "无法导入")
+            return
+        if meta.get("missing"):
+            # 资产不在当前工作区里：导入一定失败，不如直说，省得白等一轮
+            reason = str(meta.get("missing_reason") or "")
+            if meta.get("workspace_mismatch"):
+                self.status.setText(reason or "这个包不属于当前工作区，无法导入")
+            else:
+                self.status.setText("这个包的资产已不在当前工作区，重新导入没有意义 ——"
+                                    "请在原来那个工作区里操作，或重新上传该 ZIP")
+            return
+        project = self._owning_project(entry)
+        meta["state"], meta["state_label"] = "importing", "导入中"
+        meta["error"] = ""
+        self._touch_attachment(entry, project)
+        self.status.setText("已请求导入（后台执行，解压 + 建索引 + 挂接 ADS 工作区）…")
+        # 先把轮询点起来再发请求：万一回执丢了（后端重启、网络断），
+        # 卡片也不会永远停在"导入中" —— 轮询会把它推到真实状态。
+        self._attach_poll_ticks[package_id] = 0
+        if not self._attach_poll.isActive():
+            self._attach_poll.start()
+        self._spawn_model_worker({"package_id": package_id}, "/models/import",
+                                 lambda data, e=entry, p=project:
+                                 self._on_import_ack(e, p, data))
+
+    def _on_import_ack(self, entry: dict, project: str | None, data: dict):
+        meta = entry.setdefault("meta", {})
+        if not data.get("ok"):
+            meta["state"], meta["state_label"] = "failed", "导入失败"
+            meta["error"] = str(data.get("error") or "导入请求失败")
+            self._touch_attachment(entry, project)
+            if data.get("backend_down"):
+                self._auto_revive()
+            return
+        package_id = str(meta.get("package_id") or "")
+        op_id = str(data.get("op_id") or "")
+        if op_id:
+            self._attach_op[package_id] = op_id
+        meta["message"] = str(data.get("message") or "导入已开始（后台执行）")
+        self._touch_attachment(entry, project)
+        self._attach_poll_ticks[package_id] = 0
+        if not self._attach_poll.isActive():
+            self._attach_poll.start()
+
+    def _on_attach_poll_tick(self):
+        """轮询所有"仍在动"的包的状态。
+
+        跨项目收集：导入是后台长任务，用户中途切到别的项目不该让轮询断掉
+        （否则那条导入的状态就永远停在"导入中"）。
+
+        两个必要的去重：
+          * 同一个包被多个聊天引用时只发**一次**请求（否则 N 个聊天就是 N 倍
+            请求，状态更新还互相覆盖）；
+          * 上一次清单请求还没回来就不重复发（1.6s 一个 tick，慢后端会积压）。
+        """
+        targets = self._attachments_needing_poll()
+        if not targets:
+            self._attach_poll.stop()
+            return
+        by_id: dict = {}
+        for entry, project in targets:
+            package_id = str((entry.get("meta") or {}).get("package_id") or "")
+            if package_id:
+                by_id.setdefault(package_id, []).append((entry, project))
+        keep_polling = False
+        for package_id, owners in by_id.items():
+            self._attach_poll_ticks[package_id] = \
+                self._attach_poll_ticks.get(package_id, 0) + 1
+            if self._attach_poll_ticks[package_id] > MA.POLL_MAX_TICKS:
+                for entry, project in owners:
+                    (entry.setdefault("meta", {}))["message"] = (
+                        "已停止自动刷新导入进度（超过约 "
+                        f"{MA.POLL_MAX_TICKS * MA.POLL_INTERVAL_MS // 60000}"
+                        " 分钟）。可以点「刷新状态」手动查一次，"
+                        "或到工作区的模型目录里看实际结果。")
+                    self._touch_attachment(entry, project)
+                continue
+            keep_polling = True
+            if package_id in self._attach_inflight:
+                continue        # 上一次还没回来，这一拍跳过（不重复发请求）
+            self._attach_inflight.add(package_id)
+            self._spawn_model_worker(None, MA.packages_path(),
+                                     lambda data, pid=package_id:
+                                     self._on_packages(data, pid))
+        if not keep_polling:
+            # 所有还在动的包都超过了上限：停掉定时器，别空转
+            self._attach_poll.stop()
+
+    def _attachments_needing_poll(self) -> list:
+        """所有项目里状态仍是"导入中/检查中"的附件 [(entry, project)]。"""
+        out = []
+        for name, proj in (self.projects_data.get("projects") or {}).items():
+            for entry in (proj.get("entries") or []):
+                meta = entry.get("meta") or {}
+                if entry.get("kind") == "attachment" and \
+                        str(meta.get("state") or "") in MA.POLL_ACTIVE_STATES:
+                    out.append((entry, name))
+        return out
+
+    def _on_packages(self, data: dict, package_id: str,
+                     project: str | None = None):
+        """用 /models/packages 的最新 state 刷新卡片。
+
+        只更新**状态与计数**，不整表重建：轮询每 1.6s 一次，整表重建会让
+        会话区持续重排（用户正在读别的消息也会被打断）。
+
+        同一个包被多个聊天引用时**每个引用都要刷新**（只刷第一个的话，别的
+        聊天里那张卡片会永远停在旧状态）。
+        """
+        self._attach_inflight.discard(package_id)
+        if not data.get("ok"):
+            return
+        packages = {str(p.get("package_id")): p
+                    for p in (data.get("packages") or []) if isinstance(p, dict)}
+        live = packages.get(package_id)
+        owners = self._find_attachments(package_id)
+        if not owners:
+            return
+        truncated = MA.listing_truncated(data)
+        for entry, owner in owners:
+            meta = entry.setdefault("meta", {})
+            if live is None:
+                if truncated:
+                    # 这一页被上限截断了：没出现 ≠ 没了。如实说"没确认"，
+                    # 绝不能把好包标成资产丢失。
+                    meta["message"] = (
+                        f"本次只核对了清单里前 {data.get('returned')} 个包"
+                        f"（共 {data.get('total')} 个），这个包不在这一页里，"
+                        "暂时无法确认它是否还在 —— 可点「刷新状态」再查一次。")
+                    self._touch_attachment(entry, owner)
+                    continue
+                # 轮询时包从清单里消失：如实说不可用，不假装还在导入
+                meta["missing"] = True
+                meta["missing_reason"] = "当前工作区的模型清单里已经没有这个包"
+                meta["state"], meta["state_label"] = "missing", "资产已不可用"
+                self._touch_attachment(entry, owner)
+                continue
+            state = str(live.get("state") or "")
+            meta.update({
+                "state": state or meta.get("state"),
+                "state_label": live.get("state_label") or meta.get("state_label"),
+                "model_count": live.get("model_count", meta.get("model_count")),
+                "package_kind": live.get("package_kind") or meta.get("package_kind"),
+                "package_kind_label": live.get("package_kind_label")
+                                      or meta.get("package_kind_label"),
+                # 清单里也带挂接结果：轮询到"待验证/已就绪"后，「在 ADS 元件
+                # 列表中打开」无需等用户先点「查看模型」就该出现。
+                "library_attach": live.get("library_attach")
+                                  or meta.get("library_attach"),
+                "missing": False,
+                "workspace_mismatch": False,
+            })
+            if live.get("last_error"):
+                meta["error"] = str(live["last_error"])
+            self._touch_attachment(entry, owner)
+            if (state == "awaiting_user" and not meta.get("detection")
+                    and not meta.get("kit_root_lookup_pending")):
+                meta["kit_root_lookup_pending"] = True
+                self._spawn_model_worker(
+                    None, f"/models/package?id={package_id}",
+                    lambda detail, e=entry, p=owner:
+                    self._on_package_detail(e, p, detail))
+
+    def _attach_view(self, entry: dict):
+        """查看模型：拉包详情（识别依据 + 型号索引）并就地展开。"""
+        package_id = str((entry.get("meta") or {}).get("package_id") or "")
+        if not package_id:
+            self.status.setText("这张附件没有 package_id，无法查看模型清单")
+            return
+        entry["expanded"] = True
+        project = self._owning_project(entry)
+        # 展开状态改了要立刻重画（折叠头要翻向、详情区要露出来），
+        # 等回执到再画会让用户以为"点了没反应"
+        self._touch_attachment(entry, project)
+        self.status.setText("正在读取模型包清单…")
+        self._spawn_model_worker(
+            None, f"/models/package?id={package_id}",
+            lambda data, e=entry, p=project: self._on_package_detail(e, p, data))
+
+    def _on_package_detail(self, entry: dict, project: str | None, data: dict):
+        meta = entry.setdefault("meta", {})
+        meta["kit_root_lookup_pending"] = False
+        if not data.get("ok"):
+            meta["error"] = str(data.get("error") or "读取失败")
+            self._touch_attachment(entry, project)
+            if data.get("backend_down"):
+                self._auto_revive()
+            return
+        package = dict(data.get("package") or {})
+        for key in ("state", "state_label", "model_count", "package_kind",
+                    "package_kind_label", "vendor", "version", "last_error"):
+            if package.get(key) is not None:
+                meta[key] = package[key]
+        meta["detection"] = package.get("detection") or {}
+        meta["models"] = package.get("models") or []
+        meta["models_truncated"] = package.get("models_truncated") or 0
+        if package.get("validation"):
+            meta["validation"] = package["validation"]
+        # 挂接结果（哪些库已挂到工作区）决定「在 ADS 元件列表中打开」是否可点，
+        # 必须随详情一起落到卡片 meta 里。
+        if package.get("library_attach") is not None:
+            meta["library_attach"] = package["library_attach"]
+        if not meta.get("workspace") and package.get("workspace"):
+            meta["workspace"] = package["workspace"]
+        self._touch_attachment(entry, project)
+        self._sync_sibling_cards(entry, meta)
+        if project == self.projects_data.get("active"):
+            self.status.setText(
+                f"已读取 {meta.get('filename') or '该模型包'} 的清单："
+                f"{meta.get('model_count') or len(meta.get('models') or [])} 个型号")
+
+    def _attach_open(self, entry: dict):
+        """在 ADS 元件列表中打开：请后端把该包已挂接的库在原生入口里打开/置前。
+
+        与「查看模型」同一套后台请求（**不经 LLM**）：只把后端返回的结构化
+        证据（boot.loaded / native.* / limits）如实渲染到卡片详情区。原生打开
+        是长任务，超时按契约给足（后端 ≥240s）。
+        """
+        meta = entry.setdefault("meta", {})
+        package_id = str(meta.get("package_id") or "")
+        if not package_id:
+            self.status.setText("这张附件没有 package_id，无法请求在 ADS 元件列表中打开")
+            return
+        if meta.get("missing"):
+            self.status.setText("这个包的资产不在当前工作区，无法在 ADS 元件列表中打开")
+            return
+        entry["expanded"] = True
+        project = self._owning_project(entry)
+        # 先写"请求中"再重画：等回执到才动会让用户以为点了没反应。
+        # 注意**不**碰 meta["error"]：那是导入失败的口径，打开失败不该把
+        # 整张卡片误标成"导入失败"。
+        meta["native_list"] = {"ok": True, "outcome": "",
+                               "message": "正在请求 ADS 打开元件列表…"}
+        self._touch_attachment(entry, project)
+        self.status.setText("已请求在 ADS 元件列表中打开（后台执行，会打开/置前原生入口）…")
+        self._spawn_model_worker(
+            {"package_id": package_id}, "/models/open",
+            lambda data, e=entry, p=project: self._on_open_result(e, p, data),
+            timeout=300)
+
+    def _on_open_result(self, entry: dict, project: str | None, data: dict):
+        meta = entry.setdefault("meta", {})
+        if not data.get("ok"):
+            # 请求层失败（HTTP/连接）：错误留在 native_list 里，不动 meta["error"]。
+            meta["native_list"] = {
+                "ok": False, "outcome": "failed",
+                "error": str(data.get("error") or "打开请求失败")}
+            self._touch_attachment(entry, project)
+            if data.get("backend_down"):
+                self._auto_revive()
+            return
+        result = data.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        result = dict(result)
+        result.setdefault("ok", True)
+        meta["native_list"] = result
+        # 后端同时回带最新清单视图：顺手把状态/挂接结果刷新，避免卡片停在旧值。
+        package = dict(data.get("package") or {})
+        for key in ("state", "state_label", "model_count", "package_kind",
+                    "package_kind_label", "last_error"):
+            if package.get(key) is not None:
+                meta[key] = package[key]
+        if package.get("library_attach") is not None:
+            meta["library_attach"] = package["library_attach"]
+        self._touch_attachment(entry, project)
+        self._sync_sibling_cards(entry, meta)
+        if project == self.projects_data.get("active"):
+            self.status.setText(
+                f"已请求在 ADS 元件列表中打开 {meta.get('filename') or '该模型包'}："
+                f"{result.get('outcome') or '已返回结果'}")
+
+    def _sync_sibling_cards(self, entry: dict, meta: dict) -> None:
+        """同一个包在别的聊天里也有卡片时，把状态同步过去。
+
+        只同步"这个包是什么状态"这类事实（state / 型号数 / 类型），**不**把
+        型号清单本身复制到每张卡片 —— 那是几 KB 到几十 KB 的重复，会白白把
+        projects.json 撑大。
+        """
+        package_id = str(meta.get("package_id") or "")
+        if not package_id:
+            return
+        for other, owner in self._find_attachments(package_id):
+            if other is entry:
+                continue
+            other_meta = other.setdefault("meta", {})
+            touched = False
+            for key in ("state", "state_label", "model_count",
+                        "package_kind_label"):
+                if meta.get(key) is not None and meta.get(key) != other_meta.get(key):
+                    other_meta[key] = meta[key]
+                    touched = True
+            if touched:
+                self._touch_attachment(other, owner)
+
+    def _attach_cancel(self, entry: dict):
+        package_id = str((entry.get("meta") or {}).get("package_id") or "")
+        op_id = self._attach_op.get(package_id)
+        if not op_id:
+            self.status.setText("这次导入没有可取消的操作号（可能已经结束）")
+            return
+        project = self._owning_project(entry)
+        meta = entry.setdefault("meta", {})
+        # 文案必须区分"已请求取消"与"已完成的前置步骤保留"：解压到一半的
+        # 目录不会自动回滚，说成"已完全取消"是不诚实的。
+        meta["message"] = ("已请求取消导入。已完成的前置步骤（解压、建索引）"
+                           "会保留，取消后不会继续进入仿真。")
+        self._touch_attachment(entry, project)
+        self.status.setText("已请求取消导入…")
+        self._spawn_model_worker({"op_id": op_id}, "/models/cancel",
+                                 lambda data, e=entry, p=project:
+                                 self._on_cancel_ack(e, p, data))
+
+    def _on_cancel_ack(self, entry: dict, project: str | None, data: dict):
+        meta = entry.setdefault("meta", {})
+        if data.get("ok") is False and not data.get("known"):
+            meta["message"] = "该导入操作已经结束或不存在（可能已经完成）"
+        elif not data.get("ok"):
+            meta["error"] = str(data.get("error") or "取消失败")
+        self._touch_attachment(entry, project)
+
+    def _attach_retry(self, entry: dict):
+        """失败后的重试：先看失败发生在哪一步，再决定重做哪一步。
+
+        上传阶段失败 → 重传同一个本地文件（文件还在磁盘上才有意义，
+        不在就如实说需要重新选）；导入阶段失败 → 再导入一次（导入是幂等的）；
+        资产已不可用 → 只重新核对一次（重传/重导入都救不回一个不在工作区里的包）。
+        """
+        meta = entry.get("meta") or {}
+        project = self._owning_project(entry)
+        if meta.get("missing"):
+            self._attach_view(entry)
+            return
+        if not meta.get("package_id"):
+            path = str(meta.get("local_path") or "")
+            if path and os.path.exists(path):
+                # 回写**这张卡片所在的那个聊天**，不是此刻屏幕上那一个
+                self._start_zip_upload(path, project=project, entry=entry)
+                return
+            self.status.setText("这个 ZIP 没上传成功，且本地文件已不在原路径 —— "
+                                "请重新添加附件")
+            return
+        self._attach_import(entry)
+
+    def _attach_refresh(self, entry: dict):
+        self._attach_view(entry)
+
+    def _owning_project(self, entry: dict) -> str | None:
+        """找这条附件属于哪个项目（异步回写要落到它主人那里）。"""
+        active = self.projects_data.get("active")
+        for name, proj in (self.projects_data.get("projects") or {}).items():
+            if entry in (proj.get("entries") or []):
+                return name
+        return active
+
+    def _find_attachment(self, package_id: str):
+        """按 package_id 找附件（第一个引用）；返回 (entry, project)。"""
+        found = self._find_attachments(package_id)
+        return found[0] if found else (None, None)
+
+    def _find_attachments(self, package_id: str) -> list:
+        """按 package_id 找出**所有**引用，返回 [(entry, project)]。
+
+        同一个包可以被多个聊天引用（例如把同一个 ZIP 拖进两个项目，或一次
+        上传后在别的聊天里也发过）。状态刷新必须覆盖每一处引用，否则其余
+        卡片会停在旧状态。
+        """
+        out = []
+        for name, proj in (self.projects_data.get("projects") or {}).items():
+            for entry in (proj.get("entries") or []):
+                meta = entry.get("meta") or {}
+                if entry.get("kind") == "attachment" and \
+                        str(meta.get("package_id") or "") == package_id:
+                    out.append((entry, name))
+        return out
+
+    def _spawn_model_worker(self, payload: dict | None, path: str, callback,
+                            timeout: int = 120) -> None:
+        worker = MA.ModelApiWorker(path, payload=payload, base=_backend_base(),
+                                   auth=_auth_header(), timeout=timeout)
+        worker.result.connect(callback)
+        worker.finished.connect(lambda w=worker: self._gc_attach_worker(w))
+        self._attach_workers.append(worker)
+        worker.start()
+
+    def _verify_attachments(self):
+        """重启后核对附件引用是否还有效：资产不在了就如实标注。
+
+        只核对**当前项目**里的附件 —— 切到别的项目时再核一遍，避免启动即发
+        一堆请求。核对结果只写回**发起核对时那一组** entry：请求是异步的，
+        回调到达时用户可能已经切到别的项目，不能顺着 self.entries 乱改。
+        """
+        entries = [e for e in self.entries if e.get("kind") == "attachment"]
+        if not entries:
+            return
+        self._spawn_model_worker(None, MA.packages_path(),
+                                 lambda data, es=entries: self._on_verify_packages(data, es))
+
+    def _on_verify_packages(self, data: dict, entries: list | None = None):
+        if entries is None:
+            entries = [e for e in self.entries if e.get("kind") == "attachment"]
+        if not data.get("ok"):
+            if data.get("backend_down"):
+                self._auto_revive(retry=self._verify_attachments)
+            return
+        packages = {str(p.get("package_id")): p
+                    for p in (data.get("packages") or []) if isinstance(p, dict)}
+        current_ws = str(data.get("workspace") or "")
+        truncated = MA.listing_truncated(data)
+        changed = False
+        for entry in entries:
+            if entry.get("kind") != "attachment":
+                continue
+            meta = entry.setdefault("meta", {})
+            package_id = str(meta.get("package_id") or "")
+            if not package_id:
+                # 重启前那次上传根本没完成（ADS 被关了/崩了）。如实说是
+                # "上传中断"，不能让它一直显示"上传中"，也不能算"资产丢失"。
+                if str(meta.get("state") or "") == "uploading":
+                    meta["state"], meta["state_label"] = "failed", "上传中断"
+                    meta["error"] = ("上次上传没有完成（面板已重启或被关闭）。"
+                                     "请重新添加这个 ZIP —— 后端没有收到完整的包。")
+                    changed = True
+                continue
+            live = packages.get(package_id)
+            if live is None:
+                if truncated:
+                    # 清单被返回上限截断：没在这一页里 ≠ 没了。
+                    meta["message"] = (
+                        f"本次只核对了清单里前 {data.get('returned')} 个包"
+                        f"（共 {data.get('total')} 个），这个包不在这一页里，"
+                        "暂时无法确认它是否还在 —— 可点「刷新状态」再查一次。")
+                    changed = True
+                    continue
+                recorded_ws = str(meta.get("workspace") or "")
+                mismatch = bool(current_ws and recorded_ws
+                                and current_ws != recorded_ws)
+                meta["missing"] = True
+                meta["workspace_mismatch"] = mismatch
+                meta["missing_reason"] = (
+                    MA.workspace_mismatch_reason(recorded_ws, current_ws)
+                    if mismatch else
+                    "当前工作区的模型清单里没有这个包"
+                    "（可能换了工作区，或资产已被移除）")
+                changed = True
+                continue
+            if meta.get("missing") or meta.get("workspace_mismatch"):
+                meta["missing"] = False
+                meta["missing_reason"] = ""
+                meta["workspace_mismatch"] = False
+                changed = True
+            if current_ws and meta.get("workspace") != current_ws:
+                meta["workspace"] = current_ws
+                changed = True
+            for key in ("state", "state_label", "model_count", "package_kind",
+                        "package_kind_label", "library_attach"):
+                if live.get(key) is not None and live.get(key) != meta.get(key):
+                    meta[key] = live[key]
+                    changed = True
+        if changed and entries and entries[0] in (self.entries or []):
+            self._rebuild()
+            self._save_projects()
+        elif changed:
+            self._save_projects()
+
+    # ---------------------------------------------------------- 附件（续）
+    def _take_pending_attachments(self, project: str | None = None) -> list:
+        """取走**这个项目**待发送的附件（发出后就清空，避免重复声明）。
+
+        按项目取而不是"全取"：A 项目刚上传的附件不能因为在 B 项目里按了发送
+        就被带进 B 的对话 —— 那等于把 A 的上下文偷偷塞给了 B。
+        """
+        name = project or self.projects_data.get("active")
+        return self._pending_attachments.pop(name, [])
+
+    def _attachment_manifest(self, attachments: list) -> str:
+        """把附件渲染成一小段说明文字。
+
+        只包含**标识与元数据**：文件名、大小、package_id、类型、状态。
+        刻意不包含任何模型文件内容 —— ZIP 从不进入对话历史与 LLM 请求
+        （与 backend/agent.py 系统提示里「上传 ≠ 导入」「先查再用」的纪律配套）。
+        """
+        lines = ["我上传了原厂模型压缩包，作为本轮的附件（内容没有进对话，"
+                 "只给你标识与元数据）："]
+        for item in attachments:
+            meta = dict(item.get("meta") or {})
+            bits = [f"- {meta.get('filename') or '（未命名）'}",
+                    MA.human_size(meta.get("size_bytes")),
+                    meta.get("package_kind_label") or "类型未识别"]
+            vendor = meta.get("vendor")
+            if vendor:
+                bits.append(f"厂商 {vendor}")
+            bits.append(MA.state_label(meta))
+            lines.append(" ".join(str(b) for b in bits)
+                         + f"（package_id: {item.get('package_id')}）")
+        lines.append("请先用模型包清单工具核对里面真实有哪些型号再回答；"
+                     "不要现在就解压或导入，我确认后再说。")
+        return "\n".join(lines)
+
     # ---------------------------------------------------------------- chat
     def _add_entry(self, kind: str, text: str, project: str | None = None,
-                   payload: dict | None = None) -> bool:
+                   payload: dict | None = None,
+                   raw_entry: dict | None = None) -> bool:
         """把一条对话条目写进 `project`（默认当前项目）。
 
         一轮对话在**发送时**就固定了所属项目；如果用户在等待回复期间切到别的
@@ -2872,6 +3814,10 @@ class AgentPanelWidget(QWidget):
         ``payload`` 用于结构化条目（目前是 ``kind="result"`` 的设计结果页）：
         entry 里只存 ``job_id``（轻量、可持久化），完整 job 从内存缓存或
         ``design_jobs/<job_id>.json`` 取 —— 重启 ADS 后仍能重新渲染。
+
+        ``raw_entry`` 用于调用方**自己构造好**整条 entry 的场合（模型附件）：
+        卡片要带自己的 meta 快照（package_id + 元数据），由调用方组装更清楚，
+        这里只负责落到正确的项目里。
         """
         active = self.projects_data.get("active")
         target = project or active
@@ -2883,12 +3829,15 @@ class AgentPanelWidget(QWidget):
         entries = proj.setdefault("entries", [])
         visible = target == active
         had_entries = bool(entries)
-        entry = {"kind": kind, "text": text}
-        if payload:
-            job_id = str(payload.get("job_id") or "")
-            if job_id:
-                entry["job_id"] = job_id
-                self._jobs[job_id] = payload
+        if raw_entry is not None:
+            entry = raw_entry
+        else:
+            entry = {"kind": kind, "text": text}
+            if payload:
+                job_id = str(payload.get("job_id") or "")
+                if job_id:
+                    entry["job_id"] = job_id
+                    self._jobs[job_id] = payload
         entries.append(entry)
 
         if visible:
@@ -2906,7 +3855,8 @@ class AgentPanelWidget(QWidget):
                 self.chat.scrollToBottom()
         elif project is not None:
             # 后台项目收到内容：只在状态栏提示，不渲染到当前会话
-            label = "设计结果页" if kind == "result" else "新消息"
+            label = {"result": "设计结果页",
+                     "attachment": "新附件"}.get(kind, "新消息")
             self.status.setText(f"项目「{target}」有{label}（切回该项目可查看）")
         self._save_projects()
         return True
@@ -2950,6 +3900,11 @@ class AgentPanelWidget(QWidget):
                 on_refresh=self._refresh_job,
                 on_export_full=self._export_full_data,
             )
+        if entry.get("kind") == "attachment":
+            row = AttachmentRow(entry, self._pal(), self._attachment_actions(),
+                                on_toggle=self._attachment_layout_changed)
+            row.entry = entry
+            return row
         row = BubbleRow(entry["kind"], entry["text"], self._pal())
         row.entry = entry           # 流式刷新按 entry 身份找这一行
         return row
@@ -2999,9 +3954,19 @@ class AgentPanelWidget(QWidget):
                 widget.reflow(avail, item)
             elif isinstance(widget, ActivityRow):
                 widget.reflow(avail, item)
+            elif isinstance(widget, AttachmentRow):
+                widget.reflow(avail, item)
 
     def _activity_layout_changed(self):
         self.reflow()
+        self._save_projects()
+
+    def _attachment_layout_changed(self, entry: dict, expanded: bool):
+        """折叠/展开附件卡片：重排 + 落盘（expanded 要能跨重启保留）。"""
+        found = self._row_for_entry(entry)
+        if found is not None:
+            found[0].reflow(max(self.chat.viewport().width() - U.P("xs"), U.px(240)),
+                            found[1])
         self._save_projects()
 
     def _update_clipboard_buttons(self, *_):
@@ -3009,7 +3974,8 @@ class AgentPanelWidget(QWidget):
         self.cut_btn.setEnabled(selected)
         self.copy_btn.setEnabled(selected)
         data = QApplication.clipboard().mimeData()
-        self.paste_btn.setEnabled(bool(data is not None and data.hasText()))
+        self.paste_btn.setEnabled(bool(data is not None and
+                                       (data.hasText() or data.hasUrls())))
 
     def _on_clear(self):
         del self.history[:]
@@ -3038,10 +4004,22 @@ class AgentPanelWidget(QWidget):
             self.status.setText("该供应商已停用，请启用供应商或选择其他模型。")
             return
         text = self.input.toPlainText().strip()
-        if not text:
+        # 只取**当前这个聊天**的待发送附件：别的项目的附件不能被这一发带上
+        project = self.projects_data.get("active")
+        if any(r.get("project") == project and
+               (r.get("entry", {}).get("meta") or {}).get("state") == "uploading"
+               for r in self._composer_attachments):
+            self.status.setText("模型压缩包还在上传，完成后即可发送。")
+            return
+        attachments = self._take_pending_attachments(project)
+        if not text and not attachments:
             return
         if self._worker is not None and self._worker.isRunning():
             self._add_entry("note", "上一轮还在进行中；可点右下角 ■ 键停止后再发…")
+            # 附件不能丢：放回**同一个项目**的待发送队列，这一轮结束后还能直接发
+            if attachments:
+                self._pending_attachments[project] = \
+                    attachments + self._pending_attachments.get(project, [])
             return
         # 固定本轮所属项目：之后所有异步事件都写回它，而不是"此刻屏幕上那一个"
         project = self.projects_data.get("active")
@@ -3049,6 +4027,18 @@ class AgentPanelWidget(QWidget):
         self._activity_entry = None
         self._activity_t0 = 0.0
         self.input.clear()
+        sent_ids = {str(item.get("package_id") or "") for item in attachments}
+        if sent_ids:
+            self._composer_attachments = [
+                r for r in self._composer_attachments
+                if str((r.get("entry", {}).get("meta") or {}).get("package_id") or "")
+                not in sent_ids
+            ]
+            self._refresh_composer_attachments()
+        # 附件独立发送：只发标识与元数据，绝不把 ZIP 内容或路径以外的
+        # 文件数据塞进消息（更不会进 LLM 请求）。
+        if attachments:
+            text = (text + "\n\n" if text else "") + self._attachment_manifest(attachments)
         self.history.append({"role": "user", "content": text})
         self._add_entry("user", text, project)
 
@@ -3107,13 +4097,13 @@ class AgentPanelWidget(QWidget):
         self._worker.stop()
 
     def _set_run_state(self, running: bool):
-        """停止操作由输入框顶部状态栏提供，发送键保留发送图标。"""
+        """发送键在运行时切换为停止键，停止请求发出后等待安全收尾。"""
         self.send.setProperty("busy", running)
-        self.send.setEnabled(not running)
-        self.send.setToolTip("回复进行中，可在状态栏停止" if running else "发送 (Enter)")
-        self.send.setAccessibleName("发送消息")
-        color = '#ffffff' if not self.dark else self._pal()['panel_bg']
-        self.send.setIcon(_draw_icon("send", color, size=U.px(18)))
+        self.send.setEnabled(not (running and self._stopping))
+        self.send.setToolTip("停止本轮回复（正在执行的操作会安全收尾）" if running else "发送 (Enter)")
+        self.send.setAccessibleName("停止本轮回复" if running else "发送消息")
+        color = self._pal()['text'] if running else ('#ffffff' if not self.dark else self._pal()['panel_bg'])
+        self.send.setIcon(_draw_icon("stop" if running else "send", color, size=U.px(18)))
         # 属性选择器不会因 setProperty 自动重算，必须手动重新 polish
         style = self.send.style()
         style.unpolish(self.send)
@@ -3145,11 +4135,10 @@ class AgentPanelWidget(QWidget):
         self.run_status_text.setToolTip(raw)
         self.run_status_text.setAccessibleDescription(raw)
         self.run_status_dot.setVisible(running and not finished)
-        self.run_stop_btn.setVisible(running and not finished)
+        self.run_stop_btn.setVisible(False)
         self.run_stop_btn.setEnabled(not self._stopping)
 
     # ------------------------------------------------- 长耗时工具的可见状态
-
     def _start_tool_timer(self, name: str, project: str | None) -> None:
         """工具执行期间在状态栏显示实时耗时。
 
@@ -3627,12 +4616,6 @@ class _DockTitleBar(QWidget):
         self.setAccessibleName('面板控制栏：仅左侧三圆点区域可拖动')
         layout = QHBoxLayout(self)
         layout.setContentsMargins(U.px(12), U.px(3), U.px(8), U.px(3))
-        layout.addSpacing(U.px(58))
-        self.compat_label = QLabel(_compat_title_suffix(), self)
-        self.compat_label.setVisible(bool(self.compat_label.text()))
-        self.compat_label.setWordWrap(True)
-        self.compat_label.setToolTip(self.compat_label.text())
-        layout.addWidget(self.compat_label)
         layout.addStretch()
         self.collapse_btn = QToolButton(self)
         self.collapse_btn.setFixedSize(U.px(26), U.px(26))
@@ -3645,8 +4628,6 @@ class _DockTitleBar(QWidget):
 
     def restyle(self, pal):
         self._pal = pal
-        self.compat_label.setStyleSheet(
-            f"color:{pal['subtle']};background:transparent;font-size:{U.fs('micro')}px;")
         self.setStyleSheet(
             f"QWidget#agentDockTitleBar{{background:{pal['header_bg']};}}"
         )
@@ -3679,7 +4660,7 @@ class _DockTitleBar(QWidget):
 
     def mousePressEvent(self, event):
         self._dragging = (event.button() == Qt.MouseButton.LeftButton
-                          and self._grip_rect().contains(event.pos()))
+                          and self._grip_rect().contains(event.position().toPoint()))
         self.update()
         event.ignore() if self._dragging else event.accept()
 
@@ -3687,17 +4668,17 @@ class _DockTitleBar(QWidget):
         # Qt may take the mouse grab during a dock drag and handle its release.
         if self._dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
             self._dragging = False
-        self._update_grip_feedback(event.pos())
+        self._update_grip_feedback(event.position().toPoint())
         event.ignore() if self._dragging else event.accept()
 
     def mouseReleaseEvent(self, event):
         was_dragging = self._dragging
         self._dragging = False
-        self._update_grip_feedback(event.pos())
+        self._update_grip_feedback(event.position().toPoint())
         event.ignore() if was_dragging else event.accept()
 
     def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._grip_rect().contains(event.pos()):
+        if event.button() == Qt.MouseButton.LeftButton and self._grip_rect().contains(event.position().toPoint()):
             event.ignore()
         else:
             event.accept()
@@ -3755,23 +4736,6 @@ def _expand_panel() -> None:
         _handle.setVisible(False)
 
 
-def _compat_title_suffix() -> str:
-    """实验性 / 未知版本时给窗口标题加的后缀 —— 开启≠验证通过，必须可见。"""
-    try:
-        import capability
-
-        snap = capability.snapshot()
-        version = snap.get("ads_version") or {}
-        year = version.get("year")
-        if version.get("status") == "known" and year in (2024, 2025, 2026):
-            return f"（实验性 · ADS {year} 未实机验证）"
-        if version.get("status") != "known":
-            return "（实验性 · ADS 版本未识别）"
-    except Exception:  # noqa: BLE001 — 横幅拿不到不影响面板本身
-        pass
-    return ""
-
-
 def open_panel():
     """Show (and dock on first use) the agent panel inside the ADS main window."""
     global _panel, _handle, _handle_tab
@@ -3783,22 +4747,13 @@ def open_panel():
         _expand_panel()
         return _panel
 
-    # main_pyside_widget 是 2027 实测接口；2024/2025 上可能不存在或行为不同。
-    # 获取失败时退化为独立窗口，**不能**让整个面板打开动作崩溃。
-    try:
-        from keysight.ads.de.app import window as app_window
-
-        main_win = app_window.main_pyside_widget()
-    except Exception as e:  # noqa: BLE001
-        print(f"[ADS Agent] 未获取到 ADS 主窗口（{type(e).__name__}: {e}），"
-              "面板将使用独立窗口模式")
-        main_win = None
+    from keysight.ads.de.app import window as app_window
 
     panel_widget = AgentPanelWidget()
-    title = DOCK_TITLE + _compat_title_suffix()
+    main_win = app_window.main_pyside_widget()
 
     if isinstance(main_win, QMainWindow):
-        dock = QDockWidget(title, main_win)
+        dock = QDockWidget(DOCK_TITLE, main_win)
         dock.setObjectName(DOCK_OBJECT_NAME)
         dock.setWidget(panel_widget)
         _install_dock_title_bar(dock, panel_widget)
@@ -3839,7 +4794,7 @@ def open_panel():
     else:
         # fallback: standalone window (main window not found)
         win = QMainWindow()
-        win.setWindowTitle(title)
+        win.setWindowTitle(DOCK_TITLE)
         win.setCentralWidget(panel_widget)
         win.resize(U.px(470), U.px(740))
         win.show()

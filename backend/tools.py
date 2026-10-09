@@ -7,8 +7,6 @@ this module forwards named tool calls to it and returns JSON results.
 注意：令牌只放在请求头里，绝不写进日志或结果 —— 日志记的是工具名、参数和耗时。
 """
 
-from __future__ import annotations
-
 import json
 import time
 import urllib.error
@@ -25,27 +23,12 @@ log = adslog.get("backend.tools")
 # urllib 会连 127.0.0.1 的请求也发给代理，于是"工具服务明明在跑"却报连不上。
 _LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-#: 工具服务身份校验结果缓存：{url: (monotonic 时间, verdict, /health 原始 payload)}。
+#: 工具服务身份校验结果缓存：{url: (monotonic 时间, verdict)}。
 #: 每次工具调用都多打一个 /health 太浪费；但**不校验**就等于把带令牌的请求
 #: 发给了端口上碰巧坐着的任何程序。折中：每个 url 最多 30s 校验一次，
 #: 连接层面一出错立刻作废缓存（下次调用重新判定）。
-#: payload 一并缓存：compat 门禁快照与身份校验共用同一次探测。
-_TOOLSERVER_VERDICT: dict[str, tuple[float, dict, dict]] = {}
+_TOOLSERVER_VERDICT: dict[str, tuple[float, dict]] = {}
 _VERDICT_TTL = 30.0
-
-
-def _probe_cached(cfg: dict) -> tuple:
-    """一次 /health 探测，同时产出身份判定与原始 payload（带 TTL 缓存）。"""
-    url = ads_base_url(cfg)
-    now = time.monotonic()
-    cached = _TOOLSERVER_VERDICT.get(url)
-    if cached and now - cached[0] < _VERDICT_TTL:
-        return cached[1], cached[2]
-    probed = instance.probe(url, timeout=2.0)
-    verdict = instance.evaluate(probed, "toolserver")
-    payload = probed.get("payload") if isinstance(probed.get("payload"), dict) else {}
-    _TOOLSERVER_VERDICT[url] = (now, verdict, payload)
-    return verdict, payload
 
 
 def _verify_toolserver(cfg: dict) -> None:
@@ -56,7 +39,13 @@ def _verify_toolserver(cfg: dict) -> None:
     用户看到的是"无法连接 ADS 端工具服务"这种指向错误的提示。
     """
     url = ads_base_url(cfg)
-    verdict, _payload = _probe_cached(cfg)
+    now = time.monotonic()
+    cached = _TOOLSERVER_VERDICT.get(url)
+    if cached and now - cached[0] < _VERDICT_TTL:
+        verdict = cached[1]
+    else:
+        verdict = instance.evaluate(instance.probe(url, timeout=2.0), "toolserver")
+        _TOOLSERVER_VERDICT[url] = (now, verdict)
 
     if verdict.get("usable"):
         return
@@ -68,7 +57,7 @@ def _verify_toolserver(cfg: dict) -> None:
     if reason == "unreachable":
         raise AdsToolError(
             "无法连接 ADS 端工具服务 "
-            f"({url})。请确认：1) ADS 已启动；2) 已安装并启用 ADS Agent 插件"
+            f"({url})。请确认：1) ADS 2027 已启动；2) 已安装并启用 ADS Agent 插件"
             "（Tools > ADS Agent）；3) 面板打开过一次。"
         )
     if reason in ("foreign_install", "no_install_id"):
@@ -95,82 +84,6 @@ def _verify_toolserver(cfg: dict) -> None:
         f"{url} 上的服务无法确认是本次安装的 ADS Agent 工具服务"
         f"（{verdict.get('detail') or reason}）。为避免把指令发给错误的实例，已停止调用。"
     )
-
-
-# ---------------------------------------------------------------------------
-# 跨版本兼容门禁（后端侧）
-# ---------------------------------------------------------------------------
-# 门禁的**裁决点**在 ADS 端插件（addon/ads_agent/capability.py， pump 派发前）；
-# 这里的预检只是更快、更友好：不可用的工具直接不进 LLM 工具列表、调用前
-# 就报"为什么不可用"，而不是发到 ADS 端被拒再折返一轮。
-
-#: /health 里 compat 快照的缓存：{url: (monotonic, snapshot)}。
-_COMPAT_CACHE: dict[str, tuple[float, dict]] = {}
-_COMPAT_TTL = 60.0
-
-
-def compat_snapshot(cfg: dict) -> dict:
-    """取工具服务 /health 上报的兼容快照（版本 + 能力 + 门禁）。
-
-    ``{"available": False}`` 表示对端插件较旧、没有上报快照 —— 此时**不过滤**
-    工具列表（保持既有行为，裁决完全交给 ADS 端）。
-    """
-    url = ads_base_url(cfg)
-    now = time.monotonic()
-    cached = _COMPAT_CACHE.get(url)
-    if cached and now - cached[0] < _COMPAT_TTL:
-        return cached[1]
-    try:
-        _verdict, payload = _probe_cached(cfg)
-        snap = payload.get("compat") if isinstance(payload.get("compat"), dict) else {}
-    except Exception as e:  # noqa: BLE001 — 快照拿不到不阻塞工具调用
-        log.debug("compat 快照获取失败（不过滤工具列表）: %s: %s", type(e).__name__, e)
-        snap = {}
-    if not snap or snap.get("error"):
-        snap = {"available": False}
-    elif not snap.get("capabilities"):
-        snap = {"available": False}  # 旧版插件（<1.1.0）没有 compat 字段
-    else:
-        snap = dict(snap)
-        snap["available"] = True
-    _COMPAT_CACHE[url] = (now, snap)
-    return snap
-
-
-def tool_unavailable_reason(cfg: dict, name: str) -> str:
-    """该工具在当前 ADS 版本上不可用的原因；可用返回空串。"""
-    if is_local(name):
-        return ""
-    snap = compat_snapshot(cfg)
-    if not snap.get("available"):
-        return ""
-    tools_info = snap.get("tools") if isinstance(snap.get("tools"), dict) else {}
-    decision = tools_info.get(name)
-    if isinstance(decision, dict) and not decision.get("allowed", True):
-        return str(decision.get("reason") or "当前 ADS 版本不可用")
-    return ""
-
-
-def available_tools(cfg: dict) -> list:
-    """给 LLM 的工具列表：过滤掉当前 ADS 版本上不可用的工具。
-
-    过滤依据是 ADS 端上报的门禁结果（同一裁决点的镜像），不可用时原样
-    返回全量列表 —— 宁可让 ADS 端拒绝，也不能在这里凭空造一个列表。
-    """
-    snap = compat_snapshot(cfg)
-    if not snap.get("available"):
-        return TOOLS
-    tools_info = snap.get("tools") if isinstance(snap.get("tools"), dict) else {}
-    if not tools_info:
-        return TOOLS
-    out = []
-    for schema in TOOLS:
-        name = schema.get("function", {}).get("name")
-        decision = tools_info.get(name)
-        if isinstance(decision, dict) and not decision.get("allowed", True):
-            continue
-        out.append(schema)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +422,297 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_shared_model_packages",
+            "description": (
+                "查询 ADS Agent 统一 libraries 目录中已备份的原厂模型 ZIP。"
+                "用户提到其它 Workspace 上传的模型、libraries 中的库或跨工程导入时先调用。"
+                "返回 package_id、厂家、版本和包类型；选择时使用返回的真实 package_id。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "按文件名、厂家、版本、型号或 package_id 搜索"},
+                    "package_kind": {"type": "string", "enum": ["", "touchstone", "design_kit", "mixed", "unknown"]},
+                    "max_items": {"type": "integer", "description": "最多返回条数，默认 50"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_shared_models",
+            "description": (
+                "在统一 libraries 备份的 ZIP 中按具体型号、cell 或库名检索真实文件证据。"
+                "无需先解压到工作区。返回所属 package_id 和包内文件证据，"
+                "用户明确要求使用时再调用 import_shared_model_package。"
+                "检索命中不代表模型已加载或已通过仿真；候选不唯一时先确认型号。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "实际料号、cell 或库名"},
+                    "max_items": {"type": "integer", "description": "最多返回条数，默认 50"},
+                    "package_kind": {"type": "string", "enum": ["", "touchstone", "design_kit", "mixed", "unknown"]},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "import_shared_model_package",
+            "description": (
+                "把统一 libraries 目录中备份的模型包复制到当前 ADS Workspace，"
+                "然后执行安全解压、索引及只读库挂接。用户明确要求从 libraries 导入/使用时调用。"
+                "必须先用 list_shared_model_packages 或 search_shared_models 得到真实 package_id。"
+                "目标 Workspace 由系统绑定，不能传路径。导入成功仍需验证模型后才可称可用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_id": {"type": "string", "description": "共享库查询返回的 package_id"},
+                    "kit_root": {"type": "string", "description": "多候选套件根时从 inspect_model_package 返回值中选"},
+                    "vendor_filter": {"type": "string", "description": "可选厂家库过滤"},
+                },
+                "required": ["package_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_model_packages",
+            "description": (
+                "列出当前 ADS Workspace 里已保存的**原厂模型压缩包资产**"
+                "（用户通过聊天附件上传的 ZIP）。返回每个包的 package_id、原始文件名、"
+                "识别出的包类型（touchstone / design_kit / mixed / unknown）、供应商、版本、"
+                "处理状态、型号数量。\n"
+                "**package_id 是唯一稳定的句柄**（形如 pkg_xxxxxxxxxxxxxxxx），"
+                "后续所有模型工具都用它，不要用文件名指代。\n"
+                "用户说「我之前上传的村田/TDK 模型」「上次那个包」时先调它。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_kind": {
+                        "type": "string",
+                        "enum": ["", "touchstone", "design_kit", "mixed", "unknown"],
+                        "description": "按包类型过滤，留空返回全部",
+                    },
+                    "state": {
+                        "type": "string",
+                        "description": "按状态过滤，如 ready / pending_import / failed；留空返回全部",
+                    },
+                    "max_items": {"type": "integer", "description": "最多返回条数，默认 50"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_model_package",
+            "description": (
+                "查看某个模型包的详细信息：包结构识别依据（evidence）、套件根目录候选、"
+                "内含文件类型统计、型号索引、库挂接信息、验证结果与最近错误。\n"
+                "**不解压、不加载、不执行包内任何脚本** —— 只读清单与索引。"
+                "用户问「这个包里有什么」「能不能用」时先调它再决定是否导入。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_id": {"type": "string", "description": "包 ID，如 pkg_ab12cd34ef567890"},
+                    "include_models": {
+                        "type": "boolean",
+                        "description": "是否返回完整型号索引，默认 true",
+                    },
+                    "max_models": {"type": "integer", "description": "型号索引返回上限，默认 200"},
+                },
+                "required": ["package_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "import_model_package",
+            "description": (
+                "把已保存的模型包**按需**解压并导入当前 ADS Workspace："
+                "安全解压 → 识别套件根目录 → 通过官方 API 挂接到本工作区 → 建模型索引。\n"
+                "**只有用户明确要求导入/解压/使用某个包时才调用**（如「解压刚才那个包」"
+                "「导入之前上传的 TDK 模型」）。上传本身不会自动导入。\n"
+                "Design Kit 默认以**只读**方式挂接到目标工作区（不会去改全局 Favorite "
+                "Design Kit 设置，也不会给原厂库写权限）。\n"
+                "同一个包重复导入是幂等的，不会产生重复挂接。\n"
+                "导入完成**不等于**模型可用 —— 必须再用 validate_model_import 验证。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_id": {"type": "string", "description": "包 ID"},
+                    "kit_root": {
+                        "type": "string",
+                        "description": "可选：套件根目录的包内相对路径。识别出多个候选时必须先"
+                                       "inspect_model_package 看 candidates，再由你或用户选定，"
+                                       "不要武断选第一个",
+                    },
+                    "vendor_filter": {
+                        "type": "string",
+                        "description": "可选：只导入属于该供应商的库（如 tdk / murata / infineon）",
+                    },
+                },
+                "required": ["package_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_vendor_models",
+            "description": (
+                "在**已挂接到当前工作区的**原厂模型库里检索可用元件（cell），"
+                "包含只读的原厂库 —— 这弥补了 list_designs 只能看到可写库的限制。\n"
+                "可按库名、名称前缀、类型（design_kit / builtin / workspace）过滤。\n"
+                "返回元件的库:cell 引用、视图列表与元件模型定义（model_def）里真实读到的"
+                "参数定义 —— 拿不到参数就如实标 null，**不要根据元件名猜参数默认值**。"
+                "\n选型时**必须先调用本工具拿到真实的库名与 cell 名**，"
+                "绝不编造库名、cell 名或参数值。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": {"type": "string", "description": "限定某个库；留空查所有已挂接库"},
+                    "name_prefix": {"type": "string", "description": "cell 名前缀过滤，如 TDK_ / BFP"},
+                    "max_items": {"type": "integer", "description": "最多返回条数，默认 100"},
+                    "include_params": {
+                        "type": "boolean",
+                        "description": "是否读取每个元件的 model_def 参数定义，默认 true；"
+                                       "元件很多时建议关掉以免响应过大",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_vendor_model_info",
+            "description": (
+                "查看**单个**元件的详细信息：所属库与库模式（只读/可写）、cell、视图、"
+                "model_def 的参数定义（名称/类型/默认值/取值范围/单位）、端口定义、"
+                "以及该元件在模型索引里的频率范围与参考阻抗（仅当文件里真实声明时才给值）。\n"
+                "用于回答「这个型号有哪些参数可设」「参考阻抗是多少」这类问题。"
+                "\n**频率范围覆盖不到目标频段时要明确提示，不静默外推**；"
+                "**固定型号的 S 参数模型不能当连续电容/电感值修改** —— "
+                "外围连续参数优化与原厂型号离散选型是两件事，不要混为一谈。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": {"type": "string"},
+                    "cell": {"type": "string"},
+                    "view": {"type": "string", "description": "默认 schematic"},
+                },
+                "required": ["library", "cell"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_model_import",
+            "description": (
+                "验证某个元件模型在当前工作区里**真的可用**：库是否已挂接、"
+                "cell 是否存在且可解析、请求参数是否与元件定义一致、"
+                "端口定义与数量、以及当前工作区与模型包所属工作区是否一致。\n"
+                "**模型与文件指纹的分阶段证据会写入工作区台账**；单个元件验证不代表整包"
+                "可用，整包只有在完整索引中的每个模型都达到仿真验证后才会标记就绪。\n"
+                "run_smoke_sim=true 时会额外做一次最小基础仿真（建临时 cell、放元件、"
+                "跑仿真）来实证；默认 false，**用户没要求验证就不要自动跑耗时仿真**。"
+                "\n型号切换时用它核对端口定义、参数与连接方式是否匹配。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": {"type": "string"},
+                    "cell": {"type": "string"},
+                    "master": {"type": "string"},
+                    "model_file": {"type": "string", "description": "Touchstone 文件路径；可为当前工作区相对路径"},
+                    "package_id": {"type": "string"},
+                    "model_id": {"type": "string"},
+                    "component": {"type": "string"},
+                    "variant": {"type": "object"},
+                    "parameters": {
+                        "type": "object",
+                        "description": "要放置的元件参数，如 {\"Freq\": \"2.4 GHz\"}；留空只做静态校验",
+                    },
+                    "run_smoke_sim": {
+                        "type": "boolean",
+                        "description": "是否额外做一次最小基础仿真实证，默认 false",
+                    },
+                    "require_smoke_sim": {"type": "boolean"},
+                    "target_band": {"type": "object"},
+                    "bias": {"type": "object"},
+                    "package": {"type": "string"},
+                    "temperature": {"type": "string"},
+                },
+                "anyOf": [
+                    {"required": ["library", "cell"]},
+                    {"required": ["model_file"]},
+                    {"required": ["master"]},
+                ],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_vendor_palette",
+            "description": (
+                "把**已导入并挂接**的原厂元件包在 ADS **原生元件列表**里打开/定位："
+                "让用户在 ADS 真正自带的 Palette / Component Library 里看到该包的真实"
+                "分类与元件，再点击放置并选真实料号。\n"
+                "**仅当用户明确要求在原生元件列表中打开时调用**"
+                "（如「在 ADS 元件列表里打开它」「把 TDK 分类调出来」）。"
+                "只是查看包内容请用 inspect_model_package，不要用本工具。\n"
+                "本工具只接受 package_id（及可选的 library / category / view），"
+                "**不接受任何文件路径** —— 目标工作区与套件根目录一律由后端从可信"
+                "上下文解析，你不要也不要尝试传路径。\n"
+                "返回体里的 **limits 要如实转述**：本机 ADS 可能没有程序化打开 Palette "
+                "窗口的 API，此时 outcome 会是 loaded_only（库已加载但界面无法代开），"
+                "**不得改口说「已为你选中分类」**。打开原生列表也**不代表模型可用** —— "
+                "仍需 validate_model_import 验证后才能放进电路仿真。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_id": {
+                        "type": "string",
+                        "description": "包 ID（list_model_packages 返回的稳定句柄）",
+                    },
+                    "library": {
+                        "type": "string",
+                        "description": "可选：要定位的库名；留空取该包第一个已挂接库",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "可选：期望定位的 palette 分类/组名",
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["schematic", "layout"],
+                        "description": "可选：目标视图，默认 schematic",
+                    },
+                },
+                "required": ["package_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "publish_design_result",
             "description": (
                 "把一次设计评估发布成对话里的「设计结果页」。后端会用真实 .ds 数据"
@@ -595,6 +799,32 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_design_optimization",
+            "description": (
+                "仅在用户明确要求优化时，对已有设计任务执行有界的真实仿真优化。"
+                "每个候选都实际应用、重新仿真并由评估器判定；自动限制轮数并保存证据。"
+                "连续参数优化只允许给变量值；型号离散选型必须提供真实元件替换信息，"
+                "若当前没有可安全替换的工作流，应先说明无法自动替换，不要假装已优化。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "已有设计结果页返回的 job_id"},
+                    "kind": {"type": "string", "enum": ["continuous", "discrete"]},
+                    "candidates": {"type": "array", "items": {"type": "object"}},
+                    "max_iterations": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "stop_on_first_pass": {"type": "boolean"},
+                    "on_error": {"type": "string", "enum": ["stop", "continue"]},
+                    "model_conditions": {"type": "object"},
+                    "reference_ohm": {"type": "number"},
+                },
+                "required": ["job_id", "kind", "candidates", "max_iterations"],
+            },
+        },
+    },
 ]
 
 # 工具名 -> 派发到 ADS 端的等待秒数（run_simulation 用 config.ini 的 sim_timeout）
@@ -615,12 +845,49 @@ TIMEOUTS = {
     "run_python": 600,
     # 只读：打开设计 + 生成网表算指纹（结果复用的版本验证用），不给模型直接调用
     "design_fingerprint": 120,
+    # ---- 原厂模型包 ----
+    # 模型包工具的等待上限要按"最坏情况"给：解压 40MB 级 Design Kit + 建索引
+    # 是几十秒级，挂接要进 ADS 工作区；只读库浏览在大套件里上万个 cell 也偏慢。
+    "list_model_packages": 60,
+    "inspect_model_package": 120,
+    # 挂接要进 ADS 工作区改 lib.defs。编排层按阶段拆开派发（而不是一个大
+    # import_model_package），这样取消能在阶段边界生效 —— 对应 ADS 侧
+    # model_ops.attach_design_kit。这三个名字漏登记过一次，后端会把它们判成
+    # "未知工具"，表现为 Design Kit 挂接 100% 失败且报错误导。
+    "attach_design_kit": 900,
+    "detach_design_kit": 180,
+    "list_readonly_libraries": 120,
+    "list_library_components": 300,
+    "inspect_component_model": 180,
+    # 解压 + 挂接 + 建索引合并在一次调用里，给足预算（120s 在 40MB 包上会超时）
+    "import_model_package": 900,
+    "import_shared_model_package": 900,
+    "list_shared_model_packages": 60,
+    "search_shared_models": 120,
+    # 上万个 cell 的原厂库：翻库本身不慢，但读取 model_def 参数定义很贵
+    "list_vendor_models": 300,
+    "get_vendor_model_info": 180,
+    "validate_model_import": 300,
+    # 打开/定位原生元件列表：ADS 端要读 eesof_lib_cfg → boot.ael → palette.ael，
+    # 首批加载大套件可能触发 aelcomp 重编，给足预算（>240）。
+    "open_vendor_palette": 240,
 }
 
 # 这些工具**不**派发到 ADS 端，由后端自己处理（见 agent.py）。
 # 放进 TOOLS 是为了让模型能调用；放进这里是为了让 tools.call() 明确拒绝，
 # 避免误当成 ADS 工具发出去变成一句莫名其妙的"未知工具"。
-LOCAL_TOOLS = {"publish_design_result"}
+LOCAL_TOOLS = {"publish_design_result", "run_design_optimization"}
+
+# 原厂模型包工具：由后端读取 Workspace 的模型清单来回答（纯读本地清单，
+# 不必把 ADS 叫起来），只有真正要动 ADS 库的导入/验证才派发到 ADS 端。
+# 目标 Workspace 一律由**可信应用上下文**（ADS 当前打开的工作区）绑定，
+# 绝不接受 LLM 传入的任意路径 —— 否则模型一句"导入到 C:\..."就能写到别处。
+MODEL_LOCAL_TOOLS = {
+    "list_model_packages",
+    "list_shared_model_packages",
+    "search_shared_models",
+    "inspect_model_package",
+}
 DEFAULT_SIM_TIMEOUT = 900
 # ADS 端比后端多等一会儿：让"超时"由后端统一报出，而不是 ADS 端先回 504
 # 结果后端还在傻等（两边用同一个数值时会出现这种竞态）。
@@ -662,6 +929,11 @@ def is_local(name: str) -> bool:
     return name in LOCAL_TOOLS
 
 
+def is_model_local(name: str) -> bool:
+    """是否是模型包的本地只读工具（读清单即可回答，不必叫起 ADS）。"""
+    return name in MODEL_LOCAL_TOOLS
+
+
 def describe_result(name: str, result) -> tuple:
     """把一次工具调用的结果翻译成 (日志级别, 结果标签)。
 
@@ -691,12 +963,6 @@ def call(cfg: dict, name: str, args: dict, job_id: str = "") -> dict:
         raise AdsToolError(f"未知工具: {name}")
     # 派发前先确认对端身份：带令牌的请求不能发给"碰巧占了那个端口"的服务
     _verify_toolserver(cfg)
-    # 兼容门禁预检（裁决在 ADS 端；这里只是提前报出原因）：
-    # 不可用的工具不发请求 —— "未执行、未写入"是可承诺的最坏情况。
-    deny = tool_unavailable_reason(cfg, name)
-    if deny:
-        log.warning("拒绝 %s（兼容门禁）: %s", name, deny)
-        raise AdsToolError(f"工具 {name} 在当前 ADS 版本上不可用：{deny}")
     import uuid
     job_id = job_id or uuid.uuid4().hex
     url = ads_base_url(cfg) + "/execute"
@@ -759,7 +1025,7 @@ def call(cfg: dict, name: str, args: dict, job_id: str = "") -> dict:
         log.error("<- %s  连接失败(%s): %s", name, _elapsed(), e.reason)
         raise AdsToolError(
             "无法连接 ADS 端工具服务 "
-            f"({url})。请确认：1) ADS 已启动；2) 已安装并启用 ADS Agent 插件"
+            f"({url})。请确认：1) ADS 2027 已启动；2) 已安装并启用 ADS Agent 插件"
             "（Tools > ADS Agent）；3) 面板打开过一次。"
         ) from e
     except TimeoutError as e:

@@ -14,6 +14,21 @@ Endpoints (除 /health 外都需要请求头 X-Ads-Agent-Token，见 ads_auth.py
   POST /design/resimulate -> 按原指标重新仿真并评估（结果页的"重新仿真"）
   POST /design/reload     -> 复用已有 .ds 重新评估（不重新仿真）
   POST /design/open_schematic -> 在 ADS 中打开指定原理图
+  POST /models/upload  -> 二进制上传模型压缩包（**不走 JSON**）
+  GET  /models/packages -> 列出当前工作区的模型包
+  POST /models/import   -> 按需解压并导入某个包
+  POST /models/cancel   -> 请求取消导入
+
+模型压缩包为什么必须走独立的二进制通道
+---------------------------------------
+真实原厂包很大（本机样本 14~41 MB，大的 Design Kit 上百 MB），而 /chat 等
+JSON 接口统一限制 8 MB。把 ZIP 转成 Base64 塞进 JSON 会同时踩三个坑：
+体积膨胀 33%、整个文件进内存、以及**模型文件内容会进聊天历史与 LLM 请求**
+（等于把原厂模型说明书喂给模型，既浪费又危险）。
+
+所以这里用 ``Content-Type: application/zip`` + 二进制请求体：文件内容全程
+不进 JSON、不进对话历史、不进 LLM 请求 —— LLM 只拿 package_id 与元数据。
+仍然受同一个 X-Ads-Agent-Token 保护（凡是能驱动 ADS 的接口都必须鉴权）。
 
 设计闭环的实测值与达标结论一律由 design_metrics 从真实数据算出，
 LLM 只能提供设计与指标定义 —— 见 design_service 的说明。
@@ -26,8 +41,6 @@ LLM 只能提供设计与指标定义 —— 见 design_service 的说明。
 
 Run:  python backend/server.py
 """
-
-from __future__ import annotations
 
 import json
 import os
@@ -46,6 +59,10 @@ import config as config_mod
 import design_job as design_job_mod
 import design_service as design_svc
 import llm as llm_mod
+import model_orchestration
+import model_store
+import model_tools
+import shared_models
 import tools as tools_mod
 from tools import TOOLS
 
@@ -76,6 +93,12 @@ _IDEM_CACHE: dict = {}
 _IDEM_LOCK = threading.Lock()
 _IDEM_TTL = 24 * 3600
 _IDEM_MAX = 500
+
+# 模型包上传：走独立二进制通道（见模块 docstring 的说明）。
+# 真实原厂包 14~41 MB 起，上百 MB 的 Design Kit 也常见；上限取 2 GiB 的
+# Content-Length 校验，实际写入仍按流式分块，不一次性读进内存。
+_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_UPLOAD_CHUNK = 1024 * 1024
 
 
 def _register_turn(turn) -> None:
@@ -115,6 +138,40 @@ def _idem_store(request_id: str, resp: dict) -> None:
 def _new_turn_id() -> str:
     import uuid
     return uuid.uuid4().hex
+
+
+def _decode_upload_filename(headers) -> str:
+    """从请求头取上传文件名，正确处理中文与非 ASCII。
+
+    HTTP 头只能放 ASCII，所以中文文件名要么按 RFC 5987 编码
+    （``filename*=UTF-8''%E6%9D%91%E7%94%B0.zip``），要么退化成 latin-1
+    被 UTF-8 误解码成一串乱码。面板两种都发，这里优先取编码形式，
+    并把 latin-1 乱码**还原**回 UTF-8 —— 否则「村田_模型.zip」会被存成
+    一串看不出所以然的字符名，用户在附件卡片上根本认不出是自己那个包。
+    """
+    import re
+    import urllib.parse
+
+    raw_star = headers.get("X-Ads-Filename-Star") or headers.get("filename*") or ""
+    if raw_star:
+        # format: charset'lang'pct-encoded
+        parts = raw_star.split("'", 2)
+        encoded = parts[2] if len(parts) == 3 else raw_star
+        try:
+            return urllib.parse.unquote(encoded, encoding=parts[0] or "utf-8",
+                                        errors="strict").strip()
+        except (UnicodeDecodeError, LookupError):
+            pass
+    plain = (headers.get("X-Ads-Filename") or headers.get("filename") or "").strip()
+    if not plain:
+        return ""
+    # latin-1 是 HTTP 头的老规矩：中文 UTF-8 字节会被逐字节塞进 latin-1
+    if re.search(r"[\x80-\xff]", plain):
+        try:
+            return plain.encode("latin-1").decode("utf-8").strip()
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+    return plain
 
 
 def workspace_mismatch(current_path: str, target_workspace: str):
@@ -244,16 +301,374 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            self._drain_body()
+            # body 已被 rfile.read(length) **完整消费**，这里绝不能再用
+            # _drain_body() 按 Content-Length 二次读取 —— keep-alive 连接上
+            # 不会再来字节，会把这个服务线程永久挂住（表现为请求一直无响应）。
             if reply:
                 self._send_json({"error": "bad request body"}, 400)
             return None
         if not isinstance(data, dict):
-            self._drain_body()
+            # 同上：body 已读完，直接回 400，不再 drain。
             if reply:
                 self._send_json({"error": "request body must be a JSON object"}, 400)
             return None
         return data
+
+    def _handle_models(self, method: str, path: str) -> None:
+        """模型压缩包的 HTTP 接口。
+
+        关键设计点：
+          * **目标工作区由可信上下文绑定** —— 所有写操作都先问 ADS 当前打开的
+            工作区，请求体里就算带 workspace 也不采信（防越权写到别处）；
+          * 上传不依赖 LLM 服务连通：保存与扫描都在本进程完成，LLM 只是后续
+            查清单的一方；
+          * 上传**不解压不加载**：只落盘 + 只读扫描中央目录 + 记清单。
+        """
+        action = path[len("/models/"):].strip("/")
+
+        if method == "GET" and action == "packages":
+            try:
+                result = model_tools.list_model_packages(CFG, {})
+            except model_tools.ModelToolError as e:
+                self._send_json({"error": str(e), "kind": "no_workspace"}, 409)
+                return
+            except Exception as e:  # noqa: BLE001
+                log.exception("列出模型包失败: %s: %s", type(e).__name__, e)
+                self._send_json({"error": f"{type(e).__name__}: {e}"}, 500)
+                return
+            self._send_json({"ok": True, **result})
+            return
+
+        if method == "GET" and action == "op":
+            self._handle_model_op()
+            return
+
+        if method == "GET" and action == "ops":
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                limit = max(1, min(int((query.get("limit") or ["50"])[0]), 200))
+            except ValueError:
+                limit = 50
+            ops = model_orchestration.get_orchestrator().list_ops(limit=limit)
+            self._send_json({"ok": True, "total": len(ops), "ops": ops})
+            return
+
+        if method == "GET" and action == "package":
+            query = parse_qs(urlparse(self.path).query)
+            package_id = (query.get("id") or [""])[0].strip()
+            if not package_id:
+                self._send_json({"error": "缺少 id"}, 400)
+                return
+            try:
+                result = model_tools.inspect_model_package(
+                    CFG, {"package_id": package_id})
+            except model_tools.ModelToolError as e:
+                self._send_json({"error": str(e)}, 404)
+                return
+            except Exception as e:  # noqa: BLE001
+                log.exception("查看模型包失败: %s: %s", type(e).__name__, e)
+                self._send_json({"error": f"{type(e).__name__}: {e}"}, 500)
+                return
+            self._send_json({"ok": True, **result})
+            return
+
+        if method == "POST" and action == "import":
+            body = self._read_json()
+            if body is None:
+                return
+            self._handle_model_import(body)
+            return
+
+        if method == "POST" and action == "open":
+            body = self._read_json()
+            if body is None:
+                return
+            self._handle_model_open(body)
+            return
+
+        if method == "POST" and action == "cancel":
+            self._handle_model_cancel()
+            return
+
+        self._send_json({"error": f"未知的模型接口 {method} /models/{action}"}, 404)
+
+    def _handle_model_import(self, body: dict) -> None:
+        """受理一次导入：**只回一次 202 + op_id**。
+
+        过去的写法（一个请求两次响应）是这样坏的：主线程发完 accepted 就关
+        连接，后台线程完成后又拿同一个 Handler 的 ``_send_json`` 写一次 ——
+        第二次往往写进一条已关闭/正被复用的 socket，面板表现为偶发的
+        ``RemoteDisconnected``，而真实原因只是"导入跑完了"。
+
+        现在后台线程**只**更新持久化操作记录与资产状态，不再持有 Handler；
+        最终结果由 ``GET /models/op?id=<op_id>`` 查询（面板的轮询与"刷新状态"
+        都走它）。
+        """
+        package_id = str(body.get("package_id") or "").strip()
+        if not package_id:
+            self._send_json({"error": "缺少 package_id"}, 400)
+            return
+        request_key = str(body.get("request_id") or "").strip()
+        kit_root = str(body.get("kit_root") or "").strip()
+
+        # 目标工作区**只认 ADS 当前打开的**，请求体里带的路径一律不采信；
+        # 并且在这里就固定下来 —— 之后用户切换工程会被流水线核对出来并停止，
+        # 不会挂到另一个工作区上。
+        try:
+            workspace = model_tools.current_workspace(CFG)
+        except model_tools.ModelToolError as e:
+            self._send_json({"error": str(e), "kind": "no_workspace"}, 409)
+            return
+
+        try:
+            op, replayed = model_orchestration.get_orchestrator().submit(
+                CFG, workspace, package_id, kit_root=kit_root,
+                source="http", request_key=request_key,
+                vendor_filter=str(body.get("vendor_filter") or "").strip())
+        except model_orchestration.OrchestrationError as e:
+            self._send_json({"error": str(e)}, 404)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.exception("受理模型导入失败: %s: %s", type(e).__name__, e)
+            self._send_json({"error": f"{type(e).__name__}: {e}"}, 500)
+            return
+
+        self._send_json({
+            "ok": True,
+            "accepted": True,
+            "op_id": op["op_id"],
+            "workspace": workspace,
+            "package_id": package_id,
+            "state": op["state"],
+            "state_label": op.get("state_label"),
+            "idempotent_replayed": bool(replayed),
+            "message": ("导入已受理（后台执行）。"
+                        + ("**没有新起导入**：同一工作区同一包已有进行中的导入，"
+                           "本次已并入它。" if replayed else "")
+                        + "用 GET /models/op?id=<op_id> 查进度与最终结果，"
+                          "POST /models/cancel 取消。"),
+        }, 202)
+
+    def _handle_model_open(self, body: dict) -> None:
+        """在 ADS 原生元件列表里打开/定位某个已导入的包（面板按钮直达，不经 LLM）。
+
+        与 import 一样：目标工作区**只认 ADS 当前打开的**，请求体里的路径一律
+        不采信；后端从清单按 package_id 解析可信套件根，再转给 ADS 端工具。
+        返回 ``{"ok":.., "result":<3.1 结构>, "package":<清单视图>}`` 供面板直接渲染。
+        """
+        package_id = str(body.get("package_id") or "").strip()
+        if not package_id:
+            self._send_json({"error": "缺少 package_id"}, 400)
+            return
+        args = {"package_id": package_id}
+        for key in ("library", "category", "view"):
+            value = str(body.get(key) or "").strip()
+            if value:
+                args[key] = value
+        try:
+            result = model_tools.open_vendor_palette(CFG, args)
+        except model_tools.AdsUnreachableError as e:
+            # ADS 工具服务连不上/超时：与"没打开工作区"分开报，别让用户去开工程。
+            self._send_json({"error": str(e), "kind": "ads_unreachable"}, 502)
+            return
+        except model_tools.ModelToolError as e:
+            self._send_json({"error": str(e), "kind": "no_workspace"}, 409)
+            return
+        except tools_mod.AdsToolError as e:
+            # 工作区已解析、仅 open 调用在传输层失败：同样如实报 502。
+            self._send_json({"error": str(e), "kind": "ads_unreachable"}, 502)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.exception("打开原生元件列表失败: %s: %s", type(e).__name__, e)
+            self._send_json({"error": f"{type(e).__name__}: {e}"}, 500)
+            return
+        if not isinstance(result, dict):
+            result = {"ok": False, "outcome": "failed",
+                      "error": f"ADS 返回了无法解析的结果：{type(result).__name__}"}
+        package = result.pop("package", None)
+        self._send_json({
+            "ok": bool(result.get("ok", True)),
+            "result": result,
+            "package": package or {},
+        })
+
+    def _handle_model_op(self) -> None:
+        """查一条导入操作的状态（后台线程把最终结果写在这里）。"""
+        query = parse_qs(urlparse(self.path).query)
+        op_id = (query.get("id") or [""])[0].strip()
+        if not op_id:
+            self._send_json({"error": "缺少 id"}, 400)
+            return
+        op = model_orchestration.get_orchestrator().get_op(op_id)
+        if op is None:
+            self._send_json({"error": f"找不到导入操作 {op_id}", "known": False},
+                            404)
+            return
+        self._send_json({"ok": True, **op})
+
+    def _handle_model_cancel(self) -> None:
+        """请求取消一条导入操作。
+
+        取消是协作式的：接口在这里就返回，真正停下发生在流水线的下一个安全
+        边界（排队 / 文件 / 数据块 / 阶段之间）。响应里的 ``state`` 是"已收到
+        取消"，不是"已停止" —— 停止后状态才会变成 ``cancelled``。
+        """
+        body = self._read_json() or {}
+        op_id = str(body.get("op_id") or "").strip()
+        if not op_id:
+            self._send_json({"error": "缺少 op_id"}, 400)
+            return
+        result = model_orchestration.get_orchestrator().request_cancel(CFG, op_id)
+        if not result.get("ok"):
+            self._send_json(result, 200 if result.get("known") else 404)
+            return
+        self._send_json({**result,
+                         "message": "已收到取消请求，正在最近的安全边界停下；"
+                                    "已完成的前置步骤保留。"})
+
+    def _handle_upload(self) -> None:
+        """接收二进制 ZIP 并保存为模型包资产。
+
+        与 JSON 接口的关键差别：
+          * 请求体是**原始字节**，不做 Base64（膨胀 33% 且会让模型文件内容
+            进入 JSON / 对话历史 / LLM 请求）；
+          * 边读边算 SHA-256、边写临时文件，不把整个包读进内存；
+          * 超限时**断开连接**而不是读半截再复用 keep-alive。
+        """
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype not in ("application/zip", "application/x-zip-compressed",
+                         "application/octet-stream"):
+            self._drain_body(limit=1_000_000)
+            self.close_connection = True
+            self._send_json(
+                {"error": f"不支持的 Content-Type: {ctype or '(空)'}；"
+                          f"模型包上传必须用 application/zip 或 "
+                          f"application/octet-stream 的原始字节流"},
+                415)
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            self._drain_body()
+            self._send_json({"error": "请求体为空：没有收到文件内容"}, 400)
+            return
+        if length > _UPLOAD_MAX_BYTES:
+            self._drain_body(limit=1_000_000)
+            self.close_connection = True
+            self._send_json(
+                {"error": f"文件过大（{length} 字节 > 上限 "
+                          f"{_UPLOAD_MAX_BYTES} 字节）"}, 413)
+            return
+
+        # 文件名放在请求头里（JSON 通道会把它和内容混在一起，且非 ASCII
+        # 需要编码）。支持两种编码：RFC 5987 的 filename*=UTF-8''... 优先。
+        filename = _decode_upload_filename(self.headers)
+        if not filename:
+            self._drain_body()
+            self._send_json({"error": "缺少文件名（X-Ads-Filename 请求头）"}, 400)
+            return
+        if not filename.lower().endswith(".zip"):
+            self._drain_body()
+            self.close_connection = True
+            self._send_json(
+                {"error": f"首版只支持 ZIP 压缩包，收到的是 {filename}。"
+                          f"其它压缩格式（tar / rar / 7z）暂不支持。"}, 415)
+            return
+
+        # 目标工作区：**只认 ADS 当前打开的**，请求体/请求头里带的路径不采信
+        try:
+            workspace = model_tools.current_workspace(CFG)
+        except model_tools.ModelToolError as e:
+            # Content-Length 已确认在允许的 2 GiB 上限内。客户端会持续发送
+            # 请求体；只排空默认的 1 MiB 后就关连接，会在大 ZIP (>1 MiB)
+            # 上传到一半时触发 WinError 10053，客户端收不到真正的 409。
+            # 把这个有界请求体读完，再返回明确的 no_workspace 错误。
+            self._drain_body(limit=length)
+            self.close_connection = True
+            self._send_json({"error": str(e), "kind": "no_workspace"}, 409)
+            return
+
+        source_session = (self.headers.get("X-Ads-Session") or "").strip()
+
+        # 落到临时文件：边收边算哈希，不把整包读进内存
+        import hashlib
+        import tempfile
+
+        tmp_dir = os.path.join(tempfile.gettempdir(), "ads_agent_uploads")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_path = os.path.join(tmp_dir, f"up_{os.getpid()}_{threading.get_ident()}.zip")
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            with open(tmp_path, "wb") as out:
+                while received < length:
+                    chunk = self.rfile.read(min(_UPLOAD_CHUNK, length - received))
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    digest.update(chunk)
+                    out.write(chunk)
+                out.flush()
+                os.fsync(out.fileno())
+            if received != length:
+                raise OSError(f"文件未传完（收到 {received}/{length} 字节）")
+
+            record = model_store.save_archive(
+                workspace, filename, source_path=tmp_path,
+                source_session=source_session)
+            # reused 是 save_archive 的一次性返回标记（表示这次没有新建
+            # 资产、只是加了引用）。后面的 scan_archive 会返回**重新读出
+            # 的记录**，那个标记不在清单里 —— 不先存下来就会丢，界面就
+            # 分不清"新上传"和"复用已有资产"。
+            was_reused = bool(record.get("reused"))
+
+            # 只读扫描中央目录（不解压）：识别包类型与套件根
+            root = model_store.store_root(workspace)
+            try:
+                record = model_store.scan_archive(root, record["package_id"])
+                scan_note = ""
+            except Exception as e:  # noqa: BLE001 — 扫描失败不该让上传白费
+                scan_note = f"包结构扫描失败（文件已保存，可稍后重试检查）：{e}"
+                log.warning("上传后扫描失败 %s: %s", record.get("package_id"), e)
+
+            try:
+                backup = shared_models.backup_package(CFG, workspace, record)
+                backup_summary = {k: backup.get(k) for k in
+                                  ("backed_up", "package_id", "sha256", "reused", "library_root")}
+                backup_note = ""
+            except Exception as e:  # noqa: BLE001 — 本地上传保留，明确报告备份失败
+                backup_summary = {"backed_up": False, "error": f"{type(e).__name__}: {e}"}
+                backup_note = f"统一模型库备份失败：{type(e).__name__}: {e}"
+                log.exception("统一模型库备份失败 %s", record.get("package_id"))
+
+            self._send_json({
+                "ok": True,
+                "workspace": workspace,
+                "package": model_tools._record_view(record, include_models=False),
+                "reused": was_reused,
+                "shared_library_backup": backup_summary,
+                "scan_note": scan_note,
+                "backup_note": backup_note,
+                "message": ("已保存到当前工作区并完成包结构检查。"
+                            + ("已备份到统一 libraries 目录。" if backup_summary.get("backed_up")
+                               else "统一模型库备份未完成，请检查备份错误。")
+                            + "**未解压、未加载套件、未执行包内脚本** —— "
+                            "需要时点附件卡片上的「解压并导入」或明确告诉我。"),
+            })
+        except model_store.UnsafeArchive as e:
+            self._send_json({"error": f"压缩包安全校验未通过：{e}"}, 400)
+        except Exception as e:  # noqa: BLE001
+            log.exception("模型包上传失败: %s: %s", type(e).__name__, e)
+            self._send_json({"error": f"{type(e).__name__}: {e}"}, 500)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def _handle_design(self, path: str) -> None:
         """设计闭环接口：跑仿真 / 重新评估 / 打开原理图。
@@ -387,6 +802,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         # /health 保持开放：插件启动探测、check_env.py 都靠它判断后端是否活着
         if path != "/health" and not self._authorized():
+            return
+        if path.startswith("/models/"):
+            self._handle_models("GET", path)
             return
         if path == "/logs":
             # 排查用：直接看最近 N 行日志，省得去翻文件
@@ -603,6 +1021,14 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_design(self.path)
             return
 
+        if self.path == "/models/upload":
+            self._handle_upload()
+            return
+
+        if self.path.startswith("/models/"):
+            self._handle_models("POST", self.path)
+            return
+
         if self.path != "/chat":
             self._send_json({"error": "not found"}, 404)
             return
@@ -750,6 +1176,16 @@ def main():
             log.warning("启动恢复：%d 个中断任务待确认: %s", len(recovered), recovered)
     except Exception as e:  # noqa: BLE001 — 恢复失败不能挡住后端启动
         log.exception("启动恢复失败: %s: %s", type(e).__name__, e)
+
+    # 模型导入同理：上次跑一半的导入不能永远停在"进行中"（界面会一直转圈），
+    # 也不能标成"失败"（那等于断言导入失败了，而实际只是不知道）。
+    try:
+        broken = model_orchestration.recover_interrupted_ops()
+        if broken:
+            log.warning("启动恢复：%d 个模型导入操作中断在未完成状态: %s",
+                        len(broken), broken)
+    except Exception as e:  # noqa: BLE001 — 同上
+        log.exception("模型导入启动恢复失败: %s: %s", type(e).__name__, e)
 
     print(f"[ADS Agent] backend listening on http://{host}:{port}")
     print(f"[ADS Agent] model: {CFG['llm_model']}  api_key: {'已配置' if CFG.get('llm_api_key') else '未配置!'}")

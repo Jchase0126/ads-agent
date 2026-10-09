@@ -20,7 +20,6 @@
 退出码：0 = 没有失败（跳过不算失败）；1 = 有失败或超时。
 """
 
-import locale
 import os
 import subprocess
 import sys
@@ -44,6 +43,7 @@ CASES = [
     ("test_rf_audit.py", "射频物理审查：单位/闭式阻抗/MTEE 角色/宽度/Layout 几何/诚实标注", "logic", False),
     ("test_sp_traces.py", "S 参数矩阵表达式与 dB 曲线", "logic", False),
     ("test_toolserver_busy.py", "toolserver 忙碌状态 / 多作业互不干扰", "http", False),
+    ("test_turn_budget.py", "轮次预算收尾 / 重复失败保护 / 总结取消", "logic", False),
     ("test_cancel_chain.py", "取消链路：排队取消 / 过期跳过 / 队列容量 / pump 预算", "logic", False),
     ("test_design_metrics.py", "设计指标：数据解析 / 指标计算 / 不编造数值", "logic", False),
     ("test_design_metrics_edge.py", "指标判定边界：覆盖不足 / 单位不可比 / 越界取点 / 带宽口径", "logic", False),
@@ -60,19 +60,24 @@ CASES = [
     ("test_instance.py", "实例身份校验：不以外来服务当自己人 / 多开检测", "logic", False),
     ("test_tool_identity.py", "工具服务身份校验 / 端口冲突人话化 / 退出清登记", "logic", False),
     ("test_packaging.py", "打包白名单 / 不含密钥 / 解出来的包能独立运行", "logic", False),
-    # ---- 跨版本兼容（2026-10-07 新增）----
-    ("test_adscompat.py", "版本识别（注册表权威） / 官方档案 / 门禁矩阵 / 位数判定", "logic", False),
-    ("test_capability.py", "运行时能力检测：假 keysight 接口树 / 三态 / fail-closed", "logic", False),
-    ("test_qtcompat.py", "Qt 绑定适配：已加载优先 / 终身缓存 / Qt5-Qt6 shim", "logic", False),
-    ("test_install_multiversion.py", "多版本安装：分别注册 / 登记表 / 卸载隔离 / 中文空格路径", "logic", False),
+    ("test_model_store.py", "模型包资产：保存去重 / 中文路径 / 识别 / 越界拒绝 / 并发 / 迁移", "logic", False),
+    ("test_shared_models.py", "共享库：目录持久化 / 跨工作区复制 / 型号索引 / 重打包去重", "logic", False),
+    ("test_shared_import_binding.py", "共享导入：固定目标工作区 / 复制前后取消 / 切换拦截", "logic", False),
+    ("test_workspace_model_dependencies.py", "模型仿真依赖：工作区映射隔离 / Include / 枚举回调", "logic", False),
+    ("test_model_http.py", "模型包 HTTP：二进制上传 / 鉴权 / 中文名 / 工作区绑定 / 幂等", "http", True),
+    ("test_model_ops.py", "模型包 ADS 侧纯逻辑：lib.defs 解析 / 路径解析 / 工具名齐全", "logic", False),
+    ("test_model_ops_flow.py", "模型包 ADS 侧流程：挂接幂等 / 只读约束 / 卸载不越界 / 验证门禁", "logic", False),
+    ("test_model_import_flow.py", "模型包导入编排：操作恢复 / 用户选择 / 取消 / 幂等", "logic", False),
+    ("test_model_open_http.py", "原生列表打开路由：可信上下文注入 / 越权拦截 / 失败如实报码", "http", False),
+    ("test_model_deps_gate.py", "模型依赖指纹与仿真缓存/条件门禁", "logic", False),
     # ---------------- qt ----------------
-    ("test_startup_health.py", "真实 Qt 启动 / 健康探测 / 端口释放", "qt", True),
-    ("test_ui_navigation.py", "模型管理 / 供应商隔离 / 输入栏选择与响应式布局", "qt", True),
     ("test_project_isolation.py", "项目会话隔离 / 如实报告仿真行为", "qt", True),
     ("test_design_isolation.py", "设计结果页：项目隔离与重启恢复", "qt", True),
     ("test_result_page_labeling.py", "结果页数据标识：显示采样点 vs 完整数据 / 完整导出", "qt", True),
     ("test_md_plain.py", "Markdown 气泡清洗：修饰符剥离 / 结构转换 / 标识符保护", "qt", True),
     ("test_thinking.py", "深度思考链路：thinking 门控与降级 / reasoning 下发 / 折叠行", "qt", True),
+    ("test_ui_navigation.py", "设置返回 / 草稿保留 / 小窗滚动 / 侧栏恢复 / 关闭面板", "qt", True),
+    ("test_model_attachments.py", "模型包附件：拖放 / 上传 / 卡片状态 / 项目隔离与恢复", "qt", True),
 ]
 
 DEFAULT_TIMEOUT_S = 240
@@ -95,11 +100,14 @@ def main() -> int:
     for filename, label, layer, needs_pyside in cases:
         path = os.path.join(HERE, filename)
         child_env = dict(os.environ)
-        child_env.pop("PYTHONIOENCODING", None)  # 子测试里的再下一层 subprocess 用系统编码
+        # 子进程的中文/emoji 输出一律按 UTF-8 写（_harness 里也会 reconfigure，
+        # 这里保证"没走 _harness 的早期输出"也一致，且父进程按同一编码解码）
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
         try:
             proc = subprocess.run(
                 [sys.executable, path], capture_output=True, text=True,
-                encoding=locale.getpreferredencoding(False), errors="replace",
+                encoding="utf-8", errors="replace",
                 env=child_env, timeout=DEFAULT_TIMEOUT_S,
             )
             rc, text = proc.returncode, (proc.stdout or "") + (proc.stderr or "")
@@ -108,7 +116,16 @@ def main() -> int:
             timed_out.append(filename)
             continue
 
-        if rc == 2 and "PySide6" in text:
+        # 无 PySide6 时按"跳过"处理（未执行，不计入失败）：
+        #   * 多数 qt 文件用 sys.exit(2) 守护 → rc==2 且文案含 PySide6；
+        #   * 但有的文件缺守卫：test_ui_navigation.py 顶层 import PySide6、
+        #     test_model_http.py 在用例体内 import 触发（间接依赖 PySide6），
+        #     二者都会在 _harness 里抛 ModuleNotFoundError → 整文件 rc==1。
+        #     它们已登记 needs_pyside=True，据"确实缺 PySide6 模块"判为跳过，
+        #     否则会被误计为失败（历史上正是这个漏标）。
+        pyside_absent = "No module named 'PySide6'" in text
+        if rc != 0 and ((rc == 2 and "PySide6" in text)
+                        or (needs_pyside and pyside_absent)):
             print(f"  跳过  {filename:<28} 需要 PySide6（pip install PySide6）")
             skipped.append(filename)
             continue

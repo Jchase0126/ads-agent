@@ -36,8 +36,8 @@ import design_job as dj  # noqa: E402
 import design_service as dsvc  # noqa: E402
 import server as server_mod  # noqa: E402
 
-WS_A = "E:/ADS/Work_AI/AI_wrk"
-WS_B = "E:/ADS/Work_Other/Other_wrk"
+WS_A = "C:/test/ads/WorkspaceA"
+WS_B = "C:/test/ads/WorkspaceB"
 
 _SPEC = {
     "design": {"library": "AI_lib", "cell": "Amp"},
@@ -162,7 +162,7 @@ def test_windows_path_case_and_slash_do_not_trigger_mismatch():
         fake = _FakeTools(WS_A)
         spec = dsvc.build_spec(dict(_SPEC, design={
             "library": "AI_lib", "cell": "Amp",
-            "workspace": "e:\\ads\\work_ai\\ai_wrk\\"}))
+            "workspace": "c:\\test\\ads\\workspacea\\"}))
         job = _with_fake_tools(fake, lambda: dsvc.run_design({}, spec, root))
         ok(not job.error, "同一工作区的大小写/分隔符差异不应触发拦截")
     finally:
@@ -276,8 +276,8 @@ def test_workspace_mismatch_pure_function():
     ok(msg is not None)
     contains(msg, WS_B)
     # Windows 大小写与斜杠差异不算不同工作区
-    ok(server_mod.workspace_mismatch("E:/ADS/Work_AI/AI_wrk",
-                                     "e:\\ads\\work_ai\\ai_wrk\\") is None)
+    ok(server_mod.workspace_mismatch("C:/test/ads/WorkspaceA",
+                                     "c:\\test\\ads\\workspacea\\") is None)
 
 
 def test_corrupt_job_file_recovered_from_bak():

@@ -43,9 +43,15 @@ BACKEND_FILES = [
     "design_metrics.py", # 确定性指标评估
     "design_service.py", # 仿真→读数→评估编排
     "instance.py",       # 实例登记与身份校验
+    "model_gate.py",     # 仿真结果模型依赖复用门禁
+    "model_orchestration.py", # 模型包检查与导入编排
+    "model_store.py",    # 模型包资产库与安全解压
+    "model_tools.py",    # 模型库 LLM 工具编排
+    "model_validation.py", # ADS 模型导入验证
     "llm.py",            # LLM 客户端
     "paths.py",          # **统一路径解析**（数据/程序双根）
     "server.py",         # HTTP/SSE 服务
+    "shared_models.py",  # 跨工作区共享模型库
     "tools.py",          # 工具派发 + ADS 端 RPC
 ]
 
@@ -57,6 +63,9 @@ ADDON_FILES = [
     "backend_launcher.py",  # 拉起并监护后端进程
     "capability.py",     # 运行时能力检测 + 工具门禁（只读探测，三态）
     "mdplain.py",        # 面板用的极简 Markdown
+    "model_attachments.py", # 模型 ZIP 附件上传与卡片
+    "model_deps.py",     # 仿真结果模型依赖指纹
+    "model_ops.py",      # ADS 侧模型库挂接与查询
     "netlist_check.py",  # 网表等价性核对
     "panel.py",          # 聊天面板（Qt 绑定经 qtcompat，PySide2/6 自适应）
     "pathbridge.py",     # 按文件路径加载共享路径模块

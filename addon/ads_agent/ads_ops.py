@@ -45,10 +45,13 @@ import threading
 import time
 
 import rf_audit  # 射频物理审查的纯计算层（同为本地模块，可离线测试）
+import model_deps  # 模型依赖指纹：本次仿真到底吃了哪些模型文件（纯计算层）
+import model_ops  # 原厂模型包的挂接/只读浏览/可用性验证（转发到 model_ops 的实现）
 
 # toolserver 热重载 ads_ops 时，依赖模块会命中 sys.modules 缓存拿旧代码；
 # 这里在每次 ads_ops（重）加载时强制刷新，保证审查逻辑与磁盘一致。
 importlib.reload(rf_audit)
+importlib.reload(model_deps)
 
 
 def _de():
@@ -776,10 +779,28 @@ def _set_param(inst, name, value):
                 old = str(getattr(p, "value", "") or "")
             except Exception:  # noqa: BLE001
                 old = ""
-            if old.startswith('"') and old.endswith('"') and len(old) >= 2:
+            # A constant form is selected by its *form name*, not its netlist
+            # value (e.g. a part number may netlist as an integer index).
+            definition = getattr(p, "definition", None)
+            forms = getattr(definition, "formset", None)
+            lookup = getattr(forms, "find_form_by_name", None)
+            raw = value[1:-1] if value.startswith('"') and value.endswith('"') else value
+            selected = lookup(raw) if callable(lookup) else None
+            is_constant = getattr(selected, "is_constant_form", None)
+            if selected is not None and callable(is_constant) and is_constant(selected):
+                p.form_name = raw
+                value = raw
+            elif old.startswith('"') and old.endswith('"') and len(old) >= 2:
                 if not (value.startswith('"') and value.endswith('"')):
                     value = f'"{value}"'
-            p.value = value
+                p.value = value
+            else:
+                p.value = value
+            callback = getattr(inst, "invoke_item_parameter_changed_callback", None)
+            if callable(callback):
+                callback([str(name)])
+            elif getattr(definition, "callbacks", None):
+                raise RuntimeError(f"参数 {name} 已改变，但当前 ADS API 无法执行模型参数回调")
             return f"{getattr(inst, 'inst_name', '')}.{name} = {value}"
     raise KeyError(
         f"{getattr(inst, 'inst_name', inst)!r} 上没有参数 {name!r}；可用: "
@@ -1861,6 +1882,34 @@ def _layout_scale_issue(design, connections, limit: float = 200.0) -> str:
     return ""
 
 
+def _constant_form_name(param):
+    name = str(getattr(param, "form_name", "") or "")
+    forms = getattr(getattr(param, "definition", None), "formset", None)
+    lookup = getattr(forms, "find_form_by_name", None)
+    form = lookup(name) if callable(lookup) else None
+    check = getattr(form, "is_constant_form", None)
+    return name if callable(check) and check(form) else ""
+
+
+def _netlist_parameter_specs(by_name: dict, instances: list) -> list:
+    """Translate verified enum forms to their real netlist values for the gate."""
+    result = []
+    for spec in instances:
+        copy = dict(spec, params=dict(spec.get("params") or {}))
+        inst = by_name.get(str(spec.get("name")))
+        for param in list(getattr(inst, "parameters", []) or []):
+            name = str(getattr(param, "name", ""))
+            if name not in copy["params"]:
+                continue
+            definition = getattr(param, "definition", None)
+            if getattr(definition, "is_netlistable", True) is False:
+                copy["params"].pop(name)
+            elif _constant_form_name(param):
+                copy["params"][name] = str(param.netlist_value)
+        result.append(copy)
+    return result
+
+
 def _verify_params(by_name: dict, instances: list) -> list:
     """对照构建清单核对落盘后的实例参数，返回不一致列表。"""
     bad = []
@@ -1871,7 +1920,7 @@ def _verify_params(by_name: dict, instances: list) -> list:
         have = {}
         try:
             for p in list(inst.parameters):
-                have[str(getattr(p, "name", ""))] = str(getattr(p, "value", ""))
+                have[str(getattr(p, "name", ""))] = _constant_form_name(p) or str(getattr(p, "value", ""))
         except Exception:  # noqa: BLE001
             continue
         for k, v in (spec.get("params") or {}).items():
@@ -5233,6 +5282,9 @@ def build_schematic(args: dict, ctx=None) -> dict:
         # 会话里看得到、落盘后再打开就丢了，表面上每一步都"成功"。
         # 保存前的放置失败不会落盘；保存后仍须只读复核，失败时查看备份。
         placed = _apply()
+        vendor_dependencies = model_ops.prepare_design_dependencies(
+            design, str(ws.path), place_includes=True)
+        placed.extend(vendor_dependencies["include_instances"])
         design.save_design()
     finally:
         # 先关写句柄再重开只读（同一设计的两个句柄不能并用，实测会失效）
@@ -5249,6 +5301,7 @@ def build_schematic(args: dict, ctx=None) -> dict:
             by_name.setdefault(_inst_name(i), i)
         missing = [n for n in placed if n not in by_name]
         params_bad = _verify_params(by_name, instances)
+        netlist_instances = _netlist_parameter_specs(by_name, instances)
         params_bad.extend(_verify_var_values(by_name, var_spec))
         conn_results = _check_connection_list(by_name, connections)
         geo = _geometry_report(d2)
@@ -5291,7 +5344,7 @@ def build_schematic(args: dict, ctx=None) -> dict:
     # （generate_netlist 在上面 try 内执行 —— 句柄关闭后调用会报
     #   invalid Design）
     nl_problems, netlist_equiv = _netlist_gate(
-        _nl, instances, connections, name, backup, gen_error=_nl_err)
+        _nl, netlist_instances, connections, name, backup, gen_error=_nl_err)
     problems.extend(nl_problems)
     if geo["problems"]:
         problems.append("保存后导线几何复核失败（以下以磁盘上读到的真实几何为准）：\n- "
@@ -5304,6 +5357,7 @@ def build_schematic(args: dict, ctx=None) -> dict:
         "layout": layout_mode,
         "backup": backup,
         "placed": placed,
+        "vendor_dependencies": vendor_dependencies,
         "n_instances": audit.get("n_instances", 0),
         "n_nets": audit.get("n_nets", 0),
         "connections": conn_results,
@@ -5470,7 +5524,34 @@ def _simulate(netlist: str, output_dir: str, dataset_name: str, netlist_path: st
 
     from keysight.edatoolbox import ads as eda
 
-    simulator = eda.CircuitSimulator()
+    dependencies = audit.get("_vendor_dependencies") or {}
+    if dependencies.get("problems"):
+        raise RuntimeError("模型依赖未就绪：" + "; ".join(dependencies["problems"]))
+    dependency_check = model_ops.check_simulation_netlist(dependencies, netlist)
+    if not dependency_check["ok"]:
+        raise RuntimeError("原厂模型网表依赖复核失败：" + "; ".join(dependency_check["problems"]))
+    mappings = dependencies.get("mappings") or {}
+    config_path = ""
+    if mappings:
+        config_path = os.path.join(output_dir, "ADSlibconfig")
+        with open(config_path, "w", encoding="utf-8") as stream:
+            for logical, target in sorted(mappings.items()):
+                if not os.path.isfile(target):
+                    raise RuntimeError(f"本工作区编码模型已不存在：{logical}: {target}")
+                stream.write(f"{logical} {target.replace(chr(92), '/')}\n")
+
+    # pdk_dirs in the bundled SDK changes process-wide os.environ. Inject its
+    # documented ADSlibconfig search directory only into this simulator child,
+    # so simultaneous workspace simulations cannot redirect each other.
+    class WorkspaceSimulator(eda.CircuitSimulator):
+        def _execute(self, *args, extra_env=None, **kwargs):
+            child_env = dict(extra_env or {})
+            if config_path:
+                child_env["ADSLIBCONFIG_PATH"] = output_dir.replace("\\", "/")
+                child_env["ADSlibconfig_PATH"] = output_dir.replace("\\", "/")
+            return super()._execute(*args, extra_env=child_env, **kwargs)
+
+    simulator = WorkspaceSimulator()
     try:
         simulator.run_netlist(netlist, output_dir=output_dir, dataset_name=dataset_name)
     except Exception as e:  # noqa: BLE001
@@ -5502,6 +5583,10 @@ def _simulate(netlist: str, output_dir: str, dataset_name: str, netlist_path: st
         "output_dir": output_dir,
         "netlist_path": netlist_path,
         "status": "done",
+        "vendor_dependencies": {"config_path": config_path,
+                                "mappings": mappings,
+                                "netlist_check": dependency_check,
+                                "pdk_dirs": dependencies.get("pdk_dirs") or []},
         "audit": {k: audit.get(k) for k in
                   ("n_instances", "controllers", "ports", "n_nets", "warnings")},
     }
@@ -5510,6 +5595,23 @@ def _simulate(netlist: str, output_dir: str, dataset_name: str, netlist_path: st
         result["workspace"] = audit["_workspace"]
     if audit.get("_design_version"):
         result["design_version"] = audit["_design_version"]
+    # 模型依赖指纹：阶段二（只做文件读取与分块哈希，不碰 DE 对象，所以
+    # 放在这里也完全安全 —— 后台线程仿真时它就在后台算完）。
+    if audit.get("_model_dep_plan") is not None:
+        try:
+            evidence = model_deps.finalize(audit["_model_dep_plan"])
+        except Exception as e:  # noqa: BLE001 — 指纹算不出来不能让仿真结果丢失
+            evidence = {"state": "incomplete", "fingerprint": "", "n_deps": 0,
+                        "deps": [], "unresolved": [{
+                            "raw": "(指纹计算失败)", "param": "", "instances": [],
+                            "origins": ["finalize"], "master": "", "library": "",
+                            "reason": f"finalize_failed:{type(e).__name__}"}],
+                        "missing": [], "kits": [], "hierarchy": {},
+                        "notes": [f"模型依赖指纹计算失败: {type(e).__name__}: {e}"],
+                        "model_fingerprint": {}}
+        result["model_deps"] = evidence
+        # 兼容字段（旧后端/旧结果页吃这个）：路径 -> 内容哈希
+        result["model_fingerprint"] = evidence.get("model_fingerprint") or {}
     if not os.path.exists(dataset_path):
         result["status"] = "no_dataset"
         result["hint"] = (
@@ -5567,6 +5669,8 @@ def run_simulation(args: dict, ctx=None) -> dict:
     design = _open_design(library, cell, view, write=False)
     try:
         audit = _design_audit(design)
+        audit["_vendor_dependencies"] = model_ops.prepare_design_dependencies(
+            design, str(ws.path))
 
         # 仿真门禁：实例数 / 控制器 / 基板引用 / 端口 全部通过才生成网表。
         # 任何一项不过就停在这里，把缺的东西点名说清楚 —— 不让 hpeesofsim
@@ -5584,6 +5688,11 @@ def run_simulation(args: dict, ctx=None) -> dict:
             raise RuntimeError(
                 f"网表生成失败：{type(e).__name__}: {e}\n{_audit_hint(audit, name)}"
             )
+        # 模型依赖指纹：网表文本相同**不代表模型没变**（同路径换内容是最常见
+        # 的原厂模型更新方式，网表一个字都不会变）。这里借"设计还开着"把
+        # 依赖解析完（要开层次子图、要读 VAR），哈希留给 _simulate ——
+        # 那样后台线程仿真时也不会占用 ADS 主线程去读大文件。
+        audit["_model_dep_plan"] = _model_dep_plan(design, netlist, ws, library)
     finally:
         _close_design(design)
 
@@ -6674,11 +6783,29 @@ def audit_rf(args: dict, ctx=None) -> dict:
 
 
 def design_fingerprint(args: dict, ctx=None) -> dict:
-    """只读：返回当前工作区信息与指定设计的网表指纹（不做任何修改）。
+    """只读：返回当前工作区信息、指定设计的网表指纹，以及模型依赖指纹。
 
     用途：结果页"结果复用"的版本验证 —— 发布结果时记录仿真时的网表指纹，
     复用前重算一次，不一致说明设计（参数/结构/VAR）已经变化，旧数据集
     不能再代表当前设计。同时带回工作区路径，防止跨工作区误操作同名设计。
+
+    **模型依赖指纹（include_models=True）**
+    ------------------------------------------
+    网表指纹只覆盖网表**文本**。原厂模型的情况是：用户把同一个 .s2p 路径上
+    的文件换成新版（原厂重新下载、版本升级、改了偏压条件），网表一个字都不会
+    变，但仿真结果完全不同 —— 只比网表会复用出一份过期结论。
+
+    所以这里额外扫一遍设计里引用到的模型文件，返回 ``model_deps``：
+
+        none        没有外部模型依赖；
+        complete    依赖全部解析到盘上真实文件并算出内容哈希；
+        incomplete  有依赖解析不出来（相对路径 / VAR 表达式 / 层次子图
+                    打不开 / 只能用 Design Kit 套件级保守指纹）；
+        missing     记录过的模型文件现在不在盘上了。
+
+    拿不到就算不出来，**不返回猜的值**：调用方按保守策略决定是否复用
+    （宁可重跑，也不要给错结果）。``model_fingerprint`` 是兼容旧字段的
+    "路径 → 内容哈希"字典。
     """
     library = args["library"]
     cell = args["cell"]
@@ -6701,6 +6828,12 @@ def design_fingerprint(args: dict, ctx=None) -> dict:
             out["error"] = f"网表生成失败：{type(e).__name__}: {e}"
             out["design_version"] = {}
             return out
+        if args.get("include_models"):
+            # 设计还开着，正好做需要 DE 对象的那一半（层次展开、VAR 求值）
+            plan = _model_dep_plan(design, netlist, ws, library)
+            evidence = model_deps.finalize(plan)
+            out["model_deps"] = evidence
+            out["model_fingerprint"] = evidence.get("model_fingerprint") or {}
     finally:
         _close_design(design)
     netlist = netlist if isinstance(netlist, str) else str(netlist)
@@ -6711,6 +6844,148 @@ def design_fingerprint(args: dict, ctx=None) -> dict:
     }
     out["design_ref"] = name
     return out
+
+
+# ---------------------------------------------------------------------------
+# 模型依赖指纹（实现见 model_deps；这里只提供"要开设计"的那两个回调）
+# ---------------------------------------------------------------------------
+
+# 这些 cell 没有下层电路可展开（控制器 / 端口 / 地 / 变量），跳过能省掉
+# 一堆注定失败的子图打开，也避免 hierarchy.failed 里全是噪音。
+_NO_DESCEND_CELLS = set(_SIM_CONTROLLERS) | set(_PORT_CELLS) | set(_GND_MASTERS) | {
+    "VAR", "VAR1", "MSUB", "MSUB1", "Options", "Eqn", "MeasEqn", "Note",
+    "Text", "NodeSet", "Stim", "SweepPlan", "OutputPlan", "Optim", "Goal",
+    "ParameterSweep", "DisplayTemplate",
+}
+
+
+def _library_roots(ws) -> dict:
+    """库名 -> 盘上路径（Design Kit 套件级保守指纹用）。
+
+    路径优先取**套件根**（往上最多找两级含 ``lib.defs`` 的目录）—— 套件根
+    才是"整个套件"的粒度；找不到就退回库目录本身（粒度更细，但仍是保守的）。
+    """
+    out: dict = {}
+    try:
+        libs = list(ws.libraries or [])
+    except Exception:  # noqa: BLE001
+        return out
+    for lib in libs:
+        try:
+            lib_name = str(getattr(lib, "name", "") or "")
+            path = str(getattr(lib, "path", "") or getattr(lib, "lib_path", "") or "")
+        except Exception:  # noqa: BLE001
+            continue
+        if not lib_name or not path:
+            continue
+        absolute = os.path.abspath(path)
+        # 往上最多找两级带 lib.defs 的目录 = 套件根；找不到就**保持库目录
+        # 本身**（绝不退到工作区根 —— 那会把整个工作区当成套件去算指纹）
+        root = absolute
+        probe = absolute
+        for _ in range(2):
+            parent = os.path.dirname(probe)
+            if not parent or parent == probe:
+                break
+            if os.path.isfile(os.path.join(parent, "lib.defs")):
+                root = parent
+                break
+            probe = parent
+        out[lib_name] = root
+        out.setdefault(lib_name.lower(), root)
+    return out
+
+
+def _model_dep_descend(library: str):
+    """层次展开回调：打开 ``lib:cell:schematic`` 取其子图清单。
+
+    只在**主线程**调用（``keysight.ads.de`` 的设计对象不能跨线程用）。
+    返回 None = 这个 cell 没有可展开的原理图（基本件，正常现象）；
+    真的出错就抛出去 —— 由 collect_plan 记进 hierarchy.failed，
+    让"有子图但打不开"和"压根没有子图"分得开。
+    """
+    def _sub(cell, lib):
+        lib_name = str(lib or library or "")
+        if not lib_name or not cell or cell in _NO_DESCEND_CELLS:
+            return None
+        design = _open_design(lib_name, cell, "schematic", write=False)
+        try:
+            try:
+                instances = list(design.instances or [])
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"{type(e).__name__}: {e}") from e
+            if not instances:
+                return None
+            entries = []
+            for inst in instances:
+                entries.append({
+                    "name": _inst_name(inst),
+                    "master": _inst_master(inst),
+                    "params": _inst_params(inst),
+                })
+            vars_table = {}
+            for inst in instances:
+                try:
+                    if getattr(inst, "is_var_instance", False):
+                        for k, v in dict(getattr(inst, "vars", {}) or {}).items():
+                            vars_table[str(k)] = str(v)
+                except Exception:  # noqa: BLE001
+                    pass
+            return {"instances": entries, "vars": vars_table, "library": lib_name}
+        finally:
+            _close_design(design)
+    return _sub
+
+
+def _netlist_libraries(netlist_text) -> list:
+    """网表里显式写出的库名（``#load "lib", "cell"`` / ``library="lib"``）。
+
+    套件的 AEL 模型在网表里就是以这种形式引入的 —— 这是"这个设计用了哪个
+    套件"的可靠证据（比从元件对象上反查库归属可靠）。
+    """
+    text = str(netlist_text or "")
+    out = []
+    for pattern in (r'#\s*load\s+"([^"]+)"', r'\blibrary\s*=\s*"([^"]+)"',
+                    r'\blib\s*=\s*"([^"]+)"'):
+        for name in re.findall(pattern, text, re.I):
+            name = str(name or "").strip()
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
+def _model_dep_plan(design, netlist_text, ws, library: str) -> dict:
+    """阶段一：设计还开着时把模型依赖解析成"待哈希清单"（不读文件内容）。"""
+    ws_path = str(getattr(ws, "path", "") or "")
+    try:
+        inventory = _rf_inventory(design, library, str(getattr(design, "name", "") or ""))
+    except Exception as e:  # noqa: BLE001 — 取不到实例清单就如实记一条
+        return {"workspace": ws_path, "library": library, "instances_scanned": 0,
+                "declared": [], "resolved": [], "unresolved": [], "kits": [],
+                "hierarchy": {"expanded": [], "failed": [
+                    {"cell": library, "library": library,
+                     "reason": f"实例清单读取失败: {type(e).__name__}: {e}"}]},
+                "notes": [f"模型依赖扫描失败，按无法解析处理: {type(e).__name__}: {e}"]}
+    try:
+        instances = list(inventory.get("instances") or [])
+        vars_table = dict(inventory.get("vars") or {})
+        return model_deps.collect_plan(
+            instances, netlist_text=netlist_text or "", workspace=ws_path,
+            var_table=vars_table, library=library,
+            library_roots=_library_roots(ws),
+            descend=_model_dep_descend(library),
+            ignored_cells=_NO_DESCEND_CELLS,
+            kit_libraries=[library] + _netlist_libraries(netlist_text),
+        )
+    except Exception as e:  # noqa: BLE001 — 扫描本身出错绝不能挡住仿真
+        return {"workspace": ws_path, "library": library,
+                "instances_scanned": len(instances),
+                "declared": [], "resolved": [], "unresolved": [{
+                    "raw": "(扫描失败)", "param": "", "instances": [],
+                    "origins": ["scan"], "master": "", "library": library,
+                    "reason": f"scan_failed:{type(e).__name__}", "tried": []}],
+                "kits": [], "hierarchy": {"expanded": [], "failed": []},
+                "notes": [f"模型依赖扫描失败: {type(e).__name__}: {e}"]}
 
 
 DISPATCH = {
@@ -6728,3 +7003,13 @@ DISPATCH = {
     "audit_rf": audit_rf,
     "design_fingerprint": design_fingerprint,
 }
+
+# 原厂模型包工具：实现全在 model_ops（同一套 attach / 只读浏览 / 验证逻辑），
+# 这里只做转发 —— 保持 DISPATCH 是"全部工具名"的唯一清单，
+# toolserver 的 pump 只认这张表。
+#
+# 键必须与 backend/model_tools.py 实际派发的名字一致：后端调的是
+# attach_design_kit / list_vendor_models / get_vendor_model_info /
+# validate_model_import，少一个后端就会拿到"未知工具"。其余四个是语义
+# 更细的别名，共用同一批实现，不是两套代码。
+DISPATCH.update(model_ops.HANDLERS)

@@ -444,6 +444,23 @@ def evaluate(traces: dict, metrics: list, band: dict | None = None,
     options = options or {}
     results = [_eval_one(traces, spec or {}, band, notes, available, options)
                for spec in (metrics or [])]
+
+    # 模型条件门禁：**在给出判定之前**拦一道。模型的有效频段覆盖不到目标
+    # 频段时，曲线在该区间是 ADS 的插值/外推结果，据此报达标没有依据；
+    # 频段或工作条件查不到时同理 —— 一律 unknown（pass=None）+ 写明原因。
+    gate = options.get("model_gate")
+    if gate and gate.get("block"):
+        reason = "model_" + str(gate.get("state") or "unknown")
+        for r in results:
+            if r.get("pass") is not None:
+                r["pass"] = None
+                r["blocked_reason"] = reason
+                r["exact"] = False
+            r["note"] = (r.get("note", "") + "；" if r.get("note") else "") \
+                + str(gate.get("message") or "模型条件门禁未通过")
+            r["model_gate"] = {"state": gate.get("state"), "reason": reason}
+        notes.append(str(gate.get("message") or ""))
+
     return {
         "results": results,
         "band": band,

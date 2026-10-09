@@ -23,6 +23,20 @@ import sys
 import tempfile
 import traceback
 
+# ---------------------------------------------------------------------------
+# Windows 编码：测试输出一律按 UTF-8 写
+# ---------------------------------------------------------------------------
+# 中文 Windows 的控制台/管道默认代码页是 GBK，测试里却到处是 emoji 与中文
+# 断言文案（📦 / Ω / 工作区…）。子进程按 UTF-8 写、父进程按 GBK 读就会满屏
+# 乱码，甚至中途 UnicodeEncodeError。这里统一把本进程的 stdout/stderr 切成
+# UTF-8（errors=replace 兜住个别无法编码的字符），父进程也按 UTF-8 解码
+# （见 run_tests.py），两边口径一致。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 PASSED: list = []
 FAILED: list = []
 

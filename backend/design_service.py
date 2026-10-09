@@ -24,6 +24,7 @@ import threading
 import adslog
 import design_job as dj
 import design_metrics as dm
+import model_gate
 import tools as tools_mod
 
 log = adslog.get("backend.design")
@@ -157,6 +158,11 @@ def build_spec(raw: dict) -> dict:
             "view": (design.get("view") or DEFAULT_VIEW).strip() or DEFAULT_VIEW,
             "workspace": (design.get("workspace") or "").strip(),
         },
+        # 模型工作条件要求（偏压 / 温度）：有就拿来核对模型变体是否匹配，
+        # 没有则只如实记录模型自身的条件，不制造"不匹配"的假象。
+        "model_conditions": dict(raw.get("model_conditions") or {}),
+        # 设计参考阻抗（Ω）：用于核对模型参考阻抗；拿不到就不比。
+        "reference_ohm": raw.get("reference_ohm"),
         "simulate": bool(raw.get("simulate", True)),
         "reuse_dataset": bool(raw.get("reuse_dataset", False)),
         "dataset_path": (raw.get("dataset_path") or "").strip(),
@@ -356,6 +362,15 @@ def _run_design_locked(cfg: dict, spec: dict, project_root: str,
         # 跨工作区防误操作使用（结果页也会展示）
         if result.get("design_version"):
             job.design_version = dict(result["design_version"])
+        # 模型依赖指纹：原厂模型可以整体被换掉（同一路径、同一个网表，
+        # 内容不同），只比网表会把过期结果当成有效结果复用。这里把
+        # 「哪个模型包 / 哪个文件 / 什么哈希」随任务一起持久化，供追溯。
+        if result.get("model_fingerprint"):
+            job.set_sim(model_fingerprint=dict(result["model_fingerprint"]))
+        # model_deps 是完整证据：四态（无依赖/完整/不完整/缺失）+ 逐文件
+        # 内容哈希 + Design Kit 套件级保守指纹。复用前的模型侧核对靠它。
+        if result.get("model_deps"):
+            job.set_sim(model_deps=dict(result["model_deps"]))
         ws_path = (result.get("workspace") or {}).get("path") or ""
         if ws_path:
             job.set_sim(workspace=ws_path)
@@ -428,11 +443,39 @@ def _run_design_locked(cfg: dict, spec: dict, project_root: str,
         return _cancel_stop("用户已取消：数据已读取并保存，评估未执行"
                             "（可稍后重新评估）")
 
-    # ---- 3. 确定性评估 ---------------------------------------------------
+    # ---- 3. 模型条件门禁（频段 / 参考阻抗 / 偏压 / 温度）-------------------
+    # 门禁而不是提示：模型的有效频段覆盖不到目标频段时，ADS 在该区间给的
+    # 是插值/外推结果 —— 拿它报"达标"就是骗人。覆盖不足或条件查不到时，
+    # 评估器会把指标判成 unknown（pass=None），并在结果里写明"需核实"。
+    gate = None
+    conditions: list = []
+    evidence = job.sim.get("model_deps") or job.sim.get("model_fingerprint")
+    if evidence:
+        ws_for_index = job.sim.get("workspace") or job.design.get("workspace") or ""
+        required = spec.get("model_conditions") or {}
+        job.set_sim(model_conditions_required=dict(required))
+        try:
+            conditions = model_gate.resolve_conditions(ws_for_index, evidence,
+                                                       required=required or None)
+            gate = model_gate.evaluate_coverage(
+                job.band, conditions,
+                reference_ohm=spec.get("reference_ohm"),
+                required=required or None)
+        except Exception as e:  # noqa: BLE001 — 门禁本身出错必须如实标记
+            log.warning("模型条件门禁计算失败 %s: %s", job.job_id, e)
+            gate = {"state": "unknown", "block": True, "reasons": [],
+                    "per_model": [],
+                    "message": f"模型条件门禁计算失败（{type(e).__name__}: {e}），"
+                               f"指标一律判为未知，不报达标。"}
+        job.set_sim(model_conditions=conditions, model_gate=gate)
+
+    # ---- 4. 确定性评估 ---------------------------------------------------
     _t_eval = _time.perf_counter()
+    eval_options = dict(spec.get("eval_options") or {})
+    if gate:
+        eval_options["model_gate"] = gate
     evaluation = dm.evaluate(traces, job.metric_specs, job.band,
-                             available=available,
-                             options=spec.get("eval_options") or {})
+                             available=available, options=eval_options)
     _timing["evaluate_s"] = round(_time.perf_counter() - _t_eval, 3)
     job.set_metrics(evaluation["results"])
     summary = evaluation["summary"]
@@ -461,6 +504,272 @@ def _run_design_locked(cfg: dict, spec: dict, project_root: str,
     return job
 
 
+MAX_OPTIMIZATION_ROUNDS = 20
+
+
+def run_optimization(cfg: dict, project_root: str, job_id: str, plan: dict,
+                     apply_candidate=None, on_step=None,
+                     cancel_event=None) -> dj.DesignJob:
+    """**有界**优化：复用现有 run_design（仿真 → 读真实数据 → 确定性评估）。
+
+    两条纪律（违反就是把"探索"包装成"结论"）：
+
+    1. **必须用户明确要求。** ``plan["requested_by_user"]`` 不为真就直接拒绝 ——
+       导入模型、改设计、看结果都不会自动触发优化。
+    2. **每一轮都留下可追溯证据。** 每轮记候选型号/实际参数 + 仿真证据
+       （数据集路径、网表指纹、模型依赖指纹）+ 评估器算出的指标；只有**真实
+       跑过且判定通过**的那一轮才能称为"达标"，"最佳已验证结果"只在有
+       通过轮次时才指向通过的那轮，否则指向达标项最多的一轮并注明未达标。
+
+    两类优化分开处理（混在一起会得出错误结论）：
+        ``continuous`` 外围连续参数优化 —— 改 VAR 变量（如匹配网络的
+            L/C 值），参数空间连续，可以直接扫；
+        ``discrete``   原厂型号离散选型 —— 在有限候选型号之间挑，必须靠
+            调用方给的 ``apply_candidate`` 真正换元件（换型号要核对端口
+            定义与参数，且换了型号旧结果一律不适用）。
+
+    停止条件：达到迭代上限 / 用户取消 / 某一轮失败（默认 stop）/ 出现达标轮次
+    且 ``stop_on_first_pass``。无论怎么停，``best`` 里都是**已验证**的结果。
+
+    ``plan`` 结构::
+
+        {"kind": "continuous"|"discrete", "requested_by_user": True,
+         "max_iterations": 8, "stop_on_first_pass": True,
+         "candidates": [{"label": "L1=2.2nH", "variables": {"L1": "2.2 nH"}}]
+         }                      # discrete 时改给 {"part": "BFP181", "cell": ...}
+    """
+    plan = dict(plan or {})
+    if not plan.get("requested_by_user"):
+        raise DesignError(
+            "优化必须来自用户的明确要求：plan 里 requested_by_user 未置位。"
+            "导入模型、修改设计都不会自动开始优化。")
+
+    job = dj.load_job(project_root, job_id)
+    if job is None:
+        raise DesignError(f"找不到设计任务 {job_id}（design_jobs/ 下没有该文件）")
+
+    kind = str(plan.get("kind") or "").strip().lower()
+    if kind not in ("continuous", "discrete"):
+        raise DesignError(
+            f"未知的优化类型 {kind!r}：只能用 continuous（外围连续参数）或 "
+            f"discrete（原厂型号离散选型）。两者不能混为一谈。")
+    if kind == "discrete" and not callable(apply_candidate):
+        raise DesignError(
+            "离散型号选型必须提供 apply_candidate 可调用对象（负责真正替换元件）。"
+            "不给就跑，等于只改了记录而没改电路 —— 那是假优化。")
+
+    candidates = [dict(c) for c in (plan.get("candidates") or [])]
+    if not candidates:
+        raise DesignError("优化计划里没有候选（candidates 为空）：先给出候选集合。")
+    try:
+        max_iterations = int(plan.get("max_iterations") or 0)
+    except (TypeError, ValueError):
+        max_iterations = 0
+    if max_iterations <= 0:
+        max_iterations = len(candidates)
+    max_iterations = min(max_iterations, MAX_OPTIMIZATION_ROUNDS)
+    stop_on_first_pass = bool(plan.get("stop_on_first_pass", True))
+    stop_on_error = str(plan.get("on_error") or "stop").lower() != "continue"
+
+    def step(stage, text=""):
+        if on_step:
+            try:
+                on_step(stage, text)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def cancelled() -> bool:
+        return bool(cancel_event is not None and cancel_event.is_set())
+
+    job.set_optimization(
+        kind=kind, requested_by_user=True,
+        max_iterations=max_iterations, n_candidates=len(candidates),
+        stop_on_first_pass=stop_on_first_pass,
+        started_at=dj.utc_now(), iterations=[], best=None,
+        stopped_reason="", status="running",
+    )
+    _persist(project_root, job)
+
+    best: dict | None = None
+    stopped_reason = "completed"
+    last_applied_index = 0
+
+    for index, candidate in enumerate(candidates[:max_iterations], start=1):
+        if cancelled():
+            stopped_reason = f"用户已取消：已完成 {index - 1} 轮，结果保留"
+            break
+
+        # run_design 的工作区检查发生在仿真阶段；优化在此之前会改 VAR 或元件，
+        # 因此必须先检查，避免切换 Workspace 后误改另一个同名设计。
+        ws_error = verify_workspace(cfg, job)
+        if ws_error:
+            job.fail(ws_error)
+            stopped_reason = f"第 {index} 轮前工作区校验失败，已停止"
+            break
+
+        label = str(candidate.get("label")
+                    or candidate.get("part")
+                    or candidate.get("cell") or f"候选{index}")
+        step(dj.STAGE_SIMULATING, f"优化第 {index}/{max_iterations} 轮：{label}")
+
+        # ---- 应用候选 ----------------------------------------------------
+        try:
+            if kind == "continuous":
+                variables = dict(candidate.get("variables") or {})
+                if not variables:
+                    raise DesignError(f"候选 {label} 没有 variables（连续参数优化靠改 VAR）")
+                tools_mod.call(cfg, "set_design_variables", {
+                    "library": job.design.get("library"),
+                    "cell": job.design.get("cell"),
+                    "view": job.design.get("view") or DEFAULT_VIEW,
+                    "values": variables,
+                })
+                applied = {"variables": variables}
+            else:
+                applied = apply_candidate(candidate) or {}
+            last_applied_index = index
+        except Exception as e:  # noqa: BLE001 — 应用失败要留下证据再决定去留
+            job.add_optimization_iteration({
+                "candidate": candidate, "label": label,
+                "status": "apply_failed",
+                "error": f"{type(e).__name__}: {e}",
+            })
+            if stop_on_error:
+                stopped_reason = f"第 {index} 轮应用候选失败（{type(e).__name__}），已停止"
+                break
+            continue
+
+        # ---- 仿真 + 评估（复用既有编排，指标一律由评估器算）--------------
+        spec = {
+            "job_id": job.job_id,
+            "band": job.band,
+            "metrics": _stored_metric_specs(job),
+            "design": job.design,
+            "traces": _traces_from_job(job),
+            "simulate": True,
+            "reuse_dataset": False,
+            "eval_options": dict(job.eval_options or {}),
+            "model_conditions": plan.get("model_conditions") or {},
+            "reference_ohm": plan.get("reference_ohm"),
+        }
+        try:
+            job = run_design(cfg, spec, project_root, job=job,
+                             on_step=on_step, cancel_event=cancel_event)
+        except Exception as e:  # noqa: BLE001
+            job.add_optimization_iteration({
+                "candidate": candidate, "label": label, "applied": applied,
+                "status": "run_failed", "error": f"{type(e).__name__}: {e}",
+            })
+            if stop_on_error:
+                stopped_reason = f"第 {index} 轮仿真/评估失败（{type(e).__name__}），已停止"
+                break
+            continue
+
+        summary = job.summary()
+        record = {
+            "n": index,
+            "candidate": candidate,
+            "label": label,
+            "applied": applied,
+            "status": "done",
+            "part": candidate.get("part") or "",
+            "metrics": [
+                {"id": m.get("id"), "label": m.get("label"),
+                 "actual": m.get("actual"), "target": m.get("target"),
+                 "unit": m.get("unit"), "pass": m.get("pass"),
+                 "blocked_reason": m.get("blocked_reason") or ""}
+                for m in (job.metrics or [])
+            ],
+            "summary": summary,
+            # 仿真证据：这一轮的结论能追溯到哪个数据集 / 哪份网表 / 哪些模型
+            "evidence": {
+                "dataset_path": job.artifacts.get("dataset_path", ""),
+                "output_dir": job.artifacts.get("output_dir", ""),
+                "netlist_sha": (job.design_version or {}).get("netlist_sha", ""),
+                "model_deps_fingerprint": ((job.sim or {}).get("model_deps") or {}).get(
+                    "fingerprint", ""),
+                "model_deps_state": ((job.sim or {}).get("model_deps") or {}).get(
+                    "state", ""),
+            },
+        }
+        job.add_optimization_iteration(record)
+        record["n"] = index   # 兜底：迭代记录里必须带轮次号
+
+        # 最佳已验证结果：**只在真实跑过的轮次里挑**
+        verdict = summary.get("verdict")
+        better = False
+        if best is None:
+            better = True
+        elif verdict == "pass" and best.get("summary", {}).get("verdict") != "pass":
+            better = True
+        elif verdict == best.get("summary", {}).get("verdict"):
+            better = summary.get("n_passed", 0) > best.get("summary", {}).get(
+                "n_passed", 0)
+        if better:
+            best = {"n": record.get("n"), "label": label, "candidate": candidate,
+                    "applied": applied, "summary": summary,
+                    "evidence": record["evidence"],
+                    "verified_pass": verdict == "pass"}
+        _persist(project_root, job)
+
+        if verdict == "pass" and stop_on_first_pass:
+            stopped_reason = f"第 {index} 轮达标，按要求停止"
+            break
+        if cancelled():
+            stopped_reason = f"用户已取消：已完成 {index} 轮，结果保留"
+            break
+        if job.stage == dj.STAGE_FAILED:
+            stopped_reason = f"第 {index} 轮失败（{job.error[:120]}），已停止"
+            break
+        if index >= max_iterations:
+            stopped_reason = f"已达到迭代上限 {max_iterations} 轮"
+
+    if best is None:
+        best_text = "没有任何一轮得到可验证的结果（未产生最佳结果）"
+    elif best.get("verified_pass"):
+        best_text = f"第 {best.get('n')} 轮（{best.get('label')}）达标"
+    else:
+        best_text = (f"第 {best.get('n')} 轮（{best.get('label')}）达标项最多，"
+                     f"但**未达标**（{best.get('summary', {}).get('n_passed', 0)}/"
+                     f"{best.get('summary', {}).get('n_metrics', 0)}）")
+
+    # 多轮探索后把电路恢复到记录的最佳候选，保证当前电路和结果页所指向的
+    # 数据集一致。恢复只重新应用已仿真的候选，不额外声称产生了新仿真结果。
+    if best and last_applied_index != int(best.get("n") or 0):
+        ws_error = verify_workspace(cfg, job)
+        try:
+            if ws_error:
+                raise DesignError(ws_error)
+            candidate = dict(best.get("candidate") or {})
+            if kind == "continuous":
+                variables = dict(candidate.get("variables") or {})
+                tools_mod.call(cfg, "set_design_variables", {
+                    "library": job.design.get("library"),
+                    "cell": job.design.get("cell"),
+                    "view": job.design.get("view") or DEFAULT_VIEW,
+                    "values": variables,
+                })
+            else:
+                apply_candidate(candidate)
+            job.notes.append({"at": dj.utc_now(), "stage": job.stage,
+                              "text": f"已恢复第 {best.get('n')} 轮最佳候选：{best.get('label')}"})
+        except Exception as e:  # noqa: BLE001
+            job.notes.append({"at": dj.utc_now(), "stage": job.stage,
+                              "text": ("未能恢复最佳候选到当前电路："
+                                       f"{type(e).__name__}: {e}")})
+
+    job.set_optimization(best=best, best_text=best_text,
+                         stopped_reason=stopped_reason,
+                         finished_at=dj.utc_now(),
+                         status="cancelled" if "取消" in stopped_reason else "done")
+    job.notes.append({"at": dj.utc_now(), "stage": job.stage,
+                      "text": f"优化结束（{kind}）：{stopped_reason}；{best_text}"})
+    _persist(project_root, job)
+    step(job.stage, f"优化结束：{stopped_reason}；{best_text}")
+    log.info("设计任务 %s 优化结束: %s | %s", job.job_id, stopped_reason, best_text)
+    return job
+
+
 def reload_job(cfg: dict, project_root: str, job_id: str, on_step=None,
                cancel_event=None) -> dj.DesignJob:
     """重新读取已记录的数据集并重算指标（不重新仿真）。"""
@@ -478,6 +787,7 @@ def reload_job(cfg: dict, project_root: str, job_id: str, on_step=None,
         "eval_options": dict(job.eval_options or {}),
         "dataset_path": job.artifacts.get("dataset_path", ""),
         "output_dir": job.artifacts.get("output_dir", ""),
+        "model_conditions": dict((job.sim or {}).get("model_conditions_required") or {}),
     }
     return run_design(cfg, spec, project_root, job=job, on_step=on_step,
                       cancel_event=cancel_event)
@@ -498,6 +808,7 @@ def resimulate(cfg: dict, project_root: str, job_id: str, on_step=None,
         "simulate": True,
         "reuse_dataset": False,
         "eval_options": dict(job.eval_options or {}),
+        "model_conditions": dict((job.sim or {}).get("model_conditions_required") or {}),
     }
     return run_design(cfg, spec, project_root, job=job, on_step=on_step,
                       cancel_event=cancel_event)

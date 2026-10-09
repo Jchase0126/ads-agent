@@ -10,8 +10,6 @@ Reads config.ini at the project root; environment variables override:
 后端和 ADS 端工具服务必须拿到同一个值（见该模块的说明）。
 """
 
-from __future__ import annotations
-
 import configparser
 import json
 import os
@@ -51,14 +49,8 @@ DEFAULTS = {
     # 把耗时仿真放到后台线程执行（不占用 ADS 主线程）。
     # 网表生成等必须访问 DE 数据库的步骤始终留在主线程；见 ads_ops.run_simulation。
     "sim_off_main_thread": True,
-    # ---- 跨版本兼容（config.ini [compat]）----
-    # 未知版本放行（默认 False = 保守拒绝写操作）
-    "compat_allow_unknown_version": False,
-    # ADS 2024–2026 为实验性适配：写/建图/仿真需按年份显式开启。
-    # **开启不代表验证通过**，界面仍会显示"未实机验证"。
-    "compat_experimental_2024": False,
-    "compat_experimental_2025": False,
-    "compat_experimental_2026": False,
+    # 统一模型库：ZIP 备份和索引放在此目录，各 ADS Workspace 按需导入副本。
+    "model_library_root": "",
 }
 
 
@@ -94,10 +86,11 @@ def load() -> dict:
     get("agent", "sim_timeout", "sim_timeout", gi)
     get("agent", "context_budget_chars", "context_budget_chars", gi)
     get_bool("agent", "sim_off_main_thread", "sim_off_main_thread")
-    get_bool("compat", "allow_unknown_version", "compat_allow_unknown_version")
-    get_bool("compat", "experimental_2024", "compat_experimental_2024")
-    get_bool("compat", "experimental_2025", "compat_experimental_2025")
-    get_bool("compat", "experimental_2026", "compat_experimental_2026")
+    get("models", "library_root", "model_library_root")
+    # 留空时由共享库模块按当前 ADS Workspace 的父目录解析为同级 libraries。
+    cfg["model_library_root"] = (
+        os.environ.get("ADS_AGENT_LIBRARY_ROOT", "").strip()
+        or cfg["model_library_root"])
 
     cfg["llm_api_key"] = os.environ.get("ADS_AGENT_API_KEY", cfg["llm_api_key"])
     cfg["llm_base_url"] = os.environ.get("ADS_AGENT_BASE_URL", cfg["llm_base_url"])
@@ -188,6 +181,45 @@ def profile_labels(cfg):
 
 def ads_base_url(cfg: dict) -> str:
     return f"http://{cfg['ads_host']}:{cfg['ads_port']}"
+
+
+def persist_model_library_root(root: str, only_if_empty: bool = True) -> str:
+    """Select the first shared root under the configuration lock, preserving other settings.
+
+    Unlike interactive LLM settings, a failed lock must not fall back to an
+    unlocked write: two first imports must not choose different shared roots.
+    Explicit edits pass only_if_empty=False; the environment override is never written.
+    """
+    root = str(root).strip()
+    if not os.path.isabs(root) or "\n" in root or "\r" in root:
+        raise ValueError("模型库目录必须为绝对路径")
+    lock = ads_auth.config_lock()
+    if not lock.acquire():
+        raise RuntimeError("无法锁定模型库配置，请稍后重试")
+    try:
+        lines = ads_auth._read_lines()
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string("\n".join(lines))
+        previous = parser.get("models", "library_root", fallback="").strip()
+        if only_if_empty and previous:
+            return previous
+        start = next((i for i, line in enumerate(lines)
+                      if line.strip().lower() == "[models]"), None)
+        if start is None:
+            lines.extend(["", "[models]"])
+            start = len(lines) - 1
+        end = next((i for i in range(start + 1, len(lines))
+                    if lines[i].strip().startswith("[")), len(lines))
+        index = next((i for i in range(start + 1, end)
+                      if re.match(r"\s*library_root\s*=", lines[i], re.I)), None)
+        if index is None:
+            lines.insert(end, "library_root = " + root)
+        else:
+            lines[index] = "library_root = " + root
+        ads_auth._atomic_write_lines(lines)
+        return root
+    finally:
+        lock.release()
 
 
 def key_hint(key: str) -> str:

@@ -627,7 +627,11 @@ def test_composer_status_tracks_phases_stops_and_preserves_errors():
     widget._on_event(dict(type='status', text='正在思考…（第 1/30 步）'), project)
     ok(widget.run_status_row.isVisible())
     eq(widget.run_status_text._full_text, '正在分析问题…')
-    ok(widget.run_stop_btn.isVisible())
+    # Running-state stop control is the send button itself (the user-requested
+    # square-in-arrow treatment); the separate row stop button stays hidden.
+    ok(widget.send.isVisible())
+    ok(widget.send.property('busy'))
+    eq(widget.send.accessibleName(), '停止本轮回复')
     widget._on_event(dict(type='content_delta', text='回复内容'), project)
     eq(widget.run_status_text._full_text, '正在生成回复…')
     stopped = []
@@ -637,9 +641,9 @@ def test_composer_status_tracks_phases_stops_and_preserves_errors():
         def stop(self):
             stopped.append(True)
     widget._worker = Worker()
-    widget.run_stop_btn.click()
+    widget.send.click()
     eq(stopped, [True])
-    ok(not widget.run_stop_btn.isEnabled())
+    ok(not widget.send.isEnabled())
     widget._on_event(dict(type='done'), project)
     ok(widget.run_status_row.isHidden())
     widget._on_event(dict(type='error', message='连接中断'), project)
