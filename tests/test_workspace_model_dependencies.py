@@ -170,7 +170,8 @@ class DependenciesTest(unittest.TestCase):
         self.assertEqual(calls[0]["ADSLIBCONFIG_PATH"], str(output).replace("\\", "/"))
         self.assertEqual(calls[0]["KEEP"], "yes")
         config = (output / "ADSlibconfig").read_text()
-        self.assertIn(str(self.target).replace("\\", "/"), config)
+        expected_target = os.path.realpath(str(self.target)).replace("\\", "/")
+        self.assertIn(expected_target, config)
         self.assertEqual(result["status"], "done")
 
 

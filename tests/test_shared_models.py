@@ -14,6 +14,11 @@ import model_store
 import shared_models
 
 
+def canonical(path):
+    """Compare Windows paths after resolving 8.3 aliases and case."""
+    return os.path.normcase(os.path.realpath(path))
+
+
 def archive(files, compression=zipfile.ZIP_STORED, reverse=False):
     data = io.BytesIO()
     with zipfile.ZipFile(data, "w", compression=compression) as z:
@@ -50,12 +55,12 @@ class SharedModelsTests(unittest.TestCase):
         other = os.path.join(self.tmp.name, "different", "other_wrk")
         second = shared_models.library_root({"model_library_root": ""}, other)
         self.assertEqual(first, second)
-        self.assertEqual(first, os.path.join(os.path.dirname(self.ws), "libraries"))
-        self.assertEqual(config.load()["model_library_root"], first)
+        self.assertEqual(canonical(first), canonical(os.path.join(os.path.dirname(self.ws), "libraries")))
+        self.assertEqual(canonical(config.load()["model_library_root"]), canonical(first))
 
     def test_environment_override_does_not_persist(self):
         with patch.dict(os.environ, {"ADS_AGENT_LIBRARY_ROOT": self.root}):
-            self.assertEqual(shared_models.library_root({}, self.ws), self.root)
+            self.assertEqual(canonical(shared_models.library_root({}, self.ws)), canonical(self.root))
             self.assertFalse(os.path.exists(os.environ["ADS_AGENT_CONFIG"]))
 
     def test_config_update_preserves_credentials_comments_and_other_sections(self):
@@ -71,7 +76,7 @@ class SharedModelsTests(unittest.TestCase):
         self.assertIn("x = 42", content)
         replacement = os.path.join(self.tmp.name, "new-library")
         shared_models.set_library_root(self.cfg, replacement)
-        self.assertEqual(config.load()["model_library_root"], replacement)
+        self.assertEqual(canonical(config.load()["model_library_root"]), canonical(replacement))
 
     def test_repacked_zip_reuses_one_canonical_archive(self):
         original = self.save(archive(self.files))
