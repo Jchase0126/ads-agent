@@ -187,7 +187,7 @@ def test_result_entry_renders_a_result_page():
     contains(row.design_ref.text(), "AI_lib:Amp24G:schematic")
     ok(row.chart.has_curves(), "结果页必须带真实曲线")
     eq(row.resim_btn.text(), "重新仿真")
-    eq(row.open_btn.text(), "在 ADS 中打开原理图")
+    eq(row.open_btn.text(), "打开原理图")
 
 
 # ---------------------------------------------------------------------------

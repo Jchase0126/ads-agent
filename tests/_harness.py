@@ -16,12 +16,61 @@
 这些文件同样能被 pytest 直接收集（函数名就是 ``test_*``）。
 """
 
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 import traceback
+
+# ---------------------------------------------------------------------------
+# Windows 编码：测试输出一律按 UTF-8 写
+# ---------------------------------------------------------------------------
+# 中文 Windows 的控制台/管道默认代码页是 GBK，测试里却到处是 emoji 与中文
+# 断言文案（📦 / Ω / 工作区…）。子进程按 UTF-8 写、父进程按 GBK 读就会满屏
+# 乱码，甚至中途 UnicodeEncodeError。这里统一把本进程的 stdout/stderr 切成
+# UTF-8（errors=replace 兜住个别无法编码的字符），父进程也按 UTF-8 解码
+# （见 run_tests.py），两边口径一致。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
 
 PASSED: list = []
 FAILED: list = []
+
+# ---------------------------------------------------------------------------
+# 测试隔离：用户数据根目录绝不能是真实的 %LOCALAPPDATA%\ADSAgent
+# ---------------------------------------------------------------------------
+# 程序文件与用户数据分离之后，凡是通过 backend/paths.py 取路径的代码
+# （design_job 的保存、config.PROJECT_ROOT、日志……）默认都会落到真实数据
+# 根目录。测试若不管它，就会把假会话写进用户的地方 —— 而用户那边的数据
+# 一旦被"已存在的有效文件"挡住，真正的迁移就再也写不进去了。
+#
+# 所以：没有一个测试显式指定时，一律指到一个进程级临时目录，退出时删掉。
+# 需要自己的目录的测试照旧设置 ADS_AGENT_DATA_DIR，本默认值会被覆盖。
+_TEST_DATA_DIR: str | None = None
+
+
+def _isolate_user_data() -> None:
+    global _TEST_DATA_DIR
+    if os.environ.get("ADS_AGENT_DATA_DIR"):
+        return  # 测试自己指定了位置，尊重它
+    _TEST_DATA_DIR = tempfile.mkdtemp(prefix="ads_agent 测试数据 ")
+    os.environ["ADS_AGENT_DATA_DIR"] = _TEST_DATA_DIR
+
+
+def _cleanup_user_data() -> None:
+    if _TEST_DATA_DIR and os.path.isdir(_TEST_DATA_DIR):
+        try:
+            shutil.rmtree(_TEST_DATA_DIR)
+        except OSError:
+            pass
+
+
+_isolate_user_data()
+atexit.register(_cleanup_user_data)
 
 
 class Skip(Exception):

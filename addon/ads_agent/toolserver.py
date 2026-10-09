@@ -31,26 +31,155 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import authbridge
+import pathbridge
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.normpath(os.path.join(_HERE, "..", ".."))
-_LOG_DIR = os.path.join(_ROOT, "logs")
-_LOG_FILE = os.path.join(_LOG_DIR, "ads_toolserver.log")
+
+
+def _identity() -> dict:
+    """本实例的身份（放进 /health，详见 backend/instance.py）。
+
+    拿不到共享模块时返回空 dict —— 对端会把"没有身份"当成无法确认归属，
+    拒绝复用。**宁可报冲突，也不要闷头连错实例。**
+    """
+    try:
+        return pathbridge.load_backend_module("instance.py", "instance").identity()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _instance():
+    """共享的 instance 模块（拿不到就返回 None，不影响服务本身）。"""
+    try:
+        return pathbridge.load_backend_module("instance.py", "instance")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _service_name() -> str:
+    """/health 里自报的服务名。
+
+    必须与 ``backend/instance.SERVICE_TOOLSERVER`` **完全相同** —— 探测方
+    （``instance.evaluate``）正是拿这个字段判断"端口上坐的是不是本插件的工具
+    服务"。这里曾经写成另一个键名（``server``），结果是：探测全部判成
+    "其它程序占用端口"，而 /health 手测又一切正常 —— 2026-10-07 实机验收抓到。
+    """
+    inst = _instance()
+    return getattr(inst, "SERVICE_TOOLSERVER", "ads_agent_toolserver")
+
+
+def _protocol_version() -> int:
+    """共享的协议版本。别写死：版本一变，探测方就该据此判为不一致。"""
+    try:
+        return int(pathbridge.load().PROTOCOL_VERSION)
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+def _register_instance(host: str, port: int) -> None:
+    """在 <数据根>/runtime 里留下"这个端口是本实例在监听"的记录。
+
+    为什么工具服务也要登记：面板/后端靠它判断 8763 上坐着的是**哪一个** ADS
+    实例。没有这条记录，就只能看到一句 OSError: [WinError 10048] 端口已占用 ——
+    用户无法区分"我多开了一个 ADS"、"装了两份插件"和"别的软件占了这个端口"。
+    """
+    inst = _instance()
+    if inst is None:
+        return
+    try:
+        inst.cleanup_stale_instances()
+        inst.write_instance("toolserver", int(port), host)
+    except Exception as e:  # noqa: BLE001 — 登记失败不该拦住服务
+        _log("WARN", f"写实例登记失败（不影响服务运行）: {type(e).__name__}: {e}")
+
+
+def _clear_instance() -> None:
+    inst = _instance()
+    if inst is None:
+        return
+    try:
+        inst.clear_instance("toolserver")
+    except Exception as e:  # noqa: BLE001
+        _log("WARN", f"清实例登记失败: {type(e).__name__}: {e}")
+
+
+def _bind_conflict_detail(host: str, port: int, err: Exception) -> str:
+    """端口绑不上时，把"被谁占了"说清楚，并给出可执行的下一步。
+
+    三种情况要分开（用户看到的提示完全不同）：
+      * **同一个安装的另一个 ADS 实例** —— 多开冲突，本版本仅支持单实例；
+      * **另一份安装（别的目录/别人拷来的）** —— 归属不对，不能连；
+      * **别的程序** 或 一个不回应 /health 的服务 —— 换端口。
+    """
+    who = f"端口 {host}:{port}"
+    inst = _instance()
+    if inst is None:
+        return (f"{who} 无法监听（{type(err).__name__}: {err}）。"
+                f"请在 config.ini 的 [ads] port 换一个空闲端口后重启 ADS。")
+    try:
+        verdict = inst.evaluate(inst.probe(f"http://{host}:{port}"), "toolserver")
+    except Exception:  # noqa: BLE001
+        verdict = {}
+
+    ident = verdict.get("identity") or {}
+    if verdict.get("reason") == "ok":
+        return (
+            f"{who} 已被**另一个 ADS 实例**的工具服务占用（pid={ident.get('pid')}）。"
+            f"本版本仅支持单实例：请只保留一个 ADS 窗口，或换一个端口"
+            f"（config.ini 的 [ads] port）后重启 ADS。"
+        )
+    if verdict.get("reason") in ("foreign_install", "no_install_id"):
+        return (
+            f"{who} 上是**另一份 ADS Agent 安装**的工具服务（对方 install_id="
+            f"{ident.get('install_id') or '未知'}），不是当前这份。"
+            f"请先退出那一个，或换一个端口。"
+        )
+    if verdict.get("conflict"):
+        return (f"{who} 上的服务不是本插件：{verdict.get('detail')}。"
+                f"请在 config.ini 的 [ads] port 换一个空闲端口后重启 ADS。")
+    # 说不清是谁：至少把端口占用这件事讲明白
+    return (f"{who} 无法监听：{verdict.get('detail') or f'{type(err).__name__}: {err}'}。"
+            f"请在 config.ini 的 [ads] port 换一个空闲端口后重启 ADS。")
+
+
+
+#: 旧接口：留空表示"用统一路径解析的结果"。测试会覆盖它们写到临时目录，
+#: 所以这两个变量必须继续存在且优先于 paths 的计算结果。
+_LOG_DIR = ""
+_LOG_FILE = ""
+
+
+def _log_dir() -> str:
+    """日志目录每次现取：数据根目录可能被环境变量改掉，也可能还没建出来。"""
+    if _LOG_DIR:
+        return _LOG_DIR
+    try:
+        return pathbridge.load().logs_dir()
+    except Exception:  # noqa: BLE001
+        return os.path.join(_ROOT, "logs")
+
+
+def _log_file() -> str:
+    if _LOG_FILE:
+        return _LOG_FILE
+    return os.path.join(_log_dir(), "ads_toolserver.log")
 
 
 def _log(level: str, msg: str) -> None:
-    """写 tools 执行日志到 logs/ads_toolserver.log。
+    """写工具执行日志到 ``%LOCALAPPDATA%\\ADSAgent\\logs\\ads_toolserver.log``。
 
     ADS 是 GUI 进程，没有控制台，print/traceback 全都会丢；报错只能靠这里。
     注意：这里记的是工具名/参数/耗时/异常，**不记令牌**。
     """
     try:
-        os.makedirs(_LOG_DIR, exist_ok=True)
+        directory = _log_dir()
+        os.makedirs(directory, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"{stamp} {level} {msg}\n"
         if len(line) > 4000:
             line = line[:4000] + " …(截断)\n"
-        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+        with open(_log_file(), "a", encoding="utf-8") as f:
             f.write(line)
     except Exception:  # noqa: BLE001 — 写日志失败绝不能影响工具执行
         pass
@@ -85,7 +214,10 @@ def _load_config() -> configparser.ConfigParser:
     try:
         path = authbridge.auth().config_path()
     except Exception:  # noqa: BLE001
-        path = os.path.join(_ROOT, "config.ini")
+        try:
+            path = os.path.join(pathbridge.load().data_root(), "config.ini")
+        except Exception:  # noqa: BLE001
+            path = os.path.join(_ROOT, "config.ini")
     if os.path.exists(path):
         parser.read(path, encoding="utf-8")
     return parser
@@ -240,7 +372,10 @@ def active_jobs() -> list:
 _ADS_OPS_PATH = os.path.join(_HERE, "ads_ops.py")
 # ads_ops 依赖的本地纯计算模块：ads_ops 热重载前要先重载它们，
 # 否则 reload(ads_ops) 里的 import 命中 sys.modules 缓存，改了也不生效
-_ADS_OPS_DEPS = ("rf_audit",)
+# model_ops 不是"纯计算"（它要 keysight.ads.de），但同样必须列进来 ——
+# 不列的话改 model_ops.py 后只重载了 ads_ops，model_ops 仍是旧代码，
+# 而且症状是"我明明改了却不生效"，极难定位（同 rf_audit 当初踩的坑）。
+_ADS_OPS_DEPS = ("rf_audit", "model_ops")
 
 
 def _get_ads_ops():
@@ -512,8 +647,11 @@ class _Handler(BaseHTTPRequestHandler):
             # 开放接口：只报告"忙不忙"和作业名/时长，不含任何令牌信息
             self._json({
                 "status": "ok",
-                "server": "ads_agent_toolserver",
-                "protocol": 1,
+                # service 是**规范字段**（探测方读它）；server 是历史别名，留着
+                # 给人和旧脚本看，两者必须同值。
+                "service": _service_name(),
+                "server": _service_name(),
+                "protocol": _protocol_version(),
                 "auth_required": True,
                 "sim_off_main_thread": _sim_off_main_thread(),
                 # busy 在**整个作业期间**都为真（含已转后台的仿真），
@@ -527,6 +665,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # 请求已超时但后台线程仍在跑的作业数（界面据此说明"还在收尾"）
                 "timed_out_count": sum(1 for j in jobs if j["timed_out"]),
                 "cancel_requested_count": sum(1 for j in jobs if j.get("cancel_requested")),
+                # 身份：让探测方能确认"这是不是我这份安装的工具服务"。
+                # 面板/后端据此识别"另一个 ADS Agent 安装的 toolserver 占着端口"
+                # 的情况，而不是连上去才发现令牌对不上。见 backend/instance.py
+                "identity": _identity(),
             })
         else:
             self._json({"error": "not found"}, 404)
@@ -645,10 +787,19 @@ def ensure_started() -> str:
     if _server is None:
         host = _setting("ads", "host", "127.0.0.1")
         port = int(_setting("ads", "port", "8761"))
-        _server = ThreadingHTTPServer((host, port), _Handler)
+        try:
+            _server = ThreadingHTTPServer((host, port), _Handler)
+        except OSError as e:
+            # 裸 OSError([WinError 10048]) 对用户毫无信息量：说不出是多开了一个
+            # ADS、装了两份插件，还是别的软件占了端口。这里翻译成人话再抛。
+            detail = _bind_conflict_detail(host, port, e)
+            _log("ERROR", f"工具服务启动失败: {detail}")
+            raise RuntimeError(detail) from e
         _server.daemon_threads = True
         _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
         _server_thread.start()
+        _register_instance(host, port)
+        _log("INFO", f"工具服务已监听 {host}:{port}")
 
     return f"http://{_setting('ads', 'host', '127.0.0.1')}:{_setting('ads', 'port', '8761')}"
 
@@ -659,3 +810,7 @@ def shutdown() -> None:
         _server.shutdown()
         _server = None
         _server_thread = None
+        # 正常退出必须清掉登记：否则下一次启动会看到一个 pid 已死的陈旧记录，
+        # 只能靠 pid 存活兜底清理（能清，但没必要留这个坑）
+        _clear_instance()
+        _log("INFO", "工具服务已停止")

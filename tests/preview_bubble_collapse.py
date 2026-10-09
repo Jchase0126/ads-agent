@@ -135,6 +135,7 @@ def main():
     dock = QDockWidget(P.DOCK_TITLE, win)
     dock.setObjectName(P.DOCK_OBJECT_NAME)
     dock.setWidget(widget)
+    bar = P._install_dock_title_bar(dock, widget)
     win.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     handle = QDockWidget(win)
@@ -157,7 +158,7 @@ def main():
     app.processEvents()
     _shot(win, "collapse-1-expanded")
 
-    widget._on_collapse()  # 点 » 折叠
+    bar.collapse_btn.click()  # 自定义标题栏 » 是唯一收起入口。
     app.processEvents()
     _shot(win, "collapse-2-collapsed")
     print("  collapsed: dock visible =", dock.isVisible(),

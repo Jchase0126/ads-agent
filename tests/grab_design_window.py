@@ -1,41 +1,16 @@
-"""在 ADS 进程内截图指定原理图窗口（Qt widget.grab），保存 PNG。
+"""兼容旧截图入口；唯一实现保留在 tests/probes/AB_grab.py。
 
-用法: python tests/probe_via_ads.py tests/probes/AB_grab.py -- D:\...\out.png
-（直接改脚本尾部 OUT_PATH / TITLE_PAT 再跑更稳）
+支持直接运行以及 probe_via_ads 将脚本文本送入 ADS 执行。
 """
-import sys
-from PySide6.QtWidgets import QApplication
+from pathlib import Path
+import runpy
 
-TITLE_PAT = "Wilkinson_5G9"
-OUT_PATH = r"D:\Antenna\ADS Agent\tests\preview\grab_5g9.png"
+_entry = Path(globals().get("__file__", ""))
+if _entry.name == "grab_design_window.py":
+    _root = _entry.resolve().parent.parent
+else:
+    # ADS 的 run_python 执行文本时没有可靠的脚本 __file__。
+    import panel
+    _root = Path(panel.__file__).resolve().parents[2]
 
-app = QApplication.instance()
-if app is None:
-    raise SystemExit("no QApplication")
-
-found = None
-for w in app.topLevelWidgets():
-    try:
-        if TITLE_PAT.lower() in (w.windowTitle() or "").lower() and w.isVisible():
-            found = w
-            break
-    except Exception:  # noqa: BLE001
-        continue
-
-if found is None:
-    titles = []
-    for w in app.topLevelWidgets():
-        try:
-            if w.isVisible():
-                titles.append(f"{type(w).__name__}: {w.windowTitle()!r}")
-        except Exception:  # noqa: BLE001
-            continue
-    print("NO WINDOW with", TITLE_PAT)
-    print("visible windows:", titles)
-    raise SystemExit(1)
-
-print("grab:", type(found).__name__, found.windowTitle(),
-      found.width(), "x", found.height())
-pix = found.grab()
-ok = pix.save(OUT_PATH)
-print("saved:", OUT_PATH, ok)
+runpy.run_path(str(_root / "tests" / "probes" / "AB_grab.py"))

@@ -33,3 +33,17 @@ tests/preview/
 *_hpeesofsim*
 netlist.log
 dbo/
+
+# 发布产物只上传 GitHub Releases，不提交到源码仓库
+dist/
+build/
+
+# 本地任务笔记
+/task_plan.md
+/findings.md
+/progress.md
+
+# 一次性附件排障输出与临时探针目录
+/_att_*.txt
+/_pyver.txt
+/_tmp_orchestration_probe/

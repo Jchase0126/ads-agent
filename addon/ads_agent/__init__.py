@@ -43,10 +43,22 @@ def _resolve_plugin_dir() -> str | None:
         pass
 
     # 2. the installation-level registration file
+    #    ADS 目录**不能**在这里写死默认值：每台机器的安装位置都不一样。
+    #    优先用环境变量；没有就让 backend/adslocate.py 去探测（卸载表 + 扫描），
+    #    仍然找不到时这一步自然跳过 —— 由 setup_addon(addon) 里的
+    #    addon.root_directory 兜底，绝不因此让 ADS 启动失败。
     try:
-        hpeesof = os.environ.get("HPEESOF_DIR", r"E:\ADS\Programfile\ADS2027")
-        xml = os.path.join(hpeesof, "config", "eesof_addons.xml")
-        if os.path.exists(xml):
+        import pathbridge
+
+        adslocate = pathbridge.load_backend_module("adslocate.py", "adslocate")
+        hpeesof = (os.environ.get("HPEESOF_DIR") or "").strip()
+        xmls = []
+        if hpeesof:
+            xmls.append(os.path.join(hpeesof, "config", "eesof_addons.xml"))
+        for item in adslocate.detect_ads_dirs(scan=False):
+            xmls.append(os.path.join(item["dir"], "config", "eesof_addons.xml"))
+        xml = next((p for p in xmls if p and os.path.exists(p)), "")
+        if xml:
             text = open(xml, encoding="utf-8", errors="replace").read()
             m = re.search(
                 r'<Addon\s+Name="%s"\s+FilePath="([^"]+)"' % _ADDON_NAME, text
@@ -75,9 +87,49 @@ def _ensure_sys_path() -> str | None:
     return d
 
 
+def _shared_paths():
+    """共享路径模块（%LOCALAPPDATA%\\ADSAgent 等），拿不到返回 None。"""
+    try:
+        _ensure_sys_path()
+        import pathbridge
+
+        return pathbridge.load()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _config_path() -> str:
+    p = _shared_paths()
+    if p is not None:
+        try:
+            return p.config_path()
+        except Exception:  # noqa: BLE001
+            pass
+    # 兜底：旧布局（配置文件就在代码目录旁边）
     d = _ensure_sys_path() or ""
     return os.path.normpath(os.path.join(d, "..", "..", "config.ini"))
+
+
+def prepare_data() -> tuple[bool, str]:
+    """准备好用户数据：建目录 → 从旧布局迁移 → 首启生成干净配置。
+
+    必须在拉起后端**之前**跑：后端会往 数据目录/logs 与 config.ini 里写东西，
+    目录都没建好就启动，等于把改造前"日志跟代码混在一起"的老毛病再犯一遍。
+    幂等且在任意 ADS 会话里都安全。
+    """
+    p = _shared_paths()
+    if p is None:
+        return False, "无法加载共享路径模块 backend/paths.py"
+    try:
+        p.ensure_data_dirs()
+        report: list = []
+        p.migrate_from_legacy(report)
+        info = p.init_first_run()
+        p.touch_install_state(app_root=p.app_root())
+        tail = ("；" + "；".join(report)) if report else ""
+        return True, f"数据目录={p.data_root()}  配置={info['config']}{tail}"
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _ui_setting(key: str, default: str) -> str:
@@ -109,6 +161,10 @@ def setup_addon(addon) -> None:
         if root:
             _plugin_dir = os.path.normpath(root)
         _ensure_sys_path()
+
+        # 先把用户数据安顿好（目录 / 旧布局迁移 / 首启配置），再谈后端与面板
+        ok, detail = prepare_data()
+        print(f"[ADS Agent] 数据准备{'完成' if ok else '失败'}：{detail}")
 
         # Auto-start the backend with ADS (hidden child, reused if already up)
         import backend_launcher
@@ -228,9 +284,24 @@ def _open_panel() -> None:
 
         panel.open_panel()
     except Exception as e:  # noqa: BLE001
-        from PySide6.QtWidgets import QMessageBox
+        _show_message("ADS Agent", "无法打开对话面板", f"{type(e).__name__}: {e}", warning=True)
 
-        QMessageBox.critical(None, "ADS Agent", f"无法打开面板：\n{type(e).__name__}: {e}")
+
+def _show_message(title: str, text: str, details: str = "", warning: bool = False) -> None:
+    from PySide6.QtWidgets import QMessageBox
+    try:
+        import sys
+        import uiscale as U
+
+        loaded = sys.modules.get('panel')
+        host = getattr(loaded, '_panel', None)
+        widget = host.widget() if host is not None and hasattr(host, 'widget') else None
+        if widget is None and host is not None and hasattr(host, 'centralWidget'):
+            widget = host.centralWidget()
+        pal = widget._pal() if widget is not None else U.PALETTES['light']
+        U.message_dialog(title, text, details, warning, parent=host, pal=pal).exec()
+    except Exception:  # status reporting must survive a broken UI module
+        QMessageBox.warning(None, title, text + (f"\n{details}" if details else ""))
 
 
 def _ensure_server() -> str:
@@ -241,18 +312,13 @@ def _ensure_server() -> str:
 
 
 def _show_server_status() -> None:
-    from PySide6.QtWidgets import QMessageBox
-
     try:
         url = _ensure_server()
         import urllib.request
 
         with urllib.request.urlopen(url + "/health", timeout=3) as resp:
             body = resp.read().decode("utf-8")
-        QMessageBox.information(None, "ADS Agent 工具服务", f"运行中：{url}\n{body}")
+        _show_message("ADS Agent 工具服务", "工具服务正在运行，可以连接 ADS。", f"服务地址：{url}\n{body}")
     except Exception as e:  # noqa: BLE001
-        QMessageBox.warning(
-            None,
-            "ADS Agent 工具服务",
-            f"未运行或异常：{type(e).__name__}: {e}",
-        )
+        _show_message("ADS Agent 工具服务", "工具服务未运行或连接异常。",
+                      f"{type(e).__name__}: {e}", warning=True)

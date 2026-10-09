@@ -34,8 +34,14 @@ def auth():
     # 先注册再 exec，避免模块内部出现重复导入
     sys.modules[_MODULE_NAME] = module
     spec.loader.exec_module(module)
-    # ADS 进程里 __file__ 未必可靠，显式把项目根告诉它
+    # ADS 进程里 __file__ 未必可靠，显式把程序根告诉它（这个根同时也是
+    # 数据迁移的源目录），并同步给共享路径模块，保证两端解析出的
+    # config.ini / 日志目录一致。
     module._FORCED_ROOT = _ROOT
+    try:
+        module._paths().set_app_root(_ROOT)
+    except Exception:
+        pass
     _mod = module
     return module
 
@@ -48,6 +54,16 @@ def token() -> str:
 def check(provided: str) -> bool:
     """校验请求携带的令牌。"""
     return auth().check_token(provided)
+
+
+def app_root() -> str:
+    """代码所在目录（只读的程序文件）。"""
+    return auth().app_root()
+
+
+def data_root() -> str:
+    """用户数据根目录（日志、会话、设计任务都在它下面）。"""
+    return auth().data_root()
 
 
 def header_name() -> str:

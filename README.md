@@ -1,6 +1,42 @@
 # ADS Agent —— ADS 2027 内置 AI 助手插件
 
+[下载安装包](https://github.com/Jchase0126/ads-agent/releases) · [安装说明](docs/安装说明.md) · [版本迭代与发布](docs/版本迭代与发布.md) · [更新记录](CHANGELOG.md)
+
+源码、测试和构建脚本保存在本仓库；带版本号的安装 ZIP 在 GitHub Releases 下载。
+当前支持 Windows + ADS 2027，提供 ZIP 与 BAT 安装入口。图形 EXE/MSI 安装程序和插件内自动更新尚未实现。
+仓库当前为私有，下载需要访问权限；尚未选择开源许可证。
+
 原理图自动建图与仿真的故障复盘及操作准则见 [原理图建图与仿真经验总结](docs/原理图建图与仿真经验总结.md)。
+
+## 安装 / 升级 / 卸载（完整说明见 docs/安装说明.md）
+
+分发包是一个带版本号的 ZIP（``ADSAgent-<版本>.zip``，由 ``tools/build_release.py``
+生成）。解压后：
+
+```
+安装 ADS Agent.bat      自动识别 ADS 2027 → 注册 → 重启 ADS → 面板内配 API 即可用
+卸载 ADS Agent.bat      只移除本插件的注册与程序文件，默认保留用户数据
+环境自检.bat            解释器 / ADS 目录 / 数据与程序目录 / 令牌 / 注册 / 实例身份
+```
+
+**不需要另外安装 Python、Anaconda 或 PySide6** —— 安装与运行都优先使用
+**ADS 2027 自带的解释器**（``<ADS>\tools\python\python.exe``），PySide6 与
+``keysight.*`` 也是 ADS 自己提供的。
+
+装好后**程序文件与用户数据是分开的**（这是升级不丢配置、卸载不误删的前提）：
+
+| 类型 | 位置 | 卸载时 |
+|---|---|---|
+| 程序文件 | ``%LOCALAPPDATA%\Programs\ADSAgent``（默认） | 可选删除 |
+| 配置 / 令牌 / 会话 / 设计任务 / 日志 | ``%LOCALAPPDATA%\ADSAgent`` | **默认保留** |
+| ADS 注册记录 | ``<ADS>\config\eesof_addons.xml`` 里的一条 | 被移除 |
+
+路径解析统一在 ``backend/paths.py``（后端、面板、工具服务、启动器、鉴权、自检共用）。
+从旧版本（数据放在代码目录旁边）升级时，旧数据会被**复制**到新位置，旧文件
+**原样保留不删除**，且不会覆盖新位置已有的有效数据。
+
+仿真产物（网表与 .ds 数据集）仍然写在用户的 ADS 工作区
+``<工作区>/ads_agent_sim/`` 下 —— 那是用户自己的工作区，不属于插件数据。
 
 在 Keysight PathWave ADS 2027 内部运行的 AI Agent：聊天面板（PySide6，官方 add-on 机制）
 + 本机后端（LLM 对话循环）+ 回环工具服务（在 ADS 进程内执行操作）。
@@ -37,6 +73,144 @@
 重启 ADS 后继续上次进度。会话写入采用原子替换，上一份有效文件保存在
 `projects.json.bak`；主文件损坏时启动会从备份恢复并在状态栏提示。
 
+## 原厂模型压缩包：上传 → 按需导入 → 选型 → 仿真
+
+用户可以把原厂模型包（村田 / TDK / Infineon 等）当**附件**发进聊天面板。
+原始 ZIP 存进当前 ADS Workspace 的 `ads_agent_models/`，**上传只保存并检查包
+结构，不自动解压、不加载套件、不执行包内脚本**；真正导入由用户按需触发
+（点附件卡片上的「解压并导入」，或明确说「导入之前上传的 TDK 模型」）。
+
+### 怎么用
+
+1. **上传**：先在 ADS 主窗口中打开目标 Workspace，再点输入框旁的 📎 选
+   `.zip`，或拖入 ZIP、复制文件后按 `Ctrl+V`。输入栏会显示可移除的文件卡片，
+   可以只发附件、不打字。上传前先检查鉴权与工作区；未打开 Workspace 时会
+   直接提示，不发送 ZIP 内容。聊天项目名称与 ADS Workspace 是独立的。
+   附件保存**不依赖 LLM 服务连通**，模型 ZIP 保存到当前工作区并备份到统一 `libraries` 目录。
+   未配置时，首次确定的 `libraries` 位于 ADS Workspace 的父目录，与工作区同级，并持久化该位置；之后切换到其他路径的工作区仍使用同一目录。可通过 `[models] library_root` 或 `ADS_AGENT_LIBRARY_ROOT` 更改位置。
+2. **看识别结果**：附件卡片显示文件名、大小、所属工作区、状态与识别出的包
+   类型（Touchstone 模型包 / ADS Design Kit / 混合包 / 未识别）。点「查看模型」
+   可展开识别依据与型号索引。
+3. **按需导入**：点「解压并导入」。导入是后台任务，卡片轮询显示进度
+   （检查中 → 待导入 → 导入中 → 待验证）；导入中可以「取消导入」。
+4. **选型与验证**：直接对 Agent 说「列出 TDK 包里的电容」「用 GRM155R71C104KA88D
+   建个 2.4G 匹配网络」。Agent 会先查真实存在的库名/cell，再验证可用性，
+   然后建图、仿真、评估。
+5. **进入优化工作流**：验证通过的模型与普通元件一样参与
+   `publish_design_result` 与后续迭代优化。
+
+### 模型工具
+
+| 工具 | 能力 |
+|---|---|
+| `list_model_packages` | 列出当前工作区的模型包（只读清单，不解压） |
+| `list_shared_model_packages` | 搜索 ADS `libraries` 统一备份目录中的模型包 |
+| `search_shared_models` | 在共享 ZIP 中按具体型号、cell 或库名查询包内文件证据 |
+| `inspect_model_package` | 识别依据、候选套件根、文件统计、型号索引 |
+| `import_model_package` | 安全解压 → 建索引 → 挂接到**本工作区**（幂等） |
+| `import_shared_model_package` | 从统一备份复制到当前工作区，再安全解压并只读挂接 |
+| `list_vendor_models` | 在已挂接库（含**只读**原厂库）里检索元件 |
+| `get_vendor_model_info` | 单个元件的 model_def 参数定义与模型元数据 |
+| `validate_model_import` | 验证"真的可用" —— **就绪状态的唯一依据** |
+
+### 状态与"就绪"的含义
+
+`saved` 已保存 → `inspecting` 检查中 → `pending_import` 待导入 →
+`importing` 导入中 → `pending_verify` 待验证 → `ready` 已就绪；
+另有 `failed` / `cancelled` / `awaiting_user`。
+
+**解压结束只标到"待验证"，绝不会标"已就绪"** —— 只有
+`validate_model_import` 通过才会写 `ready`。界面上"已导入"和"模型可用"是
+两件事：挂接成功只说明库在库里了，元件能不能真正放进电路仿真要另外验证。
+
+### 包类型与支持范围
+
+| 类型 | 判定 | 处理方式 |
+|---|---|---|
+| Touchstone 文件包 | 含 `.s1p/.s2p/.sNp/.ts` | 不按 Design Kit 安装；通过 ADS 的 S 参数元件引用文件路径 |
+| ADS Design Kit | `lib.defs` + 库结构（`.oalib`/`circuit/ael`/`design_kit/` 等） | 保持原厂内部目录结构解压，按官方 API 挂接到当前工作区 |
+| 混合包 / 未知包 / 其它仿真器模型 | 其它 | 如实显示检测结果与支持范围，**不硬套** Design Kit 导入 |
+
+#### Design Kit 仿真依赖
+
+挂接 `lib.defs` 中的库只证明 ADS 能看到库和 cell，不代表模型已进入仿真网表。不同厂商的 Design Kit 可能还要求专用 Netlist Include 元件、`models.net` / 编码模型库、AEL 启动定义、Verilog-A、数据文件或 `ADSlibconfig` 路径映射。验证前要检查这些依赖，并在隔离测试电路中放入必需的 include 元件；生成网表后核对实际的 `#include`、`#uselib`、`#load` 等引用。仿真调用若需要 PDK 根目录，也必须显式传入并验证路径映射。只有 ADS 产生数据集且读到预期曲线，才算实机仿真通过。
+
+TDK v2019.10 实测中，漏放 `TDK_Netlist_Include` 会导致模型未定义；加上它后，仍需给仿真器提供可解析的 `TDK_Encoded_Lib` 映射。该要求是这套 TDK Kit 的实测结果；对其它厂商必须从其包内结构和生成网表中重新确认，不能照搬 TDK 元件名或路径。
+
+首版**只支持 ZIP**；`.tar/.rar/.7z` 明确提示暂不支持。
+
+### 资产目录
+
+```
+<工作区>/ads_agent_models/
+├── archives/<package_id>/<原始文件名>.zip   # 原始 ZIP（永不与解压内容混放）
+├── extracted/<package_id>/<原厂内部结构>   # 解压产物（保持原厂目录结构）
+├── .tmp/                                   # 解压暂存，完整检查通过才提交
+└── manifest.json（+ .bak）                  # 资产清单（原子写入 + 跨进程锁）
+```
+
+- `package_id = "pkg_" + ZIP 的 SHA-256 前 16 位` —— 稳定、不依赖文件名；
+- 同工作区**相同内容**重复上传 → 复用已有资产（`ref_count` +1），不重复占空间；
+- **同名但内容不同** → 各存各的，不静默覆盖；
+- 清单里的路径一律**相对工作区**保存，工程迁移后用 `relocate()` 重新定位，
+  `verify_references()` 核对引用是否还指向真实文件；
+- **聊天项目只保存附件引用。删除聊天项目或清空会话不会删除模型资产**
+  （资产层刻意不提供删除入口）。
+
+### 安全
+
+压缩包按"不可信输入"处理：检查真实 ZIP 格式与损坏情况；拒绝路径穿越
+（`../`）、绝对路径、盘符路径、UNC；拒绝符号链接条目；限制文件数量、
+累计解压大小与压缩比（zip bomb）；**包内脚本一律只落盘不执行**；包内
+README / 文件名 / 说明**只当数据**，不作为对模型的指令。
+
+解压走"临时目录 → 完整检查 → 提交"，失败时**保留原始 ZIP**、清理本次
+临时产物。同一工作区的导入串行化，同包重复导入幂等（不会产生重复挂接）。
+
+上传通道是**独立的二进制接口**（`POST /models/upload`），不用 Base64、
+不走 JSON：文件内容不进聊天历史、不进 LLM 请求，LLM 只拿到 `package_id`
+与元数据。真实原厂包 14~41 MB 起，JSON 接口统一限 8 MB，所以必须走单独通道。
+
+### 工作区绑定与只读约束
+
+- 目标工作区**只认 ADS 当前打开的那个**，请求里带的路径不采信 —— 否则模型
+  一句"导入到 D:\\…"就能写到工作区之外；
+- 每次 ADS 写入/操作前复核工作区，切换工程后停止依赖当前工程的操作并说明原因；
+- 原厂库以 **`LibraryMode.READ_ONLY`** 挂接，只为浏览与引用，**不给原厂库写
+  权限**；挂接限定在目标工作区，**不动全局 Favorite Design Kit 设置**；
+  修改库定义文件时用官方 API，不做字符串拼接（退路才改文件，且备份+去重+可回滚）；
+- 重复导入前会核对工作区里是否已有同名同路径库 → 幂等，不产生重复挂接；
+- 用户在 ADS 里手工 Unzip 过套件后，重新扫描能识别并验证已导入的套件，不会重复安装。
+
+### 模型选择的硬约束
+
+- LLM **必须先查真实模型**再选型，绝不编造库名、cell、参数或型号；
+- 供应商名字不足以唯一确定型号时，列出候选项让用户选；
+- **固定型号的 S 参数模型不能当连续电容/电感值修改** —— 外围连续参数优化
+  与原厂型号离散选型分别处理；
+- 模型的频率范围覆盖不到目标频段时**明确提示，不静默外推并报告达标**；
+  偏压/温度只用具有对应条件的模型，不自行推断；
+- 型号切换时核对端口定义、参数与连接方式；
+- 用户没提优化任务时，不因为导入了模型就自动开始优化。
+
+### 结果追溯与缓存失效
+
+每次仿真记录实际使用的模型包 ID、ZIP 哈希、模型文件哈希与元件定义指纹。
+**网表指纹不足以代表模型版本**：同一个 `.s2p` 路径下的文件内容被原厂换掉时，
+网表一个字都不会变，但仿真结果完全不同。因此结果复用除了比网表指纹，还要
+比**模型依赖指纹**；拿不到当前模型指纹时按保守策略重新仿真，不给过期结论。
+
+### 已知限制（未实机验证的部分）
+
+- Design Kit 的**实机挂接**（`Workspace.add_library` / `add_library_definition_file`）
+  与元件放置、基础仿真验证，需要在真实运行的 ADS 2027 里执行；相关代码依据
+  本机 ADS 2027 安装目录的 Python 包源码核对（`tools/python/packages/keysight/
+  ads/de/_core/workspace.py`），**尚未在 ADS 实机上跑通端到端**；
+- 用户亲手 Unzip 的套件"重新扫描识别"路径已实现识别逻辑，但重复安装的
+  判定同样待实机确认；
+- 面板附件交互（📎 按钮、拖入 ZIP、卡片操作、轮询、恢复）已完成实现，
+  **PySide6 界面行为待实机验证**。
+
 ## 目录结构
 
 ```
@@ -52,6 +226,8 @@ ADS Agent/
 │                            #       design_job.py 任务与状态机 /
 │                            #       design_metrics.py 确定性指标评估 /
 │                            #       design_service.py 仿真→读数→评估 编排 /
+│                            #       model_store.py 模型包资产（保存/清单/安全解压/识别/索引）/ │
+│                            #       model_tools.py 模型工具编排（工作区绑定/导入流水线）/ │
 │                            #       ads_auth.py 回环令牌（唯一来源）/ adslog.py 文件日志
 ├── tests/                   # test_auth.py 接口鉴权 / test_token_migration.py 令牌迁移 /
 │                            # test_config_write_race.py 配置并发写入 /
@@ -60,9 +236,14 @@ ADS Agent/
 │                            # test_design_metrics.py 指标计算 /
 │                            # test_design_job.py 任务状态机与编排 /
 │                            # test_project_isolation.py 会话隔离 /
-│                            # test_design_isolation.py 结果页隔离与重启恢复
+│                            # test_design_isolation.py 结果页隔离与重启恢复 /
+│                            # test_model_store.py 模型包资产（去重/识别/越界/并发/迁移）/
+│                            # test_model_http.py 模型包上传与清单 HTTP 接口 /
+│                            # test_model_ops.py + test_model_ops_flow.py ADS 侧挂接纯逻辑
 └── addon/ads_agent/         # ADS 端插件：__init__.py 菜单注册 / panel.py 面板 /
                              # toolserver.py 工具服务 / ads_ops.py 工具实现 /
+                             # model_ops.py 原厂模型挂接/只读库浏览/验证 /
+                             # model_attachments.py 附件卡片/上传 worker/拖放过滤 /
                              # result_page.py 设计结果页（自绘曲线） /
                              # authbridge.py 加载共享令牌 / uiscale.py 自适应缩放与圆角设计令牌
 ```
@@ -72,8 +253,12 @@ ADS Agent/
 
 ## 首次使用（三步）
 
-**1. 安装插件**：双击 `install_addon.bat`（会备份并修改
+**1. 安装插件**：双击 `安装 ADS Agent.bat`（会备份并修改
 `%HPEESOF_DIR%\config\eesof_addons.xml`），然后**重启 ADS 2027**。
+
+自动识别失败时显式指定：`install_addon.py --ads-dir "你的 ADS 安装目录"`；
+先看探测结果：`install_addon.py --detect`。安装器与启动器都优先用 ADS 自带
+Python，本机没有装 Python 也能装。
 
 **2. 一切自动**：ADS 启动时插件会**自动拉起后端**（隐藏进程，复用已在运行的
 实例，日志见 `logs\backend.log`）并自动打开面板。`start_backend.bat` 仅作
@@ -168,6 +353,8 @@ GND 符号的多元件按伙伴引脚中点就近挂置；竖放桥接件（隔�
 模型 + 结构测试 + fuzz 冒烟，fuzz 含三端管放大器与双支路同 host 拓扑）。
 FM_SC 共基放大器案例（含改名/连接顺序/共享地变体）在
 tests/fm_sc_case.py + tests/test_auto_layout.py 固化。
+
+接地位置遵循用户规则：GROUND 沿接地引脚实际出线方向紧靠放置，优先同轴短直连接；S2P 的 Ref 向下时就在其正下方就近接地，避免多余横折。地符号和地线须避开实例名、器件类型与参数文字，优先调整文字而非拉长地线。该规则适用于所有厂商模型。
 
 约束与行为：导线全部横平竖直；文字/导线冲突由内置模型自动避让；连接重复
 自动去重；GROUND 朝向按接入方向规范化（实测建档：挂导线底端 270° 正置、
@@ -458,8 +645,10 @@ http://127.0.0.1:8761/health
 
 | 日志 | 内容 | 位置 |
 |---|---|---|
-| 后端日志 | 每轮对话的模型/步数/耗时、每次工具调用的参数与结果、所有异常堆栈 | `logs/backend.log`（滚动保留 3 个备份） |
-| ADS 端日志 | 工具服务收到的请求、每条工具执行结果、`run_python` 内部报错 | `logs/ads_toolserver.log` |
+| 后端日志 | 每轮对话的模型/步数/耗时、每次工具调用的参数与结果、所有异常堆栈 | `%LOCALAPPDATA%\ADSAgent\logs\backend.log`（滚动保留 3 个备份） |
+| ADS 端日志 | 工具服务收到的请求、每条工具执行结果、`run_python` 内部报错 | `%LOCALAPPDATA%\ADSAgent\logs\ads_toolserver.log` |
+
+（日志位置由 `backend/paths.py` 统一决定；设 `ADS_AGENT_DATA_DIR` 可整体改到别处。）
 
 不开文件也行，后端在跑的时候直接看最近 N 行：
 
@@ -534,7 +723,47 @@ http://127.0.0.1:8760/logs?n=200
 **面板误关/想浮动成独立窗口** —— 拖动 Dock 标题栏即可浮出，拖回边缘停靠；
 关闭后从 Tools ▸ ADS Agent 菜单再打开。
 
-**卸载** —— 双击 `uninstall_addon.bat` 后重启 ADS。
+**卸载** —— 双击 `卸载 ADS Agent.bat` 后重启 ADS。默认只移除注册，用户数据保留在
+`%LOCALAPPDATA%\ADSAgent`；要连数据一起删：`install_addon.py --remove --purge-data`。
+
+**没找到 ADS / 找到多个** —— `install_addon.py --detect` 列出候选，然后用
+`--ads-dir` 指定；确认用第一个就加 `--accept-default`。
+
+**端口被占 / 提示"服务无法确认归属"** —— 见下面「实例身份」一节。
+
+## 注册为什么是写 XML，而不是用官方的 `add_user_addon`
+
+`keysight.ads.de.app.add_user_addon()` / `remove_user_addon()` 确实是官方的
+**用户级**注册接口，但它的实现是 `_pde_app.add_user_addon(...)`，而 `_pde_app`
+是**编译进 ADS 主程序**的模块 —— 只有 ADS 自己的进程里才有。实测（本机 ADS 2027）：
+
+* ADS 进程内：`import keysight.ads.de.app` 正常，`add_user_addon` 可用；
+* 用 ADS 自带解释器在外部跑同一个 import：`ImportError: cannot import name
+  'WorkspaceItemType' from '_pde_app.ui'`，`dir(_pde_app)` 里没有任何 addon 符号
+  （外部解析到的是一个只有 `.pyi` 的空壳包）。
+
+安装器必须能在"ADS 没运行"时工作，所以注册只能写成 ADS 启动时会读的
+`eesof_addons.xml`（结构化解析 + 备份 + 原子写 + 失败回滚，写入后逐条比对
+其它插件没被动过，见 `install_addon.py` 与 `tests/test_registration.py`）。
+
+官方接口则在**条件成立的地方**照用：ADS 菜单 ▸ Tools ▸ ADS Agent ▸ 注册状态…
+会走 `addon/ads_agent/registration.py` 调 `find_addon` / `add_user_addon` /
+`remove_user_addon`。
+
+## 实例身份：不以 `/health` 200 作为复用依据
+
+后端与 ADS 端工具服务的 `/health` 都会带上 `identity`
+（`install_id` / `plugin_version` / `protocol` / `app_root` / `data_root`）。
+启动器（`addon/ads_agent/backend_launcher.py`）与自检（`check_env.py`）判断
+"能不能复用"时必须同时满足三条：
+
+1. **身份** —— `service` 是本服务的名字，且 `protocol` 与本端一致；
+2. **归属** —— `identity.install_id` 是这份安装的 ID（存在 `安装状态`里）；
+3. **存活** —— 登记文件里的 pid 还活着。
+
+任一条不满足就**不连**，并给出可执行的提示（端口被谁占、是不是旧版本、
+要不要先停掉）。首版只支持单实例：同一次安装出现了两个不同端口的后端会被
+检测为"多开冲突"并写进日志。详见 `backend/instance.py`。
 
 ## 实现依据（ADS 2027 官方机制）
 

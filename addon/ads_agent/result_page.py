@@ -18,11 +18,14 @@
 from PySide6.QtCore import Qt, QRect, QSize, QPointF
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QPolygonF
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QBoxLayout,
     QComboBox,
     QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QPushButton,
     QScrollArea,
@@ -39,10 +42,10 @@ import uiscale as U
 CURVE_COLORS = ("#1a73e8", "#e8710a", "#0f9d76", "#d93025", "#7b1fa2", "#00838f")
 
 VERDICT_STYLE = {
-    "pass": ("✅ 全部指标达标", "#0f9d76"),
-    "partial": ("⚠️ 部分指标达标", "#e8710a"),
-    "fail": ("❌ 指标未达标", "#d93025"),
-    "unknown": ("⏳ 尚无可判定指标", "#8a919c"),
+    "pass": ("全部指标达标", "#16856b"),
+    "partial": ("部分指标达标", "#b47719"),
+    "fail": ("指标未达标", "#c43d4b"),
+    "unknown": ("等待指标评估", "#65758b"),
 }
 
 STAGE_STYLE = {
@@ -67,6 +70,18 @@ def _fmt(v, digits: int = 3) -> str:
     if f == int(f) and abs(f) < 1e9:
         return str(int(f))
     return f"{f:.{digits}g}"
+
+
+def _hz(value) -> str:
+    """频率数值 -> 人能一眼读懂的单位（展示用，不做任何判定）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    for scale, unit in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")):
+        if abs(v) >= scale:
+            return f"{v / scale:g}{unit}"
+    return f"{v:g}Hz"
 
 
 def _nice_ticks(lo: float, hi: float, count: int = 5) -> list:
@@ -135,12 +150,14 @@ class CurveChart(QWidget):
                 "x": xs[:n],
                 "y": ys[:n],
                 "x_unit": t.get("x_unit") or "",
+                "x_name": t.get("x_name") or "freq",
                 "y_unit": t.get("y_unit") or "",
                 "color": CURVE_COLORS[i % len(CURVE_COLORS)],
                 "source": t.get("source") or "",
                 "n_points": t.get("n_points") or n,
             })
         self._hover = None
+        self.setFixedHeight(U.px(230 + len(self._traces) * 18))
         self.update()
 
     def has_curves(self) -> bool:
@@ -148,10 +165,11 @@ class CurveChart(QWidget):
 
     # -- 几何 ---------------------------------------------------------------
     def _plot_rect(self) -> QRect:
+        top = U.px(14 + len(self._traces) * 18)
         return QRect(
-            U.px(56), U.px(14),
+            U.px(56), top,
             max(self.width() - U.px(56) - U.px(14), U.px(40)),
-            max(self.height() - U.px(14) - U.px(38), U.px(40)),
+            max(self.height() - top - U.px(38), U.px(40)),
         )
 
     def _ranges(self):
@@ -194,18 +212,18 @@ class CurveChart(QWidget):
             painter.setPen(QColor(pal["subtle"]))
             painter.setFont(U.qfont("small"))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter,
-                             "暂无曲线数据（仿真未产出数据集，或表达式读取失败）")
+                             "暂无曲线数据")
             painter.end()
             return
 
         x0, x1, y0, y1 = rng
         x_unit = self._traces[0]["x_unit"]
-        x_name = self._traces[0]["name"].split("(")[0] or "freq"
+        x_name = self._traces[0]["x_name"]
         x_label = f"{x_name}" + (f" ({x_unit})" if x_unit else "（单位未声明）")
 
         # 网格 + 刻度
         painter.setFont(U.qfont("micro"))
-        for tick in _nice_ticks(x0, x1):
+        for tick in _nice_ticks(x0, x1, max(2, rect.width() // U.px(65))):
             p = self._map(rect, rng, tick, y0)
             painter.setPen(QPen(QColor(pal["card_border"]), 1, Qt.PenStyle.DotLine))
             painter.drawLine(QPointF(p.x(), rect.top()), QPointF(p.x(), rect.bottom()))
@@ -257,9 +275,11 @@ class CurveChart(QWidget):
                 )
                 painter.setPen(QColor(pal["text"]))
                 metrics = painter.fontMetrics()
-                w = max(metrics.horizontalAdvance(ln) for ln in text.splitlines()) + U.px(12)
+                text = "\n".join(metrics.elidedText(ln, Qt.TextElideMode.ElideRight,
+                    max(1, rect.width() - U.px(16))) for ln in text.splitlines())
+                w = min(rect.width(), max(metrics.horizontalAdvance(ln) for ln in text.splitlines()) + U.px(12))
                 h = metrics.height() * len(lines) + U.px(8)
-                bx = min(p.x() + U.px(6), rect.right() - w - 2)
+                bx = max(rect.left(), min(p.x() + U.px(6), rect.right() - w - 2))
                 by = rect.top() + U.px(4)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QBrush(QColor(pal["card_bg"])))
@@ -272,19 +292,18 @@ class CurveChart(QWidget):
                 painter.drawText(QRect(int(bx) + U.px(6), int(by) + U.px(4),
                                        int(w), int(h)), text)
 
-        # 图例（右上）
+        # One legend entry per line, outside the plotting area.
         painter.setFont(U.qfont("micro"))
-        lx = rect.right() - U.px(6)
-        for t in reversed(self._traces):
+        lx = rect.left()
+        for i, t in enumerate(self._traces):
             label = f"{t['label']}" + (f" ({t['y_unit']})" if t["y_unit"] else "")
-            w = painter.fontMetrics().horizontalAdvance(label)
-            lx -= w + U.px(16)
+            label = painter.fontMetrics().elidedText(label, Qt.TextElideMode.ElideRight,
+                                                     max(1, rect.width() - U.px(18)))
+            y = U.px(8 + i * 18)
             painter.setPen(QPen(QColor(t["color"]), 2))
-            painter.drawLine(QPointF(lx, rect.top() + U.px(9)),
-                             QPointF(lx + U.px(10), rect.top() + U.px(9)))
+            painter.drawLine(QPointF(lx, y + U.px(7)), QPointF(lx + U.px(10), y + U.px(7)))
             painter.setPen(QColor(pal["subtle"]))
-            painter.drawText(QRect(int(lx) + U.px(13), rect.top() + U.px(1),
-                                   int(w) + U.px(2), U.px(16)),
+            painter.drawText(QRect(int(lx) + U.px(16), y, rect.width() - U.px(16), U.px(16)),
                              Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                              label)
 
@@ -298,7 +317,8 @@ class CurveChart(QWidget):
         painter.translate(U.px(12), rect.center().y())
         painter.rotate(-90)
         painter.drawText(QRect(-rect.height() // 2, -U.px(8), rect.height(), U.px(16)),
-                         Qt.AlignmentFlag.AlignCenter, "数值")
+                         Qt.AlignmentFlag.AlignCenter, "数值" +
+                         (f" ({self._traces[0]['y_unit']})" if self._traces[0]['y_unit'] else "（单位未声明）"))
         painter.restore()
         painter.end()
 
@@ -337,8 +357,13 @@ class PointsDialog(QDialog):
     需要完整数据时走「导出完整数据」（后端从原始 .ds 重读）。
     """
 
-    def __init__(self, job: dict, parent=None, on_export_full=None):
+    def __init__(self, job: dict, parent=None, on_export_full=None, pal=None):
         super().__init__(parent)
+        inherited = getattr(parent, '_pal', None)
+        if callable(inherited):
+            inherited = inherited()
+        self._pal = pal or inherited or U.PALETTES['light']
+        self.setStyleSheet(U.dialog_css(self._pal))
         self.setWindowTitle("曲线数据点")
         self.resize(U.px(560), U.px(460))
         traces = (job.get("artifacts") or {}).get("traces") or {}
@@ -347,6 +372,11 @@ class PointsDialog(QDialog):
         self._on_export_full = on_export_full
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(U.px(18), U.px(18), U.px(18), U.px(18))
+        lay.setSpacing(U.px(12))
+        heading = QLabel("曲线数据")
+        heading.setStyleSheet(f"font-size:{U.fs('hero')}px;font-weight:bold;")
+        lay.addWidget(heading)
         top = QHBoxLayout()
         top.addWidget(QLabel("曲线："))
         self.picker = QComboBox()
@@ -361,38 +391,66 @@ class PointsDialog(QDialog):
 
         self.source = QLabel("")
         self.source.setWordWrap(True)
-        self.source.setStyleSheet(f"color:#8a919c; font-size:{U.fs('micro')}px;")
+        self.source.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.source.setStyleSheet(f"color:{self._pal['subtle']}; font-size:{U.fs('tiny')}px;")
         lay.addWidget(self.source)
 
         self.badge = QLabel("")
         self.badge.setWordWrap(True)
-        self.badge.setStyleSheet(f"color:#b06a00; font-size:{U.fs('micro')}px;")
+        self.badge.setStyleSheet(f"color:{self._pal['accent']};background:{self._pal['accent_soft']};"
+                                f"padding:{U.px(10)}px;border-radius:{U.R('sm')}px;font-size:{U.fs('tiny')}px;")
         lay.addWidget(self.badge)
 
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["横轴", "纵轴"])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(U.px(34))
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         lay.addWidget(self.table, 1)
 
-        row = QHBoxLayout()
+        row = QGridLayout()
+        self.actions = row
         self.hint = QLabel("")
-        self.hint.setStyleSheet(f"color:#8a919c; font-size:{U.fs('micro')}px;")
-        row.addWidget(self.hint, 1)
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet(f"color:{self._pal['subtle']}; font-size:{U.fs('tiny')}px;")
+        lay.addWidget(self.hint)
+        self.action_buttons = []
         if callable(self._on_export_full):
             self.export_btn = QPushButton("导出完整数据…")
             self.export_btn.setToolTip("从原始 .ds 数据集重新读取该表达式的全部点并另存为 CSV")
             self.export_btn.clicked.connect(self._export_full)
-            row.addWidget(self.export_btn)
+            self.export_btn.setStyleSheet(U.action_css(self._pal, primary=True))
+            self.action_buttons.append(self.export_btn)
         copy = QPushButton("复制为 CSV")
         copy.setToolTip("复制的是当前表格里的点（可能是显示采样点，见上方标识）")
         copy.clicked.connect(self._copy)
-        row.addWidget(copy)
+        self.action_buttons.append(copy)
         close = QPushButton("关闭")
         close.clicked.connect(self.accept)
-        row.addWidget(close)
+        close.setDefault(True)
+        self.action_buttons.append(close)
+        for button in self.action_buttons:
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
         lay.addLayout(row)
 
         self._reload()
+        self._layout_actions()
+
+    def _layout_actions(self):
+        columns = 1 if self.width() < U.px(440) else len(self.action_buttons)
+        while self.actions.count():
+            self.actions.takeAt(0)
+        for i, button in enumerate(self.action_buttons):
+            self.actions.addWidget(button, i // columns, i % columns)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        if hasattr(self, 'actions'):
+            self._layout_actions()
 
     def _display_state(self, t: dict) -> tuple:
         """返回 (是否显示采样点, 标识文案)。"""
@@ -440,12 +498,22 @@ class PointsDialog(QDialog):
 
     def _reload(self):
         name = self.picker.currentData()
+        if name is None:
+            self.table.setRowCount(0)
+            self.badge.setText("暂无可查看的曲线数据，请先完成仿真。")
+            self.source.setText("尚无数据来源")
+            self.hint.setText("共 0 行")
+            for button in self.action_buttons[:-1]:
+                button.setEnabled(False)
+            return
         t = self._traces.get(name) or {}
         xs, ys = t.get("x") or [], t.get("y") or []
         self.table.setRowCount(len(xs))
         for i, (xv, yv) in enumerate(zip(xs, ys)):
-            self.table.setItem(i, 0, QTableWidgetItem(_fmt(xv, 6)))
-            self.table.setItem(i, 1, QTableWidgetItem(_fmt(yv, 6)))
+            for column, value in enumerate((xv, yv)):
+                item = QTableWidgetItem(_fmt(value, 6))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.table.setItem(i, column, item)
         x_unit = t.get("x_unit") or "（未声明）"
         y_unit = t.get("y_unit") or "（未声明）"
         self.table.setHorizontalHeaderLabels([f"横轴 ({x_unit})", f"纵轴 ({y_unit})"])
@@ -501,11 +569,13 @@ class ResultPageRow(QWidget):
         outer.addWidget(self.card)
 
         lay = QVBoxLayout(self.card)
-        lay.setContentsMargins(U.P("lg"), U.P("lg"), U.P("lg"), U.P("lg"))
-        lay.setSpacing(U.P("md"))
+        lay.setContentsMargins(U.px(14), U.px(14), U.px(14), U.px(14))
+        lay.setSpacing(U.px(12))
+        self._responsive_rows = []
 
         self._build_header(lay)
         self._build_design_ref(lay)
+        self._build_model_conditions(lay)
         self._build_metrics(lay)
         self._build_chart(lay)
         self._build_footer(lay)
@@ -514,6 +584,7 @@ class ResultPageRow(QWidget):
     # -- 构建 ---------------------------------------------------------------
     def _build_header(self, lay):
         row = QHBoxLayout()
+        self._responsive_rows.append(row)
         row.setSpacing(U.P("sm"))
         self.title = QLabel(self._job.get("title") or "设计结果")
         self.title.setWordWrap(True)
@@ -524,10 +595,11 @@ class ResultPageRow(QWidget):
         verdict = self._job.get("verdict") or "unknown"
         text, color = VERDICT_STYLE.get(verdict, VERDICT_STYLE["unknown"])
         self.verdict = QLabel(text)
+        self.verdict.setWordWrap(True)
         self.verdict.setStyleSheet(
             f"color:{color}; background:{self._pal['card_bg']};"
-            f"border:1px solid {color}; border-radius:{U.R('pill')}px;"
-            f"padding:{U.P('xs')}px {U.P('md')}px; font-size:{U.fs('tiny')}px;"
+            f"border:none; border-left:3px solid {color}; border-radius:{U.R('xs')}px;"
+            f"padding:{U.px(8)}px {U.px(10)}px; font-size:{U.fs('small')}px;"
         )
         row.addWidget(self.verdict, 0)
         lay.addLayout(row)
@@ -562,6 +634,7 @@ class ResultPageRow(QWidget):
     def _build_design_ref(self, lay):
         d = self._job.get("design") or {}
         row = QHBoxLayout()
+        self._responsive_rows.append(row)
         row.setSpacing(U.P("sm"))
         ref = self._job.get("design_ref") or "?"
         parts = [
@@ -570,73 +643,157 @@ class ResultPageRow(QWidget):
             f"cell：{d.get('cell') or '?'}",
             f"视图：{d.get('view') or 'schematic'}",
         ]
-        self.design_ref = QLabel(f"📐 {ref}\n" + "　".join(parts))
+        self.design_ref = QLabel(f"{ref}\n" + "\n".join(parts))
+        self.design_ref.setTextFormat(Qt.TextFormat.PlainText)
         self.design_ref.setWordWrap(True)
         self.design_ref.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.design_ref.setStyleSheet(
             f"color:{self._pal['text']}; background:{self._pal['card_bg']};"
-            f"border:1px solid {self._pal['card_border']};"
+            "border:none;"
             f"border-radius:{U.R('md')}px; padding:{U.P('sm')}px {U.P('md')}px;"
             f"font-size:{U.fs('tiny')}px;"
         )
         row.addWidget(self.design_ref, 1)
 
-        self.open_btn = QPushButton("在 ADS 中打开原理图")
+        self.open_btn = QPushButton("打开原理图")
+        self.open_btn.setToolTip("在 ADS 中打开此设计的原理图")
         self.open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.open_btn.clicked.connect(self._emit_open)
         row.addWidget(self.open_btn, 0)
         lay.addLayout(row)
 
-    def _build_metrics(self, lay):
-        metrics = self._job.get("metrics") or []
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(U.P("md"))
-        grid.setVerticalSpacing(U.P("xs"))
-        headers = ["指标", "目标", "实测", "判定", "频点"]
-        for c, h in enumerate(headers):
-            lab = QLabel(h)
-            lab.setStyleSheet(
-                f"color:{self._pal['subtle']}; font-size:{U.fs('micro')}px; font-weight:bold;"
-            )
-            grid.addWidget(lab, 0, c)
-        grid.setColumnStretch(0, 3)
-        grid.setColumnStretch(4, 2)
+    def _build_model_conditions(self, lay):
+        """模型来源与有效条件（原厂模型必须让用户看见"数据从哪来、在什么条件下有效"）。
 
+        为什么专门一块：指标表里"达标"两个字看不出背后是不是拿超出模型有效
+        频段的插值/外推曲线判的。这里把模型来源、有效频段、参考阻抗、偏压
+        写清楚，门禁没过时用警示色标出"未判达标的原因"。
+        """
+        sim = self._job.get("sim") or {}
+        deps = sim.get("model_deps") or {}
+        conditions = sim.get("model_conditions") or []
+        gate = sim.get("model_gate") or {}
+        if not deps and not conditions and not gate:
+            return
+
+        heading = QLabel("模型来源与有效条件")
+        heading.setFont(U.qfont("small", bold=True))
+        heading.setStyleSheet(f"color:{self._pal['text']};")
+        lay.addWidget(heading)
+
+        lines = []
+        state = str(deps.get("state") or "")
+        state_text = {
+            "none": "本次仿真没有引用外部模型文件",
+            "complete": f"已核对 {deps.get('n_deps', 0)} 个模型文件的内容哈希",
+            "incomplete": "模型依赖无法完整确认（按保守策略处理）",
+            "missing": "模型依赖缺失（有文件在盘上找不到）",
+        }.get(state, "")
+        if state_text:
+            lines.append((f"模型依赖：{state_text}", self._pal['subtle']))
+        for cond in conditions:
+            part = cond.get("part") or cond.get("variant") or "（未识别型号）"
+            source = cond.get("source") or "来源未知"
+            if not cond.get("available"):
+                lines.append((f"{part}（{source}）：有效条件未知 —— "
+                              f"{cond.get('reason') or '索引里没有可引用数据'}",
+                              self._pal['subtle']))
+                continue
+            bits = []
+            if cond.get("freq_start_hz") and cond.get("freq_stop_hz"):
+                bits.append("有效频段 %s–%s" % (_hz(cond["freq_start_hz"]),
+                                                _hz(cond["freq_stop_hz"])))
+            else:
+                bits.append("有效频段未知")
+            if cond.get("reference_impedance_ohm"):
+                bits.append("Z0 %gΩ" % cond["reference_impedance_ohm"])
+            if cond.get("bias"):
+                bits.append("偏压 " + ", ".join(
+                    f"{k}={v}" for k, v in dict(cond["bias"]).items()))
+            if cond.get("package_id"):
+                bits.append(f"包 {cond['package_id']}")
+            lines.append((f"{part}（{source}）：" + "，".join(bits),
+                          self._pal['subtle']))
+        if gate:
+            color = self._pal['error'] if gate.get("block") else self._pal['subtle']
+            lines.append((str(gate.get("message") or ""), color))
+
+        for text, color in lines:
+            label = QLabel(text)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setStyleSheet(
+                f"color:{color}; background:{self._pal['card_bg']};"
+                f"border:none; border-radius:{U.R('sm')}px;"
+                f"padding:{U.px(6)}px {U.P('sm')}px; font-size:{U.fs('micro')}px;")
+            lay.addWidget(label)
+
+    def _build_metrics(self, lay):
+        heading = QLabel("指标评估")
+        heading.setFont(U.qfont("small", bold=True))
+        heading.setStyleSheet(f"color:{self._pal['text']};")
+        lay.addWidget(heading)
+        self.metrics_grid = QGridLayout()
+        self.metrics_grid.setSpacing(U.px(8))
+        self.metric_cards = []
+        self._metric_columns = 0
+        metrics = self._job.get("metrics") or []
         if not metrics:
-            lab = QLabel("（没有指标定义）")
-            lab.setStyleSheet(f"color:{self._pal['subtle']}; font-size:{U.fs('tiny')}px;")
-            grid.addWidget(lab, 1, 0, 1, 5)
-        for r, m in enumerate(metrics, start=1):
+            empty = QLabel("尚未定义指标")
+            empty.setStyleSheet(f"color:{self._pal['subtle']};")
+            lay.addWidget(empty)
+        for m in metrics:
+            card = QFrame()
+            card.setObjectName("metricCard")
+            card.setStyleSheet(
+                f"QFrame#metricCard{{background:{self._pal['card_bg']};"
+                f"border:none;border-radius:{U.R('md')}px;}}")
+            inner = QVBoxLayout(card)
+            inner.setContentsMargins(U.px(12), U.px(10), U.px(12), U.px(10))
+            inner.setSpacing(U.px(6))
             passed = m.get("pass")
-            mark = "✅ 达标" if passed is True else ("❌ 未达标" if passed is False else "⚠️ 无法判定")
-            color = "#0f9d76" if passed is True else ("#d93025" if passed is False else "#8a919c")
+            mark = "达标" if passed is True else ("未达标" if passed is False else "无法判定")
+            dark = self._pal == U.PALETTES['dark']
+            color = ('#61cbb0' if dark else '#16856b') if passed is True else (self._pal['error'] if passed is False else self._pal['subtle'])
             unit = m.get("unit") or ""
-            cells = [
-                (m.get("label") or m.get("id") or "?", self._pal["text"], False),
-                (f"{_fmt(m.get('target'))} {unit}".strip(), self._pal["text"], False),
-                (f"{_fmt(m.get('actual'))} {unit}".strip(), color, True),
-                (mark, color, True),
-                (m.get("at") or "—", self._pal["subtle"], False),
+            badge = QLabel(mark)
+            badge_bg = ('#193c35' if dark else '#e8f5f0') if passed is True else (
+                ('#442832' if dark else '#fff0f1') if passed is False else self._pal['accent_soft'])
+            badge.setStyleSheet(f"color:{color};background:{badge_bg};padding:{U.px(4)}px {U.px(8)}px;"
+                               f"border-radius:{U.R('xs')}px;font-size:{U.fs('tiny')}px;")
+            lines = [
+                (m.get("label") or m.get("id") or "未命名指标", self._pal['text'], "small", True),
+                (f"{_fmt(m.get('actual'))} {unit}".strip(), self._pal['text'], "hero", True),
+                (f"目标  {_fmt(m.get('target'))} {unit}".strip(), self._pal['subtle'], "small", False),
+                (f"频点  {m.get('at') or '—'}", self._pal['subtle'], "tiny", False),
             ]
-            for c, (text, col, bold) in enumerate(cells):
-                lab = QLabel(text)
-                lab.setWordWrap(True)
-                lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                lab.setStyleSheet(
-                    f"color:{col}; font-size:{U.fs('tiny')}px;"
-                    + ("font-weight:bold;" if bold else "")
-                )
-                grid.addWidget(lab, r, c)
-            note = m.get("note") or ""
-            if note:
-                sub = QLabel("　" + note)
-                sub.setWordWrap(True)
-                sub.setStyleSheet(
-                    f"color:{self._pal['subtle']}; font-size:{U.fs('micro')}px;"
-                )
-                grid.addWidget(sub, r, 5, 1, 1)
-        grid.setColumnStretch(5, 3)
-        lay.addLayout(grid)
+            if m.get('note'):
+                lines.append((str(m['note']), self._pal['subtle'], "tiny", False))
+            for text, fg, token, bold in lines:
+                label = QLabel(text)
+                label.setTextFormat(Qt.TextFormat.PlainText)
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                label.setFont(U.qfont(token, bold=bold))
+                label.setStyleSheet(f"color:{fg};font-size:{U.fs(token)}px;" +
+                                   ("font-weight:bold;" if bold else ""))
+                inner.addWidget(label)
+            inner.addWidget(badge, 0, Qt.AlignmentFlag.AlignLeft)
+            self.metric_cards.append(card)
+        lay.addLayout(self.metrics_grid)
+        self._layout_metrics(1)
+
+    def _layout_metrics(self, columns):
+        if self._metric_columns == columns:
+            return
+        self._metric_columns = columns
+        while self.metrics_grid.count():
+            self.metrics_grid.takeAt(0)
+        for i, card in enumerate(self.metric_cards):
+            self.metrics_grid.addWidget(card, i // columns, i % columns)
+        self.metrics_grid.setColumnStretch(0, 1)
+        self.metrics_grid.setColumnStretch(1, 1 if columns == 2 else 0)
 
     def _build_chart(self, lay):
         traces = (self._job.get("artifacts") or {}).get("traces") or {}
@@ -684,26 +841,41 @@ class ResultPageRow(QWidget):
             )
             lay.addWidget(self.err)
 
-        row = QHBoxLayout()
+        row = QGridLayout()
+        self.footer_actions = row
+        self._action_layout_state = None
         row.setSpacing(U.P("sm"))
         self.points_btn = QPushButton("查看数据点")
         self.points_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.points_btn.clicked.connect(self._show_points)
-        row.addWidget(self.points_btn)
 
-        self.refresh_btn = QPushButton("重新评估（用已有数据）")
+        self.refresh_btn = QPushButton("重新评估")
         self.refresh_btn.setToolTip("不重新仿真，只重新读取 .ds 并重算指标")
         self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_btn.clicked.connect(lambda: self._emit(self._on_refresh))
-        row.addWidget(self.refresh_btn)
 
         self.resim_btn = QPushButton("重新仿真")
         self.resim_btn.setToolTip("按当前指标与设计引用重新生成网表并仿真")
         self.resim_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.resim_btn.clicked.connect(lambda: self._emit(self._on_resim))
-        row.addWidget(self.resim_btn)
-        row.addStretch(1)
         lay.addLayout(row)
+        self._layout_actions(True, U.px(330))
+
+    def _layout_actions(self, narrow, width):
+        state = (narrow, width < U.px(280))
+        if state == self._action_layout_state:
+            return
+        self._action_layout_state = state
+        while self.footer_actions.count():
+            self.footer_actions.takeAt(0)
+        if narrow:
+            columns = 1 if state[1] else 2
+            self.footer_actions.addWidget(self.points_btn, 0, 0, 1, columns)
+            self.footer_actions.addWidget(self.refresh_btn, 1, 0)
+            self.footer_actions.addWidget(self.resim_btn, 2 if columns == 1 else 1, 0 if columns == 1 else 1)
+        else:
+            for column, button in enumerate((self.points_btn, self.refresh_btn, self.resim_btn)):
+                self.footer_actions.addWidget(button, 0, column)
 
     def _apply_style(self):
         pal = self._pal
@@ -713,16 +885,13 @@ class ResultPageRow(QWidget):
             f"QLabel{{background:transparent;}}"
             + U.font_css()
         )
-        self.title.setStyleSheet(f"color:{pal['text']}; font-size:{U.fs('body')}px;")
-        btn_css = (
-            f"QPushButton{{background:{pal['card_bg']}; color:{pal['text']};"
-            f"border:1px solid {pal['card_border']}; border-radius:{U.R('md')}px;"
-            f"padding:{U.P('sm')}px {U.P('md')}px; font-size:{U.fs('tiny')}px;}}"
-            f"QPushButton:hover{{background:{pal['hover']};}}"
-            f"QPushButton:disabled{{color:{pal['subtle']};}}"
-        )
+        self.title.setStyleSheet(f"color:{pal['text']}; font-size:{U.fs('title')}px;font-weight:bold;")
         for btn in (self.open_btn, self.points_btn, self.refresh_btn, self.resim_btn):
-            btn.setStyleSheet(btn_css)
+            btn.setStyleSheet(U.action_css(pal, primary=btn is self.points_btn))
+        for label in self.card.findChildren(QLabel):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.points_btn.setEnabled(self.chart.has_curves())
 
     # -- 行为 ---------------------------------------------------------------
     def _emit(self, callback):
@@ -734,7 +903,7 @@ class ResultPageRow(QWidget):
 
     def _show_points(self):
         dlg = PointsDialog(self._job, self,
-                           on_export_full=self._on_export_full)
+                           on_export_full=self._on_export_full, pal=self._pal)
         dlg.exec()
 
     def set_busy(self, busy: bool, text: str = ""):
@@ -748,8 +917,16 @@ class ResultPageRow(QWidget):
 
     def reflow(self, avail_w: int, item):
         """按可用宽度给出真实高度（内容很长，不能写死）。"""
-        w = max(avail_w - U.P("xl") * 2, U.px(240))
+        w = max(avail_w - U.P("xl") * 2, U.px(160))
+        narrow = w < U.px(520)
+        for row in self._responsive_rows:
+            row.setDirection(QBoxLayout.Direction.TopToBottom if narrow else QBoxLayout.Direction.LeftToRight)
         self.card.setFixedWidth(w)
-        self.chart.setFixedWidth(w - U.P("lg") * 2)
-        h = self.sizeHint().height()
+        self.chart.setFixedWidth(max(U.px(100), w - U.px(28)))
+        self._layout_metrics(1 if narrow else 2)
+        self._layout_actions(narrow, w)
+        self.card.layout().activate()
+        h = self.card.layout().heightForWidth(w) + U.P('sm') * 2
+        if h < 0:
+            h = self.sizeHint().height()
         item.setSizeHint(QSize(avail_w, max(h, U.px(260))))

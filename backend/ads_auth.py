@@ -33,6 +33,7 @@ import os
 import random
 import re
 import secrets
+import sys
 import threading
 import time
 
@@ -47,12 +48,49 @@ TOKEN_BYTES = 32
 # 低于这个长度视为弱令牌（只警告，不擅自改动用户自己设的值）
 MIN_STRONG_LEN = 24
 
-# 允许把配置指到别处（测试、便携安装）。留空则用项目根目录的 config.ini。
+# 允许把配置指到别处（测试、便携安装）。留空则用 %LOCALAPPDATA%\ADSAgent\config.ini
 CONFIG_ENV = "ADS_AGENT_CONFIG"
 
 _DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 由 authbridge 在 ADS 进程内覆写（那时 __file__ 可能不可靠）
 _FORCED_ROOT: str | None = None
+
+# 路径统一走 backend/paths.py —— **不要**在这里另算一遍，否则两端会读到
+# 不同的配置文件（表现就是"随机 401"）。本进程里 backend/ 不在 sys.path 上，
+# 所以按文件位置加载同一个 paths.py（同进程只有一份实例）。
+_PATHS = None
+
+
+def _paths():
+    global _PATHS
+    if _PATHS is None:
+        import importlib.util
+
+        mod = sys.modules.get("ads_agent_shared_paths")
+        if mod is None:
+            try:
+                import paths as _plain  # type: ignore
+
+                if hasattr(_plain, "config_path"):
+                    mod = _plain
+            except Exception:
+                mod = None
+        if mod is None:
+            target = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paths.py")
+            spec = importlib.util.spec_from_file_location("ads_agent_shared_paths", target)
+            if spec is None or spec.loader is None:     # pragma: no cover
+                raise ImportError(f"无法加载共享路径模块: {target}")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["ads_agent_shared_paths"] = mod
+            spec.loader.exec_module(mod)
+        _PATHS = mod
+    try:
+        # ADS 进程里会把 _FORCED_ROOT 写进来（见 authbridge），同步给 paths
+        if _FORCED_ROOT:
+            _PATHS.set_app_root(_FORCED_ROOT)
+    except Exception:
+        pass
+    return _PATHS
 
 # 锁文件：与 config.ini 同目录，名字带上"配置"而不只是"令牌"——
 # 它保护的是整个文件的读-改-写。
@@ -89,15 +127,28 @@ _stats = {"acquired": 0, "fallback": 0}
 # 路径
 # ---------------------------------------------------------------------------
 
+def app_root() -> str:
+    """代码所在目录（只读的程序文件）—— 见 backend/paths.py 的双根说明。"""
+    return _paths().app_root()
+
+
+def data_root() -> str:
+    """用户数据根目录（配置、令牌、日志、会话、设计任务）。"""
+    return _paths().data_root()
+
+
 def project_root() -> str:
-    return _FORCED_ROOT or _DEFAULT_ROOT
+    """兼容旧名。**语义已变为"数据根目录"** —— 以前几个项目数据（design_jobs）
+    跟代码放在一起，现在它们在 %LOCALAPPDATA%\\ADSAgent 下。
+    """
+    return data_root()
 
 
 def config_path() -> str:
     override = (os.environ.get(CONFIG_ENV) or "").strip()
     if override:
         return override
-    return os.path.join(project_root(), "config.ini")
+    return _paths().config_path()
 
 
 def _lock_path() -> str:

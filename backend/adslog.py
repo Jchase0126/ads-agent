@@ -18,9 +18,13 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOG_DIR = os.path.join(_ROOT, "logs")
-LOG_FILE = os.path.join(LOG_DIR, "backend.log")
+# 统一走 backend/paths.py：日志属于**用户数据**，写到 %LOCALAPPDATA%\ADSAgent\logs，
+# 而不是代码目录旁边（程序文件可能只读，也不该被运行时产物污染）。
+import paths
+
+# 模块级常量：测试会在 import server 之前把它们改写到临时目录（见 tests/test_auth.py）
+LOG_DIR = paths.logs_dir()
+LOG_FILE = paths.log_path("backend")
 
 MAX_BYTES = 2_000_000   # 单文件 2MB
 BACKUP_COUNT = 3        # 保留 backend.log.1~3

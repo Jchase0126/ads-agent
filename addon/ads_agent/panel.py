@@ -1,8 +1,7 @@
 """ADS Agent chat panel — docked into the ADS main window as a side panel.
 
-Provider settings modeled after mainstream AI-client UIs:
-  API 密钥 (👁 显隐 + 获取密钥链接 + 检测) / API 地址 / 模型区块 (⟳同步模型
-  + 搜索 + 勾选即用的模型清单)。
+Provider settings: saved-model sidebar and add/edit form, with independent model
+connections, API model discovery, and a pinned save-and-apply action.
 Chat UI: bubble conversation with light/dark theme, centered welcome state
 with suggestion chips, rounded input box with ↑ send button, Enter-to-send.
 
@@ -18,12 +17,13 @@ paints widgets.
 import configparser
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.request
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject, QRect, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject, QRect, QSize, QPoint
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -40,7 +40,10 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QPlainTextEdit,
+    QScrollArea,
+    QStackedWidget,
     QPushButton,
     QSizePolicy,
     QToolButton,
@@ -53,6 +56,8 @@ import project_store
 from mdplain import to_plain
 
 from result_page import ResultPageRow
+import model_attachments as MA
+from model_attachments import AttachmentRow
 
 # 后端在本机回环上，请求必须**绕过 HTTP 代理**：企业网络常设 HTTP_PROXY，
 # urllib 会连 127.0.0.1 的请求也发给代理，于是面板报"后端未启动"（其实是通的）。
@@ -80,52 +85,38 @@ SUGGESTIONS = [
 ]
 
 # 配色：在原来的浅/深主题上补齐了"圆润风"需要的面板底色、悬浮色、滚动条色
-PALETTES = {
-    "light": {
-        "panel_bg": "#eef1f5",      # 面板底色（卡片浮在其上，圆角更明显）
-        "chat_bg": "#ffffff",
-        "text": "#1f2328",
-        "subtle": "#8a919c",
-        # 用户气泡：渐变蓝 + 同色描边；AI 气泡：白底 + 浅灰描边（更干净）
-        "user_bubble": "#2f7cf6", "user_bubble_to": "#1a5fd0",
-        "user_bubble_border": "#1a5fd0", "user_text": "#ffffff",
-        "ai_bubble": "#ffffff", "ai_bubble_border": "#dfe4ea", "ai_text": "#1f2328",
-        "card_bg": "#f6f8fa", "card_border": "#e3e6ea",
-        "accent": "#1a73e8", "accent_hover": "#1667d6", "accent_soft": "#e8f0fe",
-        "avatar_user": "#2f7cf6", "avatar_user_to": "#1a5fd0", "avatar_user_ring": "#bcd6fb",
-        "avatar_ai": "#0f9d76", "avatar_ai_ring": "#a7dcc9",
-        "input_bg": "#ffffff", "input_border": "#d9dee3",
-        "chip_bg": "#eef3fb", "chip_text": "#1a5fb4", "chip_hover": "#dce8fb",
-        "hover": "#e9edf2", "scroll": "#c4cad1",
-        "error": "#c01c28",
-        "stop_bg": "#c01c28", "stop_bg_hover": "#a3161f",
-    },
-    "dark": {
-        "panel_bg": "#17181b",
-        "chat_bg": "#1e1f22",
-        "text": "#e8eaed",
-        "subtle": "#9aa0a6",
-        "user_bubble": "#4a7dff", "user_bubble_to": "#2f56c8",
-        "user_bubble_border": "#2f56c8", "user_text": "#ffffff",
-        "ai_bubble": "#26282c", "ai_bubble_border": "#3f434a", "ai_text": "#e8eaed",
-        "card_bg": "#26282c", "card_border": "#3a3d42",
-        "accent": "#5b8bff", "accent_hover": "#7ba3ff", "accent_soft": "#26304a",
-        "avatar_user": "#4a7dff", "avatar_user_to": "#2f56c8", "avatar_user_ring": "#5c6ea8",
-        "avatar_ai": "#0f9d76", "avatar_ai_ring": "#3f7f6d",
-        "input_bg": "#26282c", "input_border": "#3a3d42",
-        "chip_bg": "#2c3a55", "chip_text": "#a9c4ff", "chip_hover": "#35456a",
-        "hover": "#31343a", "scroll": "#4a4d52",
-        "error": "#ff7b72",
-        "stop_bg": "#e0524a", "stop_bg_hover": "#c9463e",
-    },
-}
+PALETTES = U.PALETTES
 
 # 气泡最大宽度占可视宽度的比例（窄面板也能占满、宽面板不至于拉太长）
 _BUBBLE_RATIO = 0.78
 # AI 气泡的宽度比例：上限跟随面板宽度。固定像素上限（旧值 720px）在宽
 # 面板里会把长回复压在半幅以内、右侧留一大条空白；用户气泡仍保持紧凑。
-_BUBBLE_AI_RATIO = 0.85
+_BUBBLE_AI_RATIO = 0.94
 _BUBBLE_MIN, _BUBBLE_MAX = 200, 720
+
+
+class ZipAwareInput(QPlainTextEdit):
+    """把剪贴板中的本地文件交给附件处理，避免把 file:// 路径贴进正文。"""
+
+    def __init__(self, on_files, parent=None):
+        super().__init__(parent)
+        self._on_files = on_files
+
+    def insertFromMimeData(self, source):  # noqa: N802 — Qt virtual method
+        paths, has_files = MA.local_paths(source)
+        if not has_files and source is not None and source.hasText():
+            # 某些 Windows 剪贴板只暴露 text/uri-list；只把整段都是本地
+            # file URL 的内容识别为文件，普通文本与网页链接仍按原样粘贴。
+            from PySide6.QtCore import QUrl
+            lines = [line.strip() for line in source.text().splitlines() if line.strip()]
+            urls = [QUrl(line) for line in lines]
+            if urls and all(url.isLocalFile() for url in urls):
+                paths = [url.toLocalFile() for url in urls if url.toLocalFile()]
+                has_files = bool(paths)
+        if has_files:
+            self._on_files(paths)
+            return
+        super().insertFromMimeData(source)
 
 
 def _draw_icon(name: str, color: str, size: int = 16):
@@ -141,6 +132,8 @@ def _draw_icon(name: str, color: str, size: int = 16):
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    # All paths use a 16x16 design grid, including larger brand/send icons.
+    p.scale(size / 16.0, size / 16.0)
     pen = QPen(QColor(color))
     pen.setWidthF(1.5)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -189,12 +182,102 @@ def _draw_icon(name: str, color: str, size: int = 16):
         p.setBrush(QColor(color))
         p.drawRoundedRect(QRectF(3.6, 3.6, 8.8, 8.8), 1.6, 1.6)
     elif name == "send":         # 向上箭头
-        line(8.0, 13.2, 8.0, 3.2)
+        line(8.0, 13.0, 8.0, 3.0)
         head = QPainterPath()
         head.moveTo(3.6, 7.4)
         head.lineTo(8.0, 3.0)
         head.lineTo(12.4, 7.4)
         p.drawPath(head)
+    elif name == "chevron_up":
+        line(4, 10, 8, 6)
+        line(8, 6, 12, 10)
+    elif name == "close":
+        line(4, 4, 12, 12)
+        line(12, 4, 4, 12)
+    elif name == "menu":
+        for y in (4, 8, 12):
+            line(3, y, 13, y)
+    elif name == "settings":
+        p.drawEllipse(QPointF(8, 8), 4, 4)
+        p.drawEllipse(QPointF(8, 8), 1.5, 1.5)
+        for x1, y1, x2, y2 in ((8, 1, 8, 3), (8, 13, 8, 15),
+                               (1, 8, 3, 8), (13, 8, 15, 8),
+                               (3, 3, 4.5, 4.5), (11.5, 11.5, 13, 13),
+                               (3, 13, 4.5, 11.5), (11.5, 4.5, 13, 3)):
+            line(x1, y1, x2, y2)
+    elif name == "sliders":
+        for y, x in ((4, 6), (8, 10), (12, 5)):
+            line(2, y, x - 1.5, y)
+            line(x + 1.5, y, 14, y)
+            p.drawEllipse(QPointF(x, y), 1.5, 1.5)
+    elif name == "brand":
+        # A compact symmetric A beneath two RF broadcast arcs.
+        p.drawArc(QRectF(1.5, 1.5, 13, 13), 30 * 16, 120 * 16)
+        p.drawArc(QRectF(4, 4, 8, 8), 30 * 16, 120 * 16)
+        line(4.5, 13, 8, 6.5)
+        line(8, 6.5, 11.5, 13)
+        line(6, 10.2, 10, 10.2)
+    elif name == "moon":
+        path = QPainterPath()
+        path.moveTo(10, 2)
+        path.cubicTo(1, 1, 1, 14, 10, 14)
+        path.cubicTo(13, 14, 15, 11, 14, 9)
+        path.cubicTo(8, 11, 5, 5, 10, 2)
+        p.drawPath(path)
+    elif name == "eye":
+        path = QPainterPath()
+        path.moveTo(1, 8)
+        path.quadTo(8, 0, 15, 8)
+        path.quadTo(8, 16, 1, 8)
+        p.drawPath(path)
+        p.drawEllipse(QPointF(8, 8), 2, 2)
+    elif name == "plus":
+        line(8, 3, 8, 13)
+        line(3, 8, 13, 8)
+    elif name == "signal":
+        wave = QPainterPath()
+        wave.moveTo(1, 8)
+        for x, y in ((4, 8), (6, 3), (8.5, 13), (11, 5), (13, 8), (15, 8)):
+            wave.lineTo(x, y)
+        p.drawPath(wave)
+    elif name == "chevron":
+        line(5, 6, 8, 9)
+        line(8, 9, 11, 6)
+    elif name == "back":
+        line(3, 8, 13, 8)
+        line(3, 8, 7, 4)
+        line(3, 8, 7, 12)
+    elif name == "collapse":
+        for x in (3, 8):
+            line(x, 4, x + 4, 8)
+            line(x + 4, 8, x, 12)
+    elif name == "sun":
+        p.drawEllipse(QPointF(8, 8), 3, 3)
+        for x1, y1, x2, y2 in ((8, 1, 8, 2.5), (8, 13.5, 8, 15),
+                              (1, 8, 2.5, 8), (13.5, 8, 15, 8),
+                              (3, 3, 4, 4), (12, 12, 13, 13),
+                              (3, 13, 4, 12), (12, 4, 13, 3)):
+            line(x1, y1, x2, y2)
+    elif name == "chart":
+        line(3, 2, 3, 13)
+        line(3, 13, 14, 13)
+        line(4, 10, 7, 6)
+        line(7, 6, 10, 9)
+        line(10, 9, 14, 3)
+    elif name == "refresh":
+        p.drawArc(QRectF(3, 3, 10, 10), 40 * 16, 285 * 16)
+        line(13, 2, 13, 6)
+        line(9, 6, 13, 6)
+    elif name == "folder":
+        path = QPainterPath()
+        path.moveTo(2, 4)
+        path.lineTo(6, 4)
+        path.lineTo(7.5, 6)
+        path.lineTo(14, 6)
+        path.lineTo(14, 13)
+        path.lineTo(2, 13)
+        path.closeSubpath()
+        p.drawPath(path)
     elif name == "code":         # </>（允许执行 Python）
         left = QPainterPath()
         left.moveTo(5.8, 4.6)
@@ -206,6 +289,21 @@ def _draw_icon(name: str, color: str, size: int = 16):
         right.lineTo(13.6, 8.0)
         right.lineTo(10.2, 11.4)
         p.drawPath(right)
+    elif name == "document":    # 文件卡片中的文档
+        p.drawRoundedRect(QRectF(3.5, 1.5, 9, 13), 1.5, 1.5)
+        line(6, 6, 10, 6)
+        line(6, 9, 10, 9)
+        line(6, 12, 9, 12)
+    elif name == "attach":       # 回形针（附件：添加模型压缩包）
+        # 回形针用两条弧 + 一段斜杆，比文字符号 📎 在各字体下都一致
+        body = QPainterPath()
+        body.moveTo(6.2, 9.4)
+        body.lineTo(10.6, 5.0)
+        body.cubicTo(12.6, 3.0, 11.0, 1.4, 9.4, 3.0)
+        body.lineTo(4.4, 8.0)
+        body.cubicTo(2.4, 10.0, 4.0, 12.2, 6.0, 10.2)
+        body.lineTo(10.4, 5.8)
+        p.drawPath(body)
     p.end()
     return QIcon(pm)
 
@@ -227,60 +325,23 @@ def _scrollbar_css(pal: dict) -> str:
 
 
 def _button_css(pal: dict, kind: str = "primary") -> str:
-    """圆润按钮：primary 实心胶囊 / soft 浅底胶囊 / ghost 透明方圆角。"""
-    pad_v, pad_h = U.P("sm"), U.P("lg")
-    radius = U.R("pill") if kind != "ghost" else U.R("md")
-    if kind == "primary":
-        return (
-            f"QPushButton{{background:{pal['accent']}; color:#ffffff; border:none;"
-            f" border-radius:{radius}px; padding:{pad_v}px {pad_h}px;"
-            f" font-size:{U.fs('small')}px;}}"
-            f"QPushButton:hover{{background:{pal['accent_hover']};}}"
-            f"QPushButton:pressed{{background:{pal['accent_hover']};}}"
-            f"QPushButton:disabled{{background:{pal['card_border']}; color:{pal['subtle']};}}"
-        )
-    if kind == "soft":
-        return (
-            f"QPushButton{{background:{pal['chip_bg']}; color:{pal['chip_text']};"
-            f" border:none; border-radius:{radius}px; padding:{pad_v}px {pad_h}px;"
-            f" font-size:{U.fs('small')}px;}}"
-            f"QPushButton:hover{{background:{pal['chip_hover']};}}"
-            f"QPushButton:disabled{{color:{pal['subtle']};}}"
-        )
+    if kind in ('primary', 'soft'):
+        return U.action_css(pal, primary=kind == 'primary')
     return (
-        f"QPushButton{{background:transparent; color:{pal['text']}; border:none;"
-        f" border-radius:{radius}px; padding:{pad_v}px {pad_h}px;"
-        f" font-size:{U.fs('small')}px;}}"
-        f"QPushButton:hover{{background:{pal['hover']};}}"
+        f"QPushButton{{background:transparent;color:{pal['subtle']};border:1px solid transparent;"
+        f"border-radius:{U.R('sm')}px;padding:{U.px(6)}px {U.px(8)}px;"
+        f"font-size:{U.fs('small')}px;{U.font_css()}}}"
+        f"QPushButton:hover{{background:{pal['hover']};color:{pal['text']};}}"
+        f"QPushButton:focus{{border-color:{pal['accent']};}}"
     )
 
 
 def _combo_css(pal: dict, radius_token: str = "md") -> str:
-    """圆角下拉框（带聚焦描边 + 圆角弹出列表）。"""
-    r = U.R(radius_token)
-    return (
-        f"QComboBox{{background:{pal['input_bg']}; color:{pal['text']};"
-        f" border:1px solid {pal['input_border']}; border-radius:{r}px;"
-        f" padding:{U.P('sm')}px {U.P('md')}px; font-size:{U.fs('small')}px;"
-        f"{U.font_css()}}}"
-        f"QComboBox:focus{{border:1px solid {pal['accent']};}}"
-        f"QComboBox::drop-down{{border:none; width:{U.px(18)}px;}}"
-        f"QComboBox QAbstractItemView{{background:{pal['input_bg']}; color:{pal['text']};"
-        f" border:1px solid {pal['card_border']}; border-radius:{r}px;"
-        f" padding:{U.P('xs')}px;"
-        f" selection-background-color:{pal['accent']}; selection-color:#ffffff;}}"
-    )
+    return U.field_css(pal, combo=True)
 
 
 def _lineedit_css(pal: dict, radius_token: str = "md") -> str:
-    """圆角单行输入框（带聚焦描边）。"""
-    return (
-        f"QLineEdit{{background:{pal['input_bg']}; color:{pal['text']};"
-        f" border:1px solid {pal['input_border']}; border-radius:{U.R(radius_token)}px;"
-        f" padding:{U.P('sm')}px {U.P('md')}px; font-size:{U.fs('small')}px;"
-        f"{U.font_css()}}}"
-        f"QLineEdit:focus{{border:1px solid {pal['accent']};}}"
-    )
+    return U.field_css(pal)
 
 
 def _setting(section, key, default):
@@ -314,6 +375,14 @@ def _auth_header() -> dict:
         return {authbridge.header_name(): authbridge.token()}
     except Exception:  # noqa: BLE001 — 令牌取不到也要把请求发出去，由后端拒绝
         return {}
+
+
+def _safe_size(path: str) -> int:
+    """读本地文件大小；读不到就返回 0（卡片会显示"大小未知"，不假装有）。"""
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
 
 
 def _unauthorized_hint() -> str:
@@ -448,6 +517,15 @@ class ConfigWorker(QThread):
                 self.result.emit(json.loads(resp.read().decode("utf-8")))
         except urllib.error.HTTPError as e:
             if e.code == 404:
+                if self._path == '/config/model':
+                    try:
+                        detail = json.loads(e.read().decode('utf-8'))
+                    except (ValueError, UnicodeError):
+                        detail = {}
+                    if detail.get('error') == '模型配置不存在':
+                        self.result.emit({'error': '此模型没有保存的连接参数，请重新添加。',
+                                          'profile_missing': True})
+                        return
                 self.result.emit(
                     {"error": "后端版本过旧（缺少该接口），请关闭后端窗口后重新运行 start_backend.bat",
                      "backend_down": True}
@@ -616,7 +694,7 @@ def _soft_break_text(text: str, font, content_w: int) -> str:
 
 
 class BubbleRow(QWidget):
-    """One conversation row: circular avatar + rounded bubble (or full-width card).
+    """A restrained message row with a small vector assistant mark.
 
     宽度自适应：气泡最大宽度 = min(可视宽 * 比例, 可视宽 - 头像占位)；
     AI 气泡比例 _BUBBLE_AI_RATIO 随面板宽度伸缩，用户气泡另有 _BUBBLE_MAX
@@ -637,23 +715,16 @@ class BubbleRow(QWidget):
         row.setContentsMargins(U.P("xl"), U.P("sm"), U.P("xl"), U.P("sm"))
         row.setSpacing(U.P("md"))
 
-        self._avatar_size = U.px(30)
-        self._gutter = self._avatar_size + U.P("md") * 2 + U.P("xl") * 2
+        self._avatar_size = U.px(26)
+        self._gutter = (0 if kind == 'user' else self._avatar_size + U.P('md')) + U.P('xl') * 2
 
         if kind == "user":
-            self.label = self._make_label(text, pal["user_bubble"], pal["user_text"],
-                                          corner="br", border=pal["user_bubble_border"],
-                                          gradient_to=pal["user_bubble_to"])
+            self.label = self._make_label(text, pal["user_bubble"], pal["user_text"])
             row.addStretch(1)
             row.addWidget(self.label)
-            row.addWidget(self._make_avatar("我", pal["avatar_user"],
-                                            ring=pal["avatar_user_ring"],
-                                            gradient_to=pal["avatar_user_to"]))
         elif kind == "assistant":
-            row.addWidget(self._make_avatar("AI", pal["avatar_ai"],
-                                            ring=pal["avatar_ai_ring"]))
-            self.label = self._make_label(text, pal["ai_bubble"], pal["ai_text"],
-                                          corner="bl", border=pal["ai_bubble_border"])
+            row.addWidget(self._make_assistant_mark(pal), 0, Qt.AlignmentFlag.AlignTop)
+            self.label = self._make_label(text, pal["ai_bubble"], pal["ai_text"])
             row.addWidget(self.label)
             row.addStretch(1)
         elif kind == "stat":
@@ -682,7 +753,7 @@ class BubbleRow(QWidget):
             row.addWidget(self.label, 1)
         # 纯文本格式：工具调用的 JSON、含 < > 的代码都按字面显示，也避免被当成富文本
         self.label.setTextFormat(Qt.TextFormat.PlainText)
-        self.label.setFont(U.qfont("body" if kind not in ("tool", "stat") else "tiny"))
+        self.label.setFont(U.qfont("body" if kind in ("user", "assistant") else "tiny"))
 
     def set_text(self, text: str):
         """流式输出时就地更新气泡文本（只改文本，重排交给 reflow）。"""
@@ -691,43 +762,28 @@ class BubbleRow(QWidget):
         self._text = text
         self.label.setText(text)
 
-    def _make_avatar(self, text: str, color: str, ring: str,
-                     gradient_to: str | None = None) -> QLabel:
+    def _make_assistant_mark(self, pal: dict) -> QLabel:
         size = self._avatar_size
-        avatar = QLabel(text)
+        avatar = QLabel()
         avatar.setFixedSize(size, size)
         avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         avatar.setFont(U.qfont("tiny", bold=True))
-        # 圆形头像 + 浅色描边环，用户侧用渐变增加层次
-        if gradient_to:
-            bg = (f"qlineargradient(x1:0, y1:0, x2:1, y2:1,"
-                  f" stop:0 {color}, stop:1 {gradient_to})")
-        else:
-            bg = color
+        avatar.setPixmap(_draw_icon('brand', pal['accent'], U.px(18)).pixmap(U.px(18), U.px(18)))
         avatar.setStyleSheet(
-            f"background:{bg}; color:white; border-radius:{size // 2}px;"
-            f" border:2px solid {ring};"
-            f" font-size:{U.fs('tiny')}px; font-weight:bold;{U.font_css()}"
+            f"background:{pal['accent_soft']};border:none;border-radius:{U.R('sm')}px;"
         )
         return avatar
 
     @staticmethod
-    def _make_label(text: str, bg: str, fg: str, corner: str = "br",
-                    border: str | None = None, gradient_to: str | None = None) -> QLabel:
+    def _make_label(text: str, bg: str, fg: str) -> QLabel:
         label = QLabel(text)
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        # 圆润气泡：整体大圆角，靠自己那一侧的角收小一点，形成方向感
-        r, r_tail = U.R("lg"), U.R("xs")
-        tail = f"border-bottom-{'right' if corner == 'br' else 'left'}-radius:{r_tail}px;"
-        if gradient_to:
-            bg = (f"qlineargradient(x1:0, y1:0, x2:1, y2:1,"
-                  f" stop:0 {bg}, stop:1 {gradient_to})")
-        border_css = f"border:1px solid {border};" if border else "border:none;"
+        r = U.R("md")
         label.setStyleSheet(
-            f"background:{bg}; color:{fg}; {border_css}"
-            f" border-radius:{r}px; {tail}"
+            f"background:{bg}; color:{fg}; border:none;"
+            f" border-radius:{r}px;"
             f"padding:{U.P('md')}px {U.P('xl')}px; font-size:{U.fs('body')}px;"
             f"{U.font_css()}"
         )
@@ -746,8 +802,8 @@ class BubbleRow(QWidget):
             # 先按比例取，再保证既不超出「可视宽 - 头像占位」也不小于可读下限。
             # AI 气泡上限跟随面板宽度（固定像素上限在宽面板里会浪费半幅），
             # 用户气泡保持紧凑的固定上限；两种短回复都按内容收缩。
-            lo = U.px(_BUBBLE_MIN)
-            room = max(avail_w - self._gutter, lo)
+            room = max(avail_w - self._gutter, U.px(60))
+            lo = min(U.px(_BUBBLE_MIN), room)
             if self.kind == "assistant":
                 inner = max(lo, min(int(avail_w * _BUBBLE_AI_RATIO), room))
             else:
@@ -809,9 +865,9 @@ class ActivityRow(QWidget):
         self.toggle.setChecked(bool(entry.get("expanded")))
         self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.toggle.setStyleSheet(
-            f"QToolButton{{text-align:left; color:{pal['subtle']}; background:{pal['card_bg']};"
-            f"border:1px solid {pal['card_border']}; border-radius:{U.R('md')}px;"
-            f"padding:{U.P('sm')}px {U.P('lg')}px; font-size:{U.fs('tiny')}px;}}"
+            f"QToolButton{{text-align:left; color:{pal['subtle']}; background:transparent;"
+            f"border:none; border-radius:{U.R('sm')}px;"
+            f"padding:{U.px(8)}px {U.px(10)}px; font-size:{U.fs('small')}px;}}"
             f"QToolButton:hover{{background:{pal['hover']};}}" + U.font_css()
         )
         outer.addWidget(self.toggle)
@@ -829,7 +885,7 @@ class ActivityRow(QWidget):
         # 规则 —— 混用会让 Qt 整表解析失败并全部回退（实测踩坑）
         self.details.setStyleSheet(
             f"QPlainTextEdit{{color:{pal['text']}; background:{pal['card_bg']};"
-            f"border:1px solid {pal['card_border']}; border-radius:{U.R('md')}px;"
+            f"border:none; border-left:2px solid {pal['card_border']}; border-radius:{U.R('xs')}px;"
             f"padding:{U.P('sm')}px;{U.font_css()}}}"
             # 滚动条规则写在自身样式表里，优先级盖过从 chat 继承的窄条样式
             f"QScrollBar:vertical{{background:transparent; width:{w}px;"
@@ -868,7 +924,9 @@ class ActivityRow(QWidget):
         if n_tools:
             bits.append(f"{n_tools} 次工具")
         arrow = "⌄" if self.toggle.isChecked() else "›"
-        self.toggle.setText("✧  思考 · " + " · ".join(bits) + f"  {arrow}")
+        self._summary_text = "思考 · " + " · ".join(bits) + f"  {arrow}"
+        self.toggle.setText(self._summary_text)
+        self.toggle.setToolTip(self._summary_text + " · 点击展开或收起")
         # setPlainText 重建文档会把内部滚动条归零 —— 流式思考每 ~120ms
         # 刷一次，用户向上翻看时会被反复弹回顶部（2026-09-29 用户反馈
         # "往下滑会回弹"）。先记录阅读位置，重设后恢复；本就在底部则
@@ -900,6 +958,8 @@ class ActivityRow(QWidget):
     def reflow(self, avail_w: int, item: QListWidgetItem):
         width = max(avail_w - U.P("xl") * 2, U.px(120))
         self.toggle.setFixedWidth(width)
+        self.toggle.setText(self.toggle.fontMetrics().elidedText(
+            self._summary_text, Qt.TextElideMode.ElideRight, max(1, width - U.px(24))))
         self.details.setFixedWidth(width)
         height = self.toggle.sizeHint().height() + U.P("xs") * 2
         if self.toggle.isChecked():
@@ -958,6 +1018,39 @@ class ChipButton(QPushButton):
         return QSize(U.px(60), s.height())
 
 
+class StatusSource(QLabel):
+    changed = Signal()
+
+    def setText(self, text):
+        super().setText(text)
+        self.changed.emit()
+
+
+class ElidedStatusLabel(QLabel):
+    def setText(self, text):
+        self._full_text = text
+        super().setText(self.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, self.width()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setText(getattr(self, '_full_text', ''))
+
+
+class FeedbackLabel(QLabel):
+    """Keep empty request feedback out of the form's layout."""
+    def __init__(self, text='', parent=None):
+        super().__init__(text, parent)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.setVisible(bool(text))
+
+    def setText(self, text):  # noqa: N802
+        super().setText(text)
+        self.setVisible(bool(text))
+
+    def clear(self):
+        self.setText('')
+
+
 class WelcomeRow(QWidget):
     """Centered empty state: logo + greeting + clickable suggestion chips.
 
@@ -974,14 +1067,18 @@ class WelcomeRow(QWidget):
         col.setSpacing(U.P("md"))
         col.addStretch(1)
 
-        self.logo = QLabel("📡")
+        self.logo = QLabel()
+        mark_color = pal['panel_bg'] if pal == PALETTES['dark'] else '#ffffff'
+        self.logo.setPixmap(_draw_icon('brand', mark_color, U.px(32)).pixmap(U.px(32), U.px(32)))
+        self.logo.setFixedSize(U.px(52), U.px(52))
         self.logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.logo.setStyleSheet(
-            f"font-size:{U.fs('logo')}px; background:transparent; color:{pal['text']};"
+            f"background:{pal['accent']};border-radius:{U.R('lg')}px;"
         )
-        col.addWidget(self.logo)
+        col.addWidget(self.logo, 0, Qt.AlignmentFlag.AlignHCenter)
+        col.addSpacing(U.px(10))
 
-        self.greet = QLabel("今天想聊什么？")
+        self.greet = QLabel("开始你的射频设计")
         self.greet.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.greet.setFont(U.qfont("hero", bold=True))
         self.greet.setStyleSheet(
@@ -990,7 +1087,7 @@ class WelcomeRow(QWidget):
         )
         col.addWidget(self.greet)
 
-        self.sub = QLabel("从下面的建议开始，或直接输入 RF / ADS 设计问题")
+        self.sub = QLabel("读取设计、分析仿真，或一起优化电路。")
         self.sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sub.setWordWrap(True)
         self.sub.setStyleSheet(
@@ -1005,18 +1102,22 @@ class WelcomeRow(QWidget):
         self.grid = QGridLayout()
         self.grid.setSpacing(U.P("md"))
         self._chips: list = []
-        for tip in SUGGESTIONS:
-            chip = ChipButton(tip)
+        for index, tip in enumerate(SUGGESTIONS):
+            chip = ChipButton(('查看工作区设计', '读取设计变量', '仿真 S 参数', '调整偏置并对比')[index])
             chip.setCursor(Qt.CursorShape.PointingHandCursor)
             chip.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             chip.setStyleSheet(
                 f"QPushButton{{background:{pal['chip_bg']}; color:{pal['chip_text']};"
-                f"border:none; border-radius:{U.R('pill')}px;"
-                f"padding:{U.P('md')}px {U.P('xl')}px; font-size:{U.fs('small')}px;"
+                f"border:1px solid {pal['card_border']}; border-radius:{U.R('sm')}px;"
+                f"text-align:left; padding:{U.px(12)}px {U.px(14)}px; font-size:{U.fs('small')}px;"
                 f"{U.font_css()}}}"
                 f"QPushButton:hover{{background:{pal['chip_hover']};}}"
+                f"QPushButton:focus{{border-color:{pal['accent']};}}"
             )
+            chip.setIcon(_draw_icon(('folder', 'code', 'chart', 'settings')[index], pal['accent']))
+            chip.setIconSize(QSize(U.px(18), U.px(18)))
             chip.clicked.connect(lambda _, t=tip: on_suggest(t))
+            chip.setToolTip(tip)
             self._chips.append(chip)
         col.addLayout(self.grid)
         col.addStretch(2)
@@ -1039,7 +1140,7 @@ class WelcomeRow(QWidget):
     def reflow(self, avail_w: int, item: QListWidgetItem):
         # 卡片最小舒适宽度 -> 列数；窄面板自动降为 1 列
         usable = max(avail_w - U.P("xl") * 2, U.px(120))
-        min_chip = U.px(140)
+        min_chip = U.px(200)
         columns = max(1, min(len(self._chips), usable // max(min_chip, 1)))
         self._layout_chips(columns)
         item.setSizeHint(QSize(avail_w, max(self.sizeHint().height(), U.px(240))))
@@ -1049,10 +1150,43 @@ class WelcomeRow(QWidget):
 # panel widget
 # ---------------------------------------------------------------------------
 
+class ProviderSwitch(QCheckBox):
+    """Keyboard-accessible supplier switch with a generous hit target."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(U.px(48), U.px(30))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.colors = {}
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QColor
+        from PySide6.QtCore import QRectF
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = self.colors
+        track = QRectF(U.px(4), U.px(5), U.px(40), U.px(20))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#32b54a' if self.isChecked() else pal.get('input_border', '#8793a5')))
+        painter.drawRoundedRect(track, U.px(10), U.px(10))
+        painter.setBrush(QColor('#ffffff'))
+        painter.drawEllipse(QRectF(U.px(26) if self.isChecked() else U.px(6), U.px(7), U.px(16), U.px(16)))
+        if self.hasFocus():
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QColor(pal.get('accent', '#2563eb')))
+            painter.drawRoundedRect(QRectF(1, 1, self.width()-2, self.height()-2), U.px(12), U.px(12))
+        painter.end()
+
+
 class AgentPanelWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("agentPanelRoot")
+        # Paint our theme even when embedded in a differently themed ADS host.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMinimumWidth(U.px(330))
         self.history: list = []  # [{role, content}] visible messages
         self.entries: list = []  # [{kind, text}] rendered conversation
@@ -1063,8 +1197,9 @@ class AgentPanelWidget(QWidget):
         self._loading_models = False
         self._reviving = False
         self._revive_bridge = None
-        self._revive_retry = None
+        self._revive_retries: list = []
         self._side_wanted = True      # 用户是否想看到侧栏（窄面板会临时隐藏）
+        self._compact_projects = False
         # 会话隔离：本轮对话固定的项目名（异步事件据此回写），
         # 以及因为项目被删而丢弃的事件计数
         self._turn_project: str | None = None
@@ -1094,12 +1229,30 @@ class AgentPanelWidget(QWidget):
         self._sim_timeout = 900       # 来自后端 /config，用于给设计接口留足超时
         # 设计结果页：job_id -> job 字典（内存缓存；磁盘上还有 design_jobs/<id>.json）
         self._jobs: dict = {}
+        self._deleted_project = None
+        # 模型压缩包附件：上传/导入的 worker 句柄、导入轮询定时器、
+        # 以及"已上传但还没发给 LLM"的附件（用户可以只发附件不打字）
+        self._attach_workers: list = []
+        self._attach_poll = QTimer(self)
+        self._attach_poll.setInterval(MA.POLL_INTERVAL_MS)
+        self._attach_poll.timeout.connect(self._on_attach_poll_tick)
+        self._attach_poll_ticks: dict = {}     # package_id -> 已轮询次数
+        self._attach_op: dict = {}             # package_id -> 后端 op_id（取消用）
+        self._attach_inflight: set = set()     # package_id -> 已有清单请求在途
+        # 待发送附件**按聊天项目分开存**：A 项目刚上传的附件不能因为在 B 项目里
+        # 按了发送就被带进 B 的对话。project -> [{package_id, meta}]
+        self._pending_attachments: dict = {}
+        # 输入框上方的 ZIP 预览卡片。记录只保存在运行内存中，与待发送附件一样
+        # 按聊天项目隔离；会话历史中的正式附件卡片仍由 entries 管理。
+        self._composer_attachments: list = []
+        self._composer_removed_entries: set = set()
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(U.P("lg"), U.P("lg"), U.P("lg"), U.P("lg"))
+        layout.setContentsMargins(U.px(12), U.px(12), U.px(12), U.px(12))
         layout.setSpacing(U.P("md"))
 
-        # ---- top row: sidebar toggle + brand + theme + collapse + settings ---
+        # ---- top row: projects + brand + theme + settings ----
+        # The host title bar owns closing; avoid duplicate hide controls here.
         top = QHBoxLayout()
         top.setSpacing(U.P("sm"))
         self.side_btn = self._round_tool_button("☰", "展开/收起项目列表", checkable=True)
@@ -1108,7 +1261,7 @@ class AgentPanelWidget(QWidget):
         top.addWidget(self.side_btn)
 
         # 品牌区：圆角 Logo + 标题/副标题（比单行文字有辨识度）
-        self.logo = QLabel("📡")
+        self.logo = QLabel()
         self.logo.setFixedSize(U.px(34), U.px(34))
         self.logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top.addWidget(self.logo)
@@ -1125,34 +1278,49 @@ class AgentPanelWidget(QWidget):
         self.theme_btn = self._round_tool_button("🌙", "深色 / 浅色主题")
         self.theme_btn.clicked.connect(self._toggle_theme)
         top.addWidget(self.theme_btn)
-        self.collapse_btn = self._round_tool_button(
-            "»", "折叠面板到侧栏边缘（点击边缘的竖排标签可重新展开）"
-        )
-        self.collapse_btn.clicked.connect(self._on_collapse)
-        top.addWidget(self.collapse_btn)
-        self.settings_btn = QPushButton("⚙ 设置")
-        self.settings_btn.setCheckable(True)
-        self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_btn = self._round_tool_button("", "模型与连接设置", checkable=True)
+        self.settings_btn.setFixedWidth(U.px(92))
+        self.settings_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.settings_btn.toggled.connect(self._toggle_settings)
         top.addWidget(self.settings_btn)
         layout.addLayout(top)
+
+        self.pages = QStackedWidget()
+        layout.addWidget(self.pages, 1)
+        self.conversation_page = QWidget()
+        conversation_layout = QVBoxLayout(self.conversation_page)
+        conversation_layout.setContentsMargins(0, 0, 0, 0)
+        self.pages.addWidget(self.conversation_page)
 
         # ---- body: project sidebar + chat column ---------------------------
         body = QHBoxLayout()
         body.setSpacing(U.P("md"))
         self._build_sidebar(body)
 
-        right = QVBoxLayout()
+        self.chat_column = QWidget()
+        self.chat_column.setObjectName('agentChatColumn')
+        self.chat_column.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        right = QVBoxLayout(self.chat_column)
+        right.setContentsMargins(U.px(8), U.px(8), U.px(8), U.px(8))
         right.setSpacing(U.P("md"))
+        context = QHBoxLayout()
+        self.active_project_label = QLabel()
+        self.active_project_label.setFont(U.qfont('small', bold=True))
+        self.active_project_label.setMinimumWidth(0)
+        self.chat_heading = self.active_project_label
+        context.addWidget(self.active_project_label)
+        context.addStretch(1)
+        right.addLayout(context)
 
         self.chat = ChatList()
         right.addWidget(self.chat, 1)
 
-        self.status = QLabel("就绪")
-        self.status.setWordWrap(True)
-        right.addWidget(self.status)
-        body.addLayout(right, 1)
-        layout.addLayout(body, 1)
+        self.status = StatusSource("就绪", self)
+        self.status.hide()
+        self._run_error = ""
+        self._run_error_project = None
+        body.addWidget(self.chat_column, 1)
+        conversation_layout.addLayout(body, 1)
 
         # ---- rounded input box -----------------------------------------------
         self.input_frame = QFrame()
@@ -1161,8 +1329,39 @@ class AgentPanelWidget(QWidget):
         frame_layout.setContentsMargins(U.P("lg"), U.P("md"), U.P("md"), U.P("md"))
         frame_layout.setSpacing(U.P("xs"))
 
-        self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("输入消息，按 Enter 发送，Shift+Enter 换行")
+        self.run_status_row = QWidget()
+        status_layout = QHBoxLayout(self.run_status_row)
+        status_layout.setContentsMargins(U.px(3), 0, U.px(3), U.px(4))
+        status_layout.setSpacing(U.px(8))
+        self.run_status_dot = QLabel("●")
+        self.run_status_dot.setFixedWidth(U.px(12))
+        status_layout.addWidget(self.run_status_dot)
+        self.run_status_text = ElidedStatusLabel()
+        self.run_status_text.setMinimumWidth(0)
+        self.run_status_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        status_layout.addWidget(self.run_status_text, 1)
+        self.run_stop_btn = QToolButton()
+        self.run_stop_btn.setText("停止")
+        self.run_stop_btn.setAccessibleName("停止本轮回复")
+        self.run_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.run_stop_btn.setFixedWidth(U.px(48))
+        self.run_stop_btn.clicked.connect(self._stop_run)
+        status_layout.addWidget(self.run_stop_btn)
+        frame_layout.addWidget(self.run_status_row)
+        self.run_status_row.hide()
+        self.status.changed.connect(self._sync_composer_status)
+
+        self.composer_attachment_strip = QWidget()
+        self.composer_attachment_strip.setVisible(False)
+        self.composer_attachment_layout = QHBoxLayout(self.composer_attachment_strip)
+        self.composer_attachment_layout.setContentsMargins(0, 0, 0, 0)
+        self.composer_attachment_layout.setSpacing(U.P("sm"))
+        self.composer_attachment_layout.addStretch(1)
+        frame_layout.addWidget(self.composer_attachment_strip)
+
+        self.input = ZipAwareInput(self._on_pasted_files)
+        self.input.setPlaceholderText("描述你的设计问题…")
+        self.input.setToolTip("Enter 发送 · Shift+Enter 换行")
         self.input.setFrameShape(QPlainTextEdit.Shape.NoFrame)
         self.input.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1179,7 +1378,20 @@ class AgentPanelWidget(QWidget):
         self.allow_python.setChecked(True)
         self.allow_python.setToolTip("允许 Agent 在 ADS 进程内执行任意 Python（run_python 工具）")
         foot.addWidget(self.allow_python)
+        self.model_shortcut = QPushButton()
+        self.model_shortcut.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.model_shortcut.setToolTip("当前模型 · 点击切换")
+        self.model_shortcut.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.model_shortcut.clicked.connect(self._show_input_model_menu)
+        foot.addWidget(self.model_shortcut)
         foot.addStretch(1)
+        # 📎 附件按钮放在剪贴板组**之前**：附件是这一排里唯一的"输入"类动作
+        # （其余都是编辑/视图），排在前面符合"输入 → 附加 → 发送"的视觉顺序。
+        self.attach_btn = self._round_tool_button(
+            "", "添加模型压缩包附件（只支持 .zip，也可以直接把 ZIP 拖进来）")
+        self.attach_btn.setProperty("icon_name", "attach")
+        self.attach_btn.clicked.connect(self._on_pick_zip)
+        foot.addWidget(self.attach_btn)
         # 图标走 _draw_icon 矢量绘制（见 _apply_theme 的上色），不再用文字符号
         self.cut_btn = self._round_tool_button("", "剪切选中文字 (Ctrl+X)")
         self.copy_btn = self._round_tool_button("", "复制选中文字 (Ctrl+C)")
@@ -1199,7 +1411,9 @@ class AgentPanelWidget(QWidget):
         self.clear_btn.setProperty("icon_name", "trash")
         self.clear_btn.clicked.connect(self._on_clear)
         foot.addWidget(self.clear_btn)
-        self.send = QPushButton("")
+        self.send = QToolButton()
+        self.send.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.send.setAccessibleName("发送消息")
         self.send.setCursor(Qt.CursorShape.PointingHandCursor)
         self.send.setToolTip("发送 (Enter)")
         self.send.clicked.connect(self._on_send_clicked)
@@ -1208,7 +1422,8 @@ class AgentPanelWidget(QWidget):
         right.addWidget(self.input_frame)
 
         # settings box is created after theme so widgets exist for styling
-        self._build_settings(layout)
+        self._build_settings()
+        self._install_drop_targets()
         self._apply_theme()
         self._load_projects_state()
         self.reload_config()
@@ -1221,12 +1436,13 @@ class AgentPanelWidget(QWidget):
         btn = QToolButton()
         btn.setText(text)
         btn.setToolTip(tip)
+        btn.setAccessibleName(tip)
         btn.setCheckable(checkable)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setAutoRaise(True)
         btn.setFixedSize(U.px(32), U.px(32))
         btn.setStyleSheet(
-            f"QToolButton{{border:none; border-radius:{U.R('sm')}px;"
+            f"QToolButton{{border:1px solid transparent; border-radius:{U.R('sm')}px;"
             f" font-size:{U.fs('body')}px; padding:0;}}" + U.font_css()
         )
         return btn
@@ -1243,40 +1459,55 @@ class AgentPanelWidget(QWidget):
         # 侧栏宽度：占面板 30%，夹在 [130, 220]（按缩放换算）
         side_w = max(U.px(130), min(int(w * 0.30), U.px(220))) if w else U.px(170)
         self.sidebar.setMaximumWidth(side_w)
-        self.sidebar.setMinimumWidth(U.px(110) if w > U.px(430) else 0)
+        self.sidebar.setMinimumWidth(U.px(110) if w > U.px(560) else 0)
         # 面板太窄时临时收起侧栏，变宽后恢复用户的选择
-        too_narrow = 0 < w < U.px(430)
-        self.sidebar.setVisible(self._side_wanted and not too_narrow)
-        self.side_btn.setChecked(self._side_wanted and not too_narrow)
+        too_narrow = 0 < w < U.px(560)
+        self.sidebar.setVisible(self._compact_projects if too_narrow else self._side_wanted)
+        self.side_btn.blockSignals(True)
+        self.side_btn.setChecked(self.sidebar.isVisible())
+        self.side_btn.blockSignals(False)
+        self.chat_column.setVisible(not (too_narrow and self._compact_projects))
+        if too_narrow and self._compact_projects:
+            self.sidebar.setMaximumWidth(w)
+        self.logo.setVisible(w >= U.px(440))
+        self.subtitle.setVisible(w >= U.px(400))
         # 模型清单高度跟着面板高度走，小面板也不会把设置区顶出屏幕
-        self.model_list.setMaximumHeight(max(U.px(110), min(int(self.height() * 0.30), U.px(220))))
+        rows = max(2, min(self.model_list.count(), 3))
+        self.model_list.setFixedHeight(U.px(rows * 36 + 12))
+        settings_compact = 0 < w < U.px(440)
+        self.settings_columns.setDirection(
+            QHBoxLayout.Direction.TopToBottom if settings_compact
+            else QHBoxLayout.Direction.LeftToRight)
+        if settings_compact:
+            self.models_sidebar.setMinimumWidth(0)
+            self.models_sidebar.setMaximumWidth(16777215)
+        else:
+            self.models_sidebar.setFixedWidth(max(U.px(160), min(U.px(250), int(w * .30))))
+        self.models_sidebar.setMaximumHeight(U.px(152) if settings_compact else 16777215)
+        self.model_sidebar_actions.setDirection(QHBoxLayout.Direction.TopToBottom)
+        self.saved_model_list.setVisible(not settings_compact)
+        self.saved_model_search.setVisible(not settings_compact)
+        self.saved_model_selector.setVisible(settings_compact)
+        self._reflow_saved_model_rows()
+        self._update_project_context()
         # 窄面板：剪掉/复制/粘贴按钮让位（快捷键 Ctrl+X/C/V 仍可用）
-        compact = 0 < w < U.px(520)
+        compact = 0 < w < U.px(760)
         for button in (self.cut_btn, self.copy_btn, self.paste_btn):
             button.setVisible(not compact)
-        self.allow_python.setVisible(w > U.px(470))
+        self.allow_python.setVisible(w > U.px(640))
+        self._update_model_shortcut()
         # 宽度变了 -> 输入框的内容换行数也变了，重新贴合高度
         self._fit_input_height()
 
     def _on_side_toggle(self, on: bool):
-        self._side_wanted = on
+        if self.width() < U.px(560):
+            self._compact_projects = on
+        else:
+            self._side_wanted = on
         self.sidebar.setVisible(on)
-
-    def _on_collapse(self):
-        """折叠整个面板：dock 模式下隐藏后右缘会留下竖排展开标签。
-
-        注意不能用 self.window()：QDockWidget 停靠后会失去 Window 标志，
-        window() 返回的是**整个 ADS 主窗口**（点了会把 ADS 藏起来）。
-        沿 parent 链找到 QDockWidget（或独立窗口模式的 QMainWindow）再隐藏。
-        """
-        host = self.parentWidget()
-        while host is not None and not isinstance(host, (QDockWidget, QMainWindow)):
-            host = host.parentWidget()
-        if host is None:
-            return
-        host.hide()
-        # 保险：visibilityChanged 在某些宿主/时序下不一定发，显式同步一次
-        _sync_handle(False)
+        if self.width() < U.px(560):
+            self.sidebar.setMaximumWidth(self.width())
+            self.chat_column.setVisible(not on)
 
     def _fit_input_height(self):
         """输入框随内容长高（1 行矮、多行高，上限 160px）。
@@ -1299,9 +1530,29 @@ class AgentPanelWidget(QWidget):
         self.input.setFixedHeight(max(U.px(44), min(h, U.px(160))))
 
     # ---------------------------------------------------------------- projects
-    _PROJECTS_FILE = os.path.normpath(os.path.join(_HERE, "..", "..", "projects.json"))
-    # 设计任务（结果页）由后端写入这里；面板只读，重启后据此重新渲染结果页
-    _DESIGN_JOBS = os.path.normpath(os.path.join(_HERE, "..", "..", "design_jobs"))
+    # 会话与设计任务属于**用户数据**，位置由 backend/paths.py 统一决定
+    # （%LOCALAPPDATA%\ADSAgent），不在代码目录旁边 —— 见 pathbridge 说明。
+    # 用 property 而不是类常量：数据根目录可能被环境变量改掉，首次访问时
+    # 才建目录也更稳。
+    @property
+    def _PROJECTS_FILE(self) -> str:
+        return self._user_path("projects.json")
+
+    @property
+    def _DESIGN_JOBS(self) -> str:
+        return self._user_path("design_jobs")
+
+    @staticmethod
+    def _user_path(name: str) -> str:
+        try:
+            import pathbridge
+
+            p = pathbridge.load()
+            p.ensure_data_dirs()
+            root = p.data_root()
+        except Exception:  # noqa: BLE001 — 拿不到就退回旧布局，不报错、不阻塞
+            root = os.path.normpath(os.path.join(_HERE, "..", ".."))
+        return os.path.normpath(os.path.join(root, name))
 
     def _build_sidebar(self, body: QHBoxLayout):
         """Collapsible project list (参考 AI 客户端的项目列表) — 圆角卡片。"""
@@ -1314,26 +1565,22 @@ class AgentPanelWidget(QWidget):
 
         head = QHBoxLayout()
         head.setSpacing(U.P("xs"))
-        self.proj_collapse_btn = self._round_tool_button("▾", "折叠/展开项目列表",
-                                                         checkable=True)
-        self.proj_collapse_btn.setChecked(True)
-        self.proj_collapse_btn.setFixedSize(U.px(26), U.px(26))
-        self.proj_collapse_btn.toggled.connect(
-            lambda on: self.project_list.setVisible(on)
-        )
-        head.addWidget(self.proj_collapse_btn)
-        self.proj_label = QLabel("<b>项目</b>")
+        self.proj_label = QLabel("项目")
         head.addWidget(self.proj_label)
         head.addStretch(1)
-        self.proj_add_btn = self._round_tool_button("＋", "新建项目（保存独立对话）")
-        self.proj_add_btn.setFixedSize(U.px(26), U.px(26))
-        self.proj_add_btn.clicked.connect(self._new_project)
-        head.addWidget(self.proj_add_btn)
-        self.proj_del_btn = self._round_tool_button("🗑", "删除选中的项目")
-        self.proj_del_btn.setFixedSize(U.px(26), U.px(26))
-        self.proj_del_btn.clicked.connect(self._delete_project)
-        head.addWidget(self.proj_del_btn)
+        self.proj_count = QLabel("1")
+        head.addWidget(self.proj_count)
         sv.addLayout(head)
+        self.proj_add_btn = QPushButton("新建项目")
+        self.proj_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.proj_add_btn.setToolTip("创建项目，保存独立对话")
+        self.proj_add_btn.clicked.connect(self._new_project)
+        sv.addWidget(self.proj_add_btn)
+        self.project_search = QLineEdit()
+        self.project_search.setPlaceholderText("搜索项目")
+        self.project_search.setClearButtonEnabled(True)
+        self.project_search.textChanged.connect(self._filter_projects)
+        sv.addWidget(self.project_search)
 
         self.project_list = QListWidget()
         self.project_list.setToolTip("每个项目保存独立的对话记录，点击切换")
@@ -1343,7 +1590,16 @@ class AgentPanelWidget(QWidget):
         )
         self.project_list.setSpacing(U.P("xs"))
         self.project_list.itemSelectionChanged.connect(self._on_project_selected)
+        self.project_list.itemClicked.connect(lambda *_: self._on_project_selected())
         sv.addWidget(self.project_list, 1)
+        self.proj_del_btn = QPushButton("删除选中项目")
+        self.proj_del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.proj_del_btn.clicked.connect(self._delete_project)
+        sv.addWidget(self.proj_del_btn)
+        self.project_undo = QPushButton("撤销删除")
+        self.project_undo.clicked.connect(self._undo_delete_project)
+        self.project_undo.setVisible(False)
+        sv.addWidget(self.project_undo)
 
         body.addWidget(self.sidebar)
 
@@ -1366,6 +1622,8 @@ class AgentPanelWidget(QWidget):
 
         self._apply_project(active, create=True)
         self._refresh_project_list()
+        # 重启后核对附件引用：聊天项目只存引用，资产是否还在要问后端
+        QTimer.singleShot(0, self._verify_attachments)
 
     def _save_projects(self):
         try:
@@ -1395,6 +1653,8 @@ class AgentPanelWidget(QWidget):
         # live references：往这两个 list 里 append 就等于写进了 projects_data
         self.entries = proj.setdefault("entries", [])
         self.history = proj.setdefault("history", [])
+        self._update_project_context()
+        self._refresh_composer_attachments()
         self._rebuild()
         return True
 
@@ -1418,7 +1678,9 @@ class AgentPanelWidget(QWidget):
         try:
             self.project_list.clear()
             for name in self.projects_data["projects"]:
-                item = QListWidgetItem(f"📁 {name}")
+                item = QListWidgetItem(name)
+                item.setIcon(_draw_icon('folder', self._pal()['subtle']))
+                item.setToolTip(name)
                 item.setData(Qt.ItemDataRole.UserRole, name)
                 item.setFont(bold if name == active else plain)
                 self.project_list.addItem(item)
@@ -1426,6 +1688,23 @@ class AgentPanelWidget(QWidget):
                     item.setSelected(True)
         finally:
             self.project_list.blockSignals(False)
+        self.proj_count.setText(str(len(self.projects_data['projects'])))
+        self.proj_del_btn.setEnabled(len(self.projects_data['projects']) > 1)
+        self._filter_projects(self.project_search.text())
+
+    def _filter_projects(self, text):
+        for i in range(self.project_list.count()):
+            item = self.project_list.item(i)
+            item.setHidden(text.casefold() not in item.text().casefold())
+        self.proj_del_btn.setEnabled(
+            len(getattr(self, 'projects_data', {}).get('projects', {})) > 1 and
+            any(not item.isHidden() for item in self.project_list.selectedItems()))
+
+    def _update_project_context(self):
+        name = getattr(self, 'projects_data', {}).get('active', '默认')
+        self.active_project_label.setText(self.active_project_label.fontMetrics().elidedText(
+            name, Qt.TextElideMode.ElideRight, max(U.px(60), self.chat_column.width() - U.px(24))))
+        self.active_project_label.setToolTip(f"当前项目：{name}")
 
     def _on_project_selected(self):
         items = self.project_list.selectedItems()
@@ -1437,22 +1716,41 @@ class AgentPanelWidget(QWidget):
             self._refresh_project_list()
             self._save_projects()
             self.status.setText(f"已切换到项目：{name}")
+            # 切到别的项目也要核对该项目里的附件引用（重启恢复的路径一样）
+            QTimer.singleShot(0, self._verify_attachments)
+        if self.width() < U.px(560) and self._compact_projects:
+            self.side_btn.setChecked(False)
 
-    def _new_project(self):
+    def _project_name_dialog(self):
         from PySide6.QtWidgets import QInputDialog
 
-        name, ok = QInputDialog.getText(self, "新建项目", "项目名称：")
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("新建项目")
+        dialog.setLabelText("项目名称\n每个项目保存独立的对话与设计结果。")
+        dialog.setOkButtonText("创建项目")
+        dialog.setCancelButtonText("取消")
+        dialog.setStyleSheet(U.dialog_css(self._pal()))
+        dialog.resize(U.px(360), U.px(180))
+        return dialog
+
+    def _new_project(self):
+        dialog = self._project_name_dialog()
+        ok = dialog.exec()
+        name = dialog.textValue()
         name = (name or "").strip()
         if not ok or not name:
             return
         if name in self.projects_data["projects"]:
             self.cfg_hint.setText(f"项目 {name} 已存在")
+            self.status.setText(f"项目 {name} 已存在，请换一个名称")
             return
         self.projects_data["projects"][name] = {"entries": [], "history": []}
         self._apply_project(name, create=True)
         self._refresh_project_list()
         self._save_projects()
         self.status.setText(f"已创建项目：{name}")
+        if self._compact_projects:
+            self.side_btn.setChecked(False)
 
     def _delete_project(self):
         items = self.project_list.selectedItems()
@@ -1462,8 +1760,14 @@ class AgentPanelWidget(QWidget):
         projects = self.projects_data["projects"]
         if len(projects) <= 1:
             self.cfg_hint.setText("至少保留一个项目")
+            self.status.setText("至少保留一个项目")
             return
+        self._deleted_project = (name, projects[name])
         del projects[name]
+        # 该项目还没发出去的附件一并丢掉：留着的话，下一次发送会把**已删除
+        # 项目**的附件带进当前对话。
+        self._pending_attachments.pop(name, None)
+        self.project_undo.setVisible(True)
         pending = self._turn_project == name
         if self.projects_data.get("active") == name:
             self._apply_project(next(iter(projects)))
@@ -1475,6 +1779,21 @@ class AgentPanelWidget(QWidget):
             f"已删除项目：{name}"
             + ("（该项目仍有回复在途，其内容将被丢弃）" if pending else "")
         )
+
+    def _undo_delete_project(self):
+        if self._deleted_project is None:
+            return
+        name, project = self._deleted_project
+        if name in self.projects_data['projects']:
+            self.status.setText(f"已有同名项目：{name}，无法恢复")
+            return
+        self.projects_data['projects'][name] = project
+        self._deleted_project = None
+        self.project_undo.setVisible(False)
+        self._apply_project(name)
+        self._refresh_project_list()
+        self._save_projects()
+        self.status.setText(f"已恢复项目：{name}")
 
     # ---------------------------------------------------------------- theme
     def _pal(self) -> dict:
@@ -1491,25 +1810,30 @@ class AgentPanelWidget(QWidget):
 
         # 面板整体：卡片浮在柔和底色上，圆角更立体
         self.setStyleSheet(
-            f"QWidget#agentPanelRoot{{background:{pal['panel_bg']};{base}}}"
+            f"QWidget#agentPanelRoot{{background:{pal['header_bg']};{base}}}"
             f"QLabel{{color:{pal['text']};{base}}}"
             f"QToolButton{{color:{pal['subtle']};{base}}}"
             f"QToolButton:hover{{background:{pal['hover']};}}"
+            f"QToolButton:focus{{border:1px solid {pal['accent']};}}"
             f"QToolButton:checked{{background:{pal['accent_soft']}; color:{pal['accent']};}}"
+        )
+        self.chat_column.setStyleSheet(
+            f"QWidget#agentChatColumn{{background:{pal['chat_bg']};"
+            f"border:1px solid {pal['card_border']};border-radius:{U.R('lg')}px;}}"
         )
 
         # 会话区：圆角白卡 + 圆角细滚动条
         self.chat.setStyleSheet(
             f"QListWidget{{background:{pal['chat_bg']}; border:none;"
-            f" border-radius:{U.R('lg')}px; padding:{U.P('sm')}px 0;}}"
+            f" border-radius:0; padding:{U.px(8)}px 0;}}"
             f"QListWidget::item{{border:none;}}"
             + _scrollbar_css(pal)
         )
 
         # 侧栏：圆角卡片，内部控件透明
         self.sidebar.setStyleSheet(
-            f"QWidget#sidebarCard{{background:{pal['card_bg']};"
-            f" border-radius:{U.R('lg')}px;}}"
+            f"QWidget#sidebarCard{{background:{pal['sidebar_bg']};"
+            f"border:1px solid {pal['card_border']}; border-radius:{U.R('lg')}px;}}"
             f"QListWidget{{background:transparent; border:none; color:{pal['text']};"
             f" font-size:{U.fs('small')}px; padding:{U.P('xs')}px;}}"
             f"QListWidget::item{{border-radius:{U.R('sm')}px; padding:{U.P('sm')}px;}}"
@@ -1522,10 +1846,20 @@ class AgentPanelWidget(QWidget):
             f"color:{pal['text']}; font-size:{U.fs('small')}px;"
             "background:transparent;" + base
         )
+        self.proj_count.setStyleSheet(f"color:{pal['subtle']};font-size:{U.fs('tiny')}px;")
+        self.proj_add_btn.setStyleSheet(U.action_css(pal, primary=True))
+        self.proj_add_btn.setIcon(_draw_icon('plus', '#ffffff'))
+        self.proj_del_btn.setStyleSheet(_button_css(pal, 'ghost'))
+        self.project_undo.setStyleSheet(_button_css(pal, 'soft'))
+        self.project_search.setStyleSheet(_lineedit_css(pal))
+        for hint in (self.active_project_label,):
+            hint.setStyleSheet(f"color:{pal['text']};font-size:{U.fs('small')}px;font-weight:bold;background:transparent;")
         self.logo.setStyleSheet(
-            f"background:{pal['accent_soft']};"
-            f" border-radius:{U.px(17)}px; font-size:{U.fs('hero')}px;" + base
+            f"background:{pal['accent']};"
+            f" border-radius:{U.R('md')}px;" + base
         )
+        mark_color = pal['panel_bg'] if self.dark else '#ffffff'
+        self.logo.setPixmap(_draw_icon('brand', mark_color, U.px(22)).pixmap(U.px(22), U.px(22)))
         self.title.setStyleSheet(
             f"color:{pal['text']}; font-size:{U.fs('title')}px; font-weight:bold;"
             "background:transparent;" + base
@@ -1539,6 +1873,7 @@ class AgentPanelWidget(QWidget):
         self.input_frame.setStyleSheet(
             f"QFrame#inputFrame{{background:{pal['input_bg']};"
             f"border:1px solid {pal['input_border']}; border-radius:{U.R('xl')}px;}}"
+            f"QFrame#inputFrame[focused=\"true\"]{{border-color:{pal['accent']};}}"
         )
         # 同步控件字体：样式表只管画，fontMetrics() 拿到的是控件字体，两者必须一致
         self.input.setFont(U.qfont("body"))
@@ -1549,63 +1884,193 @@ class AgentPanelWidget(QWidget):
         _send = U.px(36)
         self.send.setFixedSize(_send, _send)
         self.send.setStyleSheet(
-            f"QPushButton{{background:{pal['accent']}; color:#ffffff; border:none;"
-            f" border-radius:{_send // 2}px; font-size:{U.fs('title')}px;"
+            f"QToolButton{{background:{pal['accent']}; color:#ffffff; border:none;padding:0;margin:0;"
+            f" border-radius:{U.R('md')}px; font-size:{U.fs('title')}px;"
             " font-weight:bold;}"
-            f"QPushButton:hover{{background:{pal['accent_hover']};}}"
-            f"QPushButton:disabled{{background:{pal['card_border']}; color:{pal['subtle']};}}"
-            # 运行中切换成红色停止键：属性选择器 + _set_run_state() 里的
+            f"QToolButton:hover{{background:{pal['accent_hover']};}}"
+            f"QToolButton:disabled{{background:{pal['card_border']}; color:{pal['subtle']};}}"
+            # 运行中发送键切换为可点击停止态：属性选择器 + _set_run_state() 里的
             # unpolish/polish 触发重算，主题重刷也不会把运行态样式冲掉
-            f"QPushButton[busy=\"true\"]{{background:{pal['stop_bg']};}}"
-            f"QPushButton[busy=\"true\"]:hover{{background:{pal['stop_bg_hover']};}}"
+            f"QToolButton[busy=\"true\"]{{background:{pal['hover']};}}"
+            f"QToolButton[busy=\"true\"]:hover{{background:{pal['hover']};}}"
         )
         # 矢量线条图标按主题着色（深/浅切换时重画）
-        for button in (self.cut_btn, self.copy_btn, self.paste_btn, self.clear_btn):
+        for button in (self.cut_btn, self.copy_btn, self.paste_btn, self.clear_btn,
+                     self.attach_btn):
             button.setIcon(_draw_icon(str(button.property("icon_name")), pal["subtle"]))
             button.setIconSize(QSize(U.px(16), U.px(16)))
         self.allow_python.setIcon(_draw_icon("code", pal["subtle"]))
         self.allow_python.setIconSize(QSize(U.px(15), U.px(15)))
         # 矢量线条图标按主题着色（深/浅切换时重画）；发送键随运行态换图标
-        busy = self._worker is not None and self._worker.isRunning()
-        self.send.setIcon(_draw_icon("stop" if busy else "send", "#ffffff", size=18))
+        busy = bool(self.send.property("busy"))
+        send_color = pal['text'] if busy else ('#ffffff' if not self.dark else pal['panel_bg'])
+        self.send.setIcon(_draw_icon("stop" if busy else "send", send_color, size=U.px(18)))
         self.send.setIconSize(QSize(U.px(18), U.px(18)))
         self.model_combo.setStyleSheet(_combo_css(pal, radius_token="pill"))
         self.allow_python.setStyleSheet(
             f"QCheckBox{{color:{pal['subtle']}; font-size:{U.fs('tiny')}px;"
-            "background:transparent;}" + base
+            f"spacing:{U.px(6)}px;background:transparent;}}" + U.indicator_css(pal) + base
         )
         self.status.setStyleSheet(
             f"color:{pal['subtle']}; font-size:{U.fs('tiny')}px;"
             "background:transparent;" + base
         )
-        self.settings_btn.setStyleSheet(_button_css(pal, "ghost"))
+        self.run_status_text.setStyleSheet(
+            f"color:{pal['subtle']};font-size:{U.fs('small')}px;background:transparent;{base}")
+        self.run_status_dot.setStyleSheet(
+            f"color:{pal['accent']};font-size:{U.fs('micro')}px;background:transparent;")
+        self.run_stop_btn.setStyleSheet(
+            f"QToolButton{{color:{pal['subtle']};background:transparent;border:none;"
+            f"padding:{U.px(4)}px;border-radius:{U.R('xs')}px;{base}}}"
+            f"QToolButton:hover{{color:{pal['error']};background:{pal['hover']};}}")
+        for button, name in ((self.side_btn, "menu"), (self.settings_btn, "sliders"),
+                             (self.settings_close, "back"),
+                             (self.theme_btn, "sun" if self.dark else "moon"), (self.key_eye, "eye")):
+            button.setText("")
+            button.setIcon(_draw_icon(name, pal['text'], U.px(16)))
+            button.setIconSize(QSize(U.px(16), U.px(16)))
+        self.settings_btn.setText("模型设置")
+        self.settings_btn.setAccessibleName("模型设置：配置连接、模型和工具权限")
+        self.settings_btn.setStyleSheet(
+            f"QToolButton{{color:{pal['text']};background:{pal['card_bg']};"
+            f"border:1px solid transparent;border-radius:{U.R('sm')}px;"
+            f"padding:0;font-size:{U.fs('small')}px;{base}}}"
+            f"QToolButton:hover{{background:{pal['hover']};}}"
+            f"QToolButton:checked{{color:{pal['accent']};background:{pal['accent_soft']};}}"
+            f"QToolButton:focus{{border-color:{pal['accent']};}}")
+        self.settings_close.setText("返回对话")
+        self.settings_close.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.settings_close.setFixedWidth(U.px(112))
+        self.model_shortcut.setStyleSheet(
+            f"QPushButton{{background:{pal['input_bg']};color:{pal['text']};border:1px solid transparent;"
+            f"border-radius:{U.R('sm')}px;padding:{U.px(6)}px {U.px(10)}px;font-size:{U.fs('small')}px;{base}}}"
+            f"QPushButton:hover,QPushButton:pressed{{background:{pal['accent_soft']};color:{pal['accent']};}}"
+            f"QPushButton:focus{{border-color:{pal['accent']};}}")
+        self.model_shortcut.setIcon(_draw_icon('chevron_up', pal['subtle']))
         self._style_settings(pal)
         _restyle_handle(pal)
+        title_bar = getattr(self, '_dock_title_bar', None)
+        if title_bar is not None:
+            title_bar.restyle(pal)
         self._rebuild()
+        if hasattr(self, 'projects_data'):
+            self._refresh_project_list()
 
     # ------------------------------------------------------------ settings
-    def _build_settings(self, layout: QVBoxLayout):
+    def _build_settings(self):
+        self._profile_request_id = 0
+        self._profile_loading = False
+        self._editor_model = None
+        self._provider_names = {}
+        self._provider_groups = []
+        self._editing_provider_models = []
+        self.settings_page = QWidget()
+        page_layout = QVBoxLayout(self.settings_page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        header = QHBoxLayout()
+        self.settings_heading = QLabel("模型设置")
+        self.settings_heading.setFont(U.qfont("title", bold=True))
+        header.addWidget(self.settings_heading, 1)
+        self.settings_close = self._round_tool_button("", "关闭设置，返回对话 (Esc)")
+        self.settings_close.clicked.connect(lambda: self.settings_btn.setChecked(False))
+        header.addWidget(self.settings_close)
+        page_layout.addLayout(header)
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.settings_columns = QHBoxLayout()
+        self.settings_columns.setSpacing(U.px(10))
+        self.models_sidebar = QWidget()
+        self.models_sidebar.setObjectName("modelsSidebar")
+        side = QVBoxLayout(self.models_sidebar)
+        side.setContentsMargins(U.px(10), U.px(14), U.px(10), U.px(12))
+        side.setSpacing(U.px(10))
+        self.saved_model_search = QLineEdit()
+        self.saved_model_search.setPlaceholderText("搜索供应商 / 模型")
+        self.saved_model_search.setAccessibleName("搜索已保存的供应商或模型")
+        self.saved_model_search.setClearButtonEnabled(True)
+        self.saved_model_search.textChanged.connect(self._filter_saved_models)
+        side.addWidget(self.saved_model_search)
+        self.saved_models_heading = QLabel("已有模型")
+        self.saved_models_heading.setFont(U.qfont("small", bold=True))
+        self.model_sidebar_actions = QHBoxLayout()
+        self.model_sidebar_actions.setSpacing(U.px(10))
+        self.model_sidebar_actions.addWidget(self.saved_models_heading)
+        self.add_model_btn = QPushButton("添加供应商")
+        self.add_model_btn.setToolTip("新增供应商与模型")
+        self.add_model_btn.setAccessibleName("新增供应商与模型")
+        self.add_model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_model_btn.clicked.connect(self._new_model)
+        self.model_sidebar_actions.addWidget(self.add_model_btn)
+        side.addLayout(self.model_sidebar_actions)
+        self.saved_model_selector = QComboBox()
+        self.saved_model_selector.setPlaceholderText("选择已有模型")
+        self.saved_model_selector.setAccessibleName("选择已有模型以编辑参数")
+        self.saved_model_selector.activated.connect(
+            lambda index: self._edit_saved_model(self.saved_model_selector.itemData(index)))
+        side.addWidget(self.saved_model_selector)
+        self.saved_model_list = QListWidget()
+        self.saved_model_list.setFrameShape(QFrame.Shape.NoFrame)
+        self.saved_model_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.saved_model_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.saved_model_list.setAccessibleName("已有模型，选择后编辑参数")
+        self.saved_model_list.currentItemChanged.connect(
+            lambda item, _: self._edit_saved_model(item.data(Qt.ItemDataRole.UserRole)) if item else None)
+        self.saved_model_list.itemClicked.connect(
+            lambda item: self._edit_saved_model(item.data(Qt.ItemDataRole.UserRole))
+            if not self._profile_loading else None)
+        side.addWidget(self.saved_model_list, 1)
+        self.settings_columns.addWidget(self.models_sidebar)
+        self.settings_columns.addWidget(self.settings_scroll, 1)
+        page_layout.addLayout(self.settings_columns, 1)
         self.settings_box = QWidget()
         self.settings_box.setObjectName("settingsCard")
         sv = QVBoxLayout(self.settings_box)
-        sv.setContentsMargins(U.P("lg"), U.P("lg"), U.P("lg"), U.P("lg"))
-        sv.setSpacing(U.P("md"))
+        sv.setContentsMargins(U.px(18), U.px(18), U.px(18), U.px(18))
+        sv.setSpacing(U.px(10))
+
+        self.model_editor_heading = QLabel("模型参数")
+        self.model_editor_heading.setFont(U.qfont("title", bold=True))
+        self.model_editor_heading.setWordWrap(True)
+        self.model_editor_heading.setMinimumWidth(0)
+        provider_header = QHBoxLayout()
+        provider_header.addWidget(self.model_editor_heading, 1)
+        self.provider_enabled = ProviderSwitch()
+        self.provider_enabled.setChecked(True)
+        self.provider_enabled.setAccessibleName("启用当前供应商")
+        self.provider_enabled.setToolTip("停用后保留配置，隐藏聊天模型；保存并应用后生效")
+        self.provider_enabled.toggled.connect(self._on_provider_enabled)
+        provider_header.addWidget(self.provider_enabled)
+        sv.addLayout(provider_header)
+        self.model_editor_hint = QLabel("选择已有模型进行编辑，或添加新的模型。")
+        self.model_editor_hint.setWordWrap(True)
+        self.model_editor_hint.hide()
+        self.connection_heading = QLabel("连接设置")
+        sv.addWidget(self.connection_heading)
 
         form = QFormLayout()
         form.setHorizontalSpacing(U.P("md"))
-        form.setVerticalSpacing(U.P("sm"))
+        form.setVerticalSpacing(U.px(6))
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(list(PRESETS))
         self.preset_combo.currentTextChanged.connect(self._on_preset)
-        form.addRow("预设", self.preset_combo)
+        form.addRow("服务类型", self.preset_combo)
+        self.provider_name_edit = QLineEdit()
+        self.provider_name_edit.setPlaceholderText("例如：我的 DeepSeek 服务")
+        self.provider_name_edit.setAccessibleName("供应商名称，显示在左侧列表")
+        form.addRow("供应商名称", self.provider_name_edit)
+        self.provider_name_edit.textChanged.connect(self._update_provider_heading)
 
         key_row = QHBoxLayout()
         key_row.setSpacing(U.P("sm"))
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_edit.setPlaceholderText("尚未保存")
+        self.api_key_edit.setPlaceholderText("输入此模型的 API 密钥")
         key_row.addWidget(self.api_key_edit, 1)
         self.key_eye = self._round_tool_button("👁", "显示/隐藏密钥", checkable=True)
         self.key_eye.toggled.connect(self._toggle_key_visibility)
@@ -1613,87 +2078,187 @@ class AgentPanelWidget(QWidget):
         self.get_key_label = QLabel("")
         self.get_key_label.setTextFormat(Qt.TextFormat.RichText)
         self.get_key_label.setOpenExternalLinks(True)
-        key_row.addWidget(self.get_key_label)
+        self.test_btn = QPushButton("检测")
+        self.test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.test_btn.setToolTip("检测连接，并获取可用模型")
+        self.test_btn.clicked.connect(self._test_connection)
+        key_row.addWidget(self.test_btn)
         form.addRow("API 密钥", key_row)
 
         self.base_url_edit = QLineEdit()
         self.base_url_edit.setPlaceholderText("https://api.deepseek.com")
         form.addRow("API 地址", self.base_url_edit)
         sv.addLayout(form)
+        sv.addWidget(self.get_key_label)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(U.P("sm"))
-        self.test_btn = QPushButton("检测")
-        self.test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.test_btn.setToolTip("检测 API 连接，并拉取该地址的可用模型列表")
-        self.test_btn.clicked.connect(self._test_connection)
-        btn_row.addWidget(self.test_btn)
         self.save_btn = QPushButton("保存并应用")
         self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.clicked.connect(self._save_settings)
-        btn_row.addWidget(self.save_btn)
-        self.cfg_hint = QLabel("")
+        self.cfg_hint = FeedbackLabel()
         self.cfg_hint.setWordWrap(True)
-        btn_row.addWidget(self.cfg_hint, 1)
-        sv.addLayout(btn_row)
+        btn_row.addStretch(1)
+        sv.addWidget(self.cfg_hint)
+        self.retry_profile_btn = QPushButton("重新载入参数")
+        self.retry_profile_btn.clicked.connect(lambda: self._edit_saved_model(self._editor_model))
+        self.retry_profile_btn.hide()
+        sv.addWidget(self.retry_profile_btn)
 
         model_header = QHBoxLayout()
         model_header.setSpacing(U.P("sm"))
-        self.model_label = QLabel("<b>模型</b>")
+        self.model_label = QLabel("模型")
         model_header.addWidget(self.model_label)
-        # 当前使用的模型：输入栏不再放模型框，切换统一在这里（勾清单也可即点即用）
+        model_header.addStretch(1)
+        # 在供应商下添加模型；对话模型由输入栏菜单切换。
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
+        self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.model_combo.setMinimumContentsLength(6)
         self.model_combo.addItems(_model_choices())
-        self._set_model_combo_text(_default_model())
-        self.model_combo.setToolTip("当前对话使用的模型；点击切换，也可手动输入任意模型名")
+        self._active_model = _default_model()
+        self._set_model_combo_text(self._active_model)
+        self.model_combo.setToolTip("选择或输入模型名称，再点击添加")
         self.model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.model_combo.setMaximumWidth(U.px(260))
-        model_header.addWidget(self.model_combo, 1)
-        self.sync_btn = QPushButton("⟳ 同步模型")
+        self.sync_btn = QPushButton("同步模型")
         self.sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sync_btn.setToolTip("从 API 地址拉取最新模型列表")
         self.sync_btn.clicked.connect(self._test_connection)
         model_header.addWidget(self.sync_btn)
-        sv.addLayout(model_header)
+        self.models_area = QFrame()
+        self.models_area.setObjectName("modelSection")
+        models_layout = QVBoxLayout(self.models_area)
+        models_layout.setContentsMargins(U.px(12), U.px(12), U.px(12), U.px(12))
+        models_layout.setSpacing(U.px(10))
+        models_layout.addLayout(model_header)
+        add_model_row = QHBoxLayout()
+        add_model_row.setSpacing(U.px(6))
+        add_model_row.addWidget(self.model_combo, 1)
+        self.add_provider_model_btn = QPushButton("添加")
+        self.add_provider_model_btn.setMinimumWidth(U.px(64))
+        self.add_provider_model_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.add_provider_model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_provider_model_btn.setToolTip("将输入的模型加入该供应商")
+        self.add_provider_model_btn.clicked.connect(self._add_provider_model)
+        add_model_row.addWidget(self.add_provider_model_btn)
+        models_layout.addLayout(add_model_row)
+        sv.addWidget(self.models_area)
+        self.model_combo.setMaximumWidth(16777215)
+        self.model_combo.currentTextChanged.connect(self._update_model_shortcut)
+        self.model_combo.lineEdit().setPlaceholderText("输入模型名称，如 deepseek-flash")
 
         self.model_search = QLineEdit()
         self.model_search.setPlaceholderText("搜索模型…")
         self.model_search.setClearButtonEnabled(True)
         self.model_search.textChanged.connect(self._filter_models)
-        sv.addWidget(self.model_search)
+        models_layout.addWidget(self.model_search)
 
         self.model_list = QListWidget()
         self.model_list.setFrameShape(QListWidget.Shape.NoFrame)
         self.model_list.setSpacing(U.P("xs"))
-        self.model_list.setToolTip("勾选某个模型 = 立即用它对话；勾选集合会保存到 config.ini")
+        self.model_list.setToolTip("选择该供应商的可用模型，保存后可在输入栏切换")
         self.model_list.itemChanged.connect(self._on_model_item_changed)
-        sv.addWidget(self.model_list)
+        self.model_list.setVisible(False)
+        self.model_search.setVisible(False)
+        models_layout.addWidget(self.model_list)
 
-        self.model_list_hint = QLabel("")
+        self.model_list_hint = QLabel("勾选多个模型并保存，即可在输入栏切换；也可手动添加。")
         self.model_list_hint.setWordWrap(True)
-        sv.addWidget(self.model_list_hint)
+        self.model_list_hint.hide()
+        self.permission_heading = QLabel("工具权限")
+        sv.addWidget(self.permission_heading)
+        self.python_setting = QCheckBox("允许执行 ADS Python")
+        self.python_setting.setChecked(self.allow_python.isChecked())
+        self.python_setting.setToolTip("启用脚本工具，用于读取和修改 ADS 设计")
+        self.python_setting.toggled.connect(self.allow_python.setChecked)
+        self.allow_python.toggled.connect(self.python_setting.setChecked)
+        sv.addWidget(self.python_setting)
 
-        self.settings_box.setVisible(False)
-        layout.addWidget(self.settings_box)
+        self.shared_connection_hint = QLabel("同一供应商的模型共用 API 地址和密钥。")
+        self.shared_connection_hint.setWordWrap(True)
+        sv.addWidget(self.shared_connection_hint)
+        sv.addStretch(1)
+        self.settings_scroll.setWidget(self.settings_box)
+        footer = QHBoxLayout()
+        self.settings_save_hint = QLabel("修改后保存并应用")
+        self.settings_save_hint.setWordWrap(True)
+        self.settings_save_hint.hide()
+        footer.addStretch(1)
+        self.save_btn.setMinimumWidth(U.px(140))
+        self.save_btn.setMaximumWidth(U.px(190))
+        footer.addWidget(self.save_btn)
+        page_layout.addLayout(footer)
+        self.pages.addWidget(self.settings_page)
+        self.settings_page.installEventFilter(self)
+        from PySide6.QtGui import QKeySequence, QShortcut
+        self.settings_escape = QShortcut(QKeySequence("Esc"), self)
+        self.settings_escape.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.settings_escape.activated.connect(lambda: self.settings_btn.setChecked(False))
+        self.settings_escape.setEnabled(False)
+        self._refresh_saved_models(_model_choices())
 
     def _style_settings(self, pal: dict):
-        """设置区：圆角卡片 + 圆角输入 + 胶囊按钮。"""
+        """设置区：模型侧栏、参数卡片与固定保存操作。"""
         base = U.font_css()
+        self.settings_scroll.setStyleSheet(
+            f"QScrollArea{{background:transparent; border:none;}}" + _scrollbar_css(pal)
+        )
         self.settings_box.setStyleSheet(
-            f"QWidget#settingsCard{{background:{pal['card_bg']};"
-            f" border:1px solid {pal['card_border']}; border-radius:{U.R('lg')}px;}}"
+            f"QWidget#settingsCard{{background:{pal['panel_bg']};border:1px solid {pal['card_border']};"
+            f"border-radius:{U.R('md')}px;}}"
             f"QLabel{{color:{pal['text']}; font-size:{U.fs('small')}px;"
             " background:transparent;" + base + "}"
+            f"QToolButton{{color:{pal['text']};}}"
         )
         self.preset_combo.setStyleSheet(_combo_css(pal))
         self.api_key_edit.setStyleSheet(_lineedit_css(pal))
         self.base_url_edit.setStyleSheet(_lineedit_css(pal))
+        self.provider_enabled.colors = pal
+        self.provider_enabled.update()
+        self.provider_name_edit.setStyleSheet(_lineedit_css(pal))
         self.model_search.setStyleSheet(_lineedit_css(pal, radius_token="pill"))
+        self.saved_model_search.setStyleSheet(_lineedit_css(pal))
+        self.models_area.setStyleSheet(
+            f"QFrame#modelSection{{background:{pal['card_bg']};border:1px solid {pal['card_border']};"
+            f"border-radius:{U.R('md')}px;}}")
         self.test_btn.setStyleSheet(_button_css(pal, "soft"))
+        self.retry_profile_btn.setStyleSheet(_button_css(pal, "soft"))
         self.save_btn.setStyleSheet(_button_css(pal, "primary"))
         self.sync_btn.setStyleSheet(_button_css(pal, "soft"))
-        for hint in (self.cfg_hint, self.model_list_hint):
+        self.sync_btn.setIcon(_draw_icon('refresh', pal['subtle']))
+        self.models_sidebar.setStyleSheet(
+            f"QWidget#modelsSidebar{{background:{pal['sidebar_bg']};"
+            f"border:1px solid {pal['card_border']};border-radius:{U.R('md')}px;}}"
+            f"QLabel{{color:{pal['text']};background:transparent;{base}}}")
+        self.add_model_btn.setStyleSheet(_button_css(pal, "soft"))
+        self.add_model_btn.setIcon(_draw_icon('plus', pal['accent']))
+        self.add_model_btn.setIconSize(QSize(U.px(14), U.px(14)))
+        self.add_provider_model_btn.setStyleSheet(_button_css(pal, "soft"))
+        self.saved_model_selector.setStyleSheet(_combo_css(pal))
+        self.saved_model_list.setStyleSheet(
+            f"QListWidget{{background:transparent;border:none;color:{pal['text']};"
+            f"font-size:{U.fs('small')}px;{base}}}"
+            f"QListWidget::item{{padding:0;"
+            f"margin-bottom:{U.px(4)}px;border:1px solid transparent;border-radius:{U.R('sm')}px;}}"
+            f"QListWidget::item:hover{{background:{pal['hover']};}}"
+            f"QListWidget::item:selected{{background:{pal['hover']};color:{pal['text']};"
+            f"border-color:{pal['card_border']};}}" + _scrollbar_css(pal))
+        for i in range(self.saved_model_list.count()):
+            row = self.saved_model_list.itemWidget(self.saved_model_list.item(i))
+            if row:
+                for label in row.findChildren(QLabel):
+                    if label.objectName() in ('providerLabel', 'modelLabel'):
+                        color = pal['subtle'] if label.objectName() == 'modelLabel' else pal['text']
+                        label.setStyleSheet(f"color:{color};background:transparent;")
+        self.python_setting.setStyleSheet(
+            f"QCheckBox{{color:{pal['text']};background:transparent;spacing:{U.px(8)}px;"
+            f"font-size:{U.fs('small')}px;{base}}}" + U.indicator_css(pal))
+        for section in (self.connection_heading, self.model_label, self.permission_heading):
+            section.setStyleSheet(f"color:{pal['text']};font-size:{U.fs('small')}px;font-weight:bold;"
+                                 f"padding-top:{U.px(8)}px;")
+        for hint in (self.cfg_hint, self.model_list_hint, self.model_editor_hint, self.shared_connection_hint,
+                     self.settings_save_hint):
             hint.setStyleSheet(
                 f"color:{pal['subtle']}; font-size:{U.fs('tiny')}px;"
                 "background:transparent;" + base
@@ -1702,14 +2267,239 @@ class AgentPanelWidget(QWidget):
             f"font-size:{U.fs('tiny')}px; background:transparent;" + base
         )
         self.model_list.setStyleSheet(
-            f"QListWidget{{background:{pal['input_bg']};"
+            f"QListWidget{{background:{pal['input_bg']};border:1px solid {pal['card_border']};"
             f" border-radius:{U.R('md')}px; color:{pal['text']};"
             f" font-size:{U.fs('small')}px; padding:{U.P('xs')}px;{base}}}"
-            f"QListWidget::item{{border-radius:{U.R('sm')}px; padding:{U.P('sm')}px;}}"
+            f"QListWidget::item{{border-radius:{U.R('sm')}px; padding:{U.px(6)}px;}}"
             f"QListWidget::item:hover{{background:{pal['hover']};}}"
             f"QListWidget::item:selected{{background:{pal['accent_soft']};}}"
-            + _scrollbar_css(pal)
+            + U.indicator_css(pal, owner='QListWidget') + _scrollbar_css(pal)
         )
+
+    def _on_provider_enabled(self, enabled):
+        self.provider_enabled.update()
+
+    def _input_model_groups(self):
+        if self._provider_groups:
+            return [g for g in self._provider_groups if g.get('enabled', True) and g['models']]
+        groups = {}
+        for model in self._saved_models or ([self._active_model] if self._active_model else []):
+            provider = self._provider_names.get(model, '自定义供应商')
+            groups.setdefault(provider, dict(provider_name=provider, models=[]))['models'].append(model)
+        return list(groups.values())
+
+    def _input_available_models(self):
+        return list(dict.fromkeys(m for g in self._input_model_groups() for m in g['models']))
+
+    def _active_provider_enabled(self):
+        return all(g.get('enabled', True) for g in self._provider_groups if self._active_model in g['models'])
+
+    def _update_provider_heading(self, name):
+        self.model_editor_heading.setText(name.strip() or ("新增供应商" if self._editor_model is None else "供应商配置"))
+        self.model_editor_heading.setWordWrap(True)
+
+    def _filter_saved_models(self, text):
+        query = text.strip().casefold()
+        for i in range(self.saved_model_list.count()):
+            item = self.saved_model_list.item(i)
+            model = item.data(Qt.ItemDataRole.UserRole)
+            provider = self._provider_names.get(model, "自定义供应商")
+            members = item.data(Qt.ItemDataRole.UserRole + 1) or [model]
+            item.setHidden(bool(query) and query not in (provider + ' ' + ' '.join(members)).casefold())
+
+    def _ingest_provider_groups(self, data):
+        if 'provider_groups' in data:
+            self._provider_groups = data['provider_groups'] or []
+
+    def _provider_models_for(self, model):
+        return next((list(g['models']) for g in self._provider_groups if model in g['models']), [model] if model else [])
+
+    def _refresh_saved_models(self, models, labels=None):
+        self._provider_names.update(labels or {})
+        self._saved_models = list(dict.fromkeys(str(m) for m in models if str(m).strip()))
+        active = self.model_combo.currentText().strip()
+        self.saved_model_list.blockSignals(True)
+        self.saved_model_list.clear()
+        self.saved_model_selector.blockSignals(True)
+        self.saved_model_selector.clear()
+        groups = [dict(g) for g in self._provider_groups if any(n in self._saved_models for n in g['models'])]
+        grouped_names = {n for g in groups for n in g['models']}
+        groups += [dict(model=n, models=[n]) for n in self._saved_models if n not in grouped_names]
+        for group in groups:
+            members = group['models']
+            name = active if active in members else group['model']
+            group['model'] = name
+            self.saved_model_selector.addItem(self._provider_names.get(name, "自定义供应商"), name)
+        self.saved_model_selector.setCurrentIndex(self.saved_model_selector.findData(active))
+        self.saved_model_selector.blockSignals(False)
+        for group in groups:
+            name, members = group['model'], group['models']
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setData(Qt.ItemDataRole.UserRole + 1, members)
+            provider = self._provider_names.get(name, "自定义供应商")
+            item.setToolTip(provider + " · " + name + (" · 当前使用" if name == self._active_model else " · 编辑参数"))
+            self.saved_model_list.addItem(item)
+            row = QWidget()
+            row.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(U.px(8), U.px(8), U.px(8), U.px(8))
+            row_layout.setSpacing(U.px(8))
+            avatar = QLabel(provider[:1].upper())
+            avatar.setObjectName('providerAvatar')
+            avatar.setFixedSize(U.px(28), U.px(28))
+            avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            colors = ('#4978c7', '#8562b1', '#258979', '#b47548', '#986377')
+            color = colors[sum(ord(char) for char in provider) % len(colors)]
+            avatar.setStyleSheet(f"background:{color};color:white;border-radius:{U.px(8)}px;font-weight:bold;")
+            row_layout.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
+            texts = QVBoxLayout()
+            texts.setSpacing(U.px(3))
+            provider_label = QLabel(provider)
+            provider_label.setObjectName('providerLabel')
+            provider_label.setFont(U.qfont("small", bold=True))
+            model_label = QLabel(f"{len(members)} 个模型")
+            model_label.setObjectName('modelLabel')
+            model_label.setFont(U.qfont("tiny"))
+            for label in (provider_label, model_label):
+                label.setWordWrap(True)
+                label.setMinimumWidth(0)
+                text_color = self._pal()['subtle'] if label is model_label else self._pal()['text']
+                label.setStyleSheet(f"color:{text_color};background:transparent;")
+                texts.addWidget(label)
+            row_layout.addLayout(texts, 1)
+            if self._active_model in members and group.get("enabled", True):
+                marker = QLabel('●')
+                marker.setObjectName('activeMarker')
+                marker.setToolTip('当前对话使用的模型')
+                marker.setFixedWidth(U.px(8))
+                marker.setStyleSheet(f"color:{self._pal()['accent']};background:transparent;font-size:{U.fs('tiny')}px;")
+                row_layout.addWidget(marker, 0, Qt.AlignmentFlag.AlignTop)
+            self.saved_model_list.setItemWidget(item, row)
+            if name == active:
+                self.saved_model_list.setCurrentItem(item)
+        self.saved_model_list.blockSignals(False)
+        self.saved_models_heading.setText(f"供应商 · {len(groups)}")
+        self._reflow_saved_model_rows()
+        self._filter_saved_models(self.saved_model_search.text())
+
+    def _reflow_saved_model_rows(self):
+        available = max(U.px(50), self.saved_model_list.viewport().width() - U.px(64))
+        for i in range(self.saved_model_list.count()):
+            item = self.saved_model_list.item(i)
+            row = self.saved_model_list.itemWidget(item)
+            if row:
+                labels = [label for label in row.findChildren(QLabel)
+                          if label.objectName() in ('providerLabel', 'modelLabel')]
+                height = 0
+                for label in labels:
+                    label_height = max(label.fontMetrics().height(), label.heightForWidth(available))
+                    label.setFixedHeight(label_height)
+                    height += label_height
+                item.setSizeHint(QSize(0, max(U.px(28), height) + U.px(24)))
+
+    def _edit_saved_model(self, name):
+        if not name:
+            return
+        self._set_model_combo_text(name)
+        self.saved_model_selector.setCurrentIndex(self.saved_model_selector.findData(name))
+        for i in range(self.saved_model_list.count()):
+            if self.saved_model_list.item(i).data(Qt.ItemDataRole.UserRole) == name:
+                self.saved_model_list.blockSignals(True)
+                self.saved_model_list.setCurrentRow(i)
+                self.saved_model_list.blockSignals(False)
+                break
+        self.model_editor_heading.setText("模型参数")
+        self.model_editor_hint.setText("编辑后点击保存并应用，即可使用该模型。")
+        self._editor_model = name
+        self._profile_request_id += 1
+        request_id = self._profile_request_id
+        self._reset_key_field()
+        self.base_url_edit.clear()
+        self.provider_name_edit.clear()
+        self._set_editor_provider("")
+        self._clear_discovered_models()
+        self._set_profile_loading(True)
+        self.retry_profile_btn.hide()
+        self.cfg_hint.setText("正在载入模型参数…")
+        self._spawn_cfg_worker({"model": name}, "/config/model",
+                               lambda data: self._on_profile_loaded(data, name, request_id))
+
+    def _set_profile_loading(self, loading):
+        self._profile_loading = loading
+        for control in (self.save_btn, self.test_btn, self.sync_btn, self.preset_combo,
+                        self.base_url_edit, self.api_key_edit, self.model_combo, self.key_eye):
+            control.setEnabled(not loading)
+        self.provider_name_edit.setEnabled(not loading)
+        self.provider_enabled.setEnabled(not loading)
+
+    def _reset_key_field(self):
+        self.key_eye.setChecked(False)
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_edit.clear()
+        self.api_key_edit.setPlaceholderText("输入此模型的 API 密钥")
+
+    def _set_editor_provider(self, address):
+        preset = next((name for name, values in PRESETS.items()
+                       if values[0] == address and address), "自定义")
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentText(preset)
+        self.preset_combo.blockSignals(False)
+        self._update_get_key_link(preset)
+
+    def _clear_discovered_models(self):
+        self.model_list.blockSignals(True)
+        self.model_list.clear()
+        self.model_list.blockSignals(False)
+        self.model_list.hide()
+        self.model_search.clear()
+        self.model_search.hide()
+        self.model_list_hint.setText("勾选多个模型并保存，即可在输入栏切换；也可手动添加。")
+
+    def _on_profile_loaded(self, data, name, request_id):
+        if request_id != self._profile_request_id or self._editor_model != name:
+            return
+        self._set_profile_loading(False)
+        if "error" in data or data.get("backend_down"):
+            self.cfg_hint.setText(data.get("error") or "后端未运行，请启动后端再重新载入。")
+            self.retry_profile_btn.show()
+            self.save_btn.setEnabled(False)
+            return
+        self.provider_enabled.setChecked(data.get("enabled", True))
+        self.base_url_edit.setText(data.get("base_url", ""))
+        self._set_editor_provider(data.get("base_url", ""))
+        self._reset_key_field()
+        self.api_key_edit.setText(data.get("api_key", ""))
+        provider = data.get("provider_name") or self.preset_combo.currentText()
+        self.provider_name_edit.setText(provider)
+        self._refresh_saved_models(self._saved_models, {name: provider})
+        self._editing_provider_models = list(data.get('models') or self._provider_models_for(name))
+        self._populate_model_list(self._editing_provider_models)
+        self.cfg_hint.clear()
+        self.settings_scroll.verticalScrollBar().setValue(0)
+
+    def _new_model(self):
+        self.provider_enabled.setChecked(True)
+        self._profile_request_id += 1
+        self._editor_model = None
+        self._editing_provider_models = []
+        self._set_profile_loading(False)
+        self._reset_key_field()
+        self.base_url_edit.clear()
+        self.provider_name_edit.clear()
+        self.retry_profile_btn.hide()
+        self._set_editor_provider("")
+        self._clear_discovered_models()
+        self.saved_model_list.blockSignals(True)
+        self.saved_model_list.setCurrentRow(-1)
+        self.saved_model_list.blockSignals(False)
+        self.saved_model_selector.setCurrentIndex(-1)
+        self._set_model_combo_text("")
+        self.model_editor_heading.setText("新增供应商")
+        self.model_editor_hint.setText("填写供应商连接，再添加或同步此 API 下的模型。")
+        self.cfg_hint.clear()
+        self.provider_name_edit.setFocus()
+        self.settings_scroll.verticalScrollBar().setValue(0)
 
     def _spawn_cfg_worker(self, payload: dict | None, path: str, callback,
                           timeout: int = 60) -> None:
@@ -1736,9 +2526,15 @@ class AgentPanelWidget(QWidget):
             le.deselect()
 
     def reload_config(self):
-        self._spawn_cfg_worker(None, "/config", self._on_config_loaded)
+        request_id = self._profile_request_id
+        self._spawn_cfg_worker(None, "/config",
+                               lambda data: self._on_config_loaded(data, request_id))
 
-    def _on_config_loaded(self, data: dict):
+    def _on_config_loaded(self, data: dict, request_id=None):
+        if request_id is not None and request_id != self._profile_request_id:
+            if "error" not in data and not data.get("backend_down"):
+                self._refresh_saved_models(self._saved_models + (data.get("models") or []), data.get('profile_labels'))
+            return
         if data.get("backend_down"):
             self._auto_revive(retry=self.reload_config)
             return
@@ -1752,19 +2548,116 @@ class AgentPanelWidget(QWidget):
         except (TypeError, ValueError):
             pass
         self.base_url_edit.setText(data.get("base_url", ""))
-        self.api_key_edit.setPlaceholderText(
-            f"已保存 {data.get('api_key_hint', '')}；留空表示不修改"
-            if data.get("has_key")
-            else "尚未保存"
-        )
-        preset = self.preset_combo.currentText()
-        if data.get("base_url", "") == PRESETS.get(preset, ("", "", ""))[0]:
-            self._update_get_key_link(preset)
-        else:
-            self._update_get_key_link("自定义")
+        self._active_model = data.get("model") or self._active_model
+        self._ingest_provider_groups(data)
+        self._set_model_combo_text(data.get("model") or self.model_combo.currentText())
+        self._refresh_saved_models(data.get("models") or [self.model_combo.currentText()], data.get('profile_labels'))
+        self._update_model_shortcut()
+        self._edit_saved_model(self._active_model)
 
     def _toggle_settings(self, checked: bool):
-        self.settings_box.setVisible(checked)
+        self.key_eye.setChecked(False)
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        if checked:
+            self._settings_return_focus = QApplication.focusWidget()
+        self.pages.setCurrentWidget(self.settings_page if checked else self.conversation_page)
+        self.side_btn.setEnabled(not checked)
+        self.settings_escape.setEnabled(checked)
+        if checked:
+            self.provider_name_edit.setFocus()
+        else:
+            target = getattr(self, "_settings_return_focus", None) or self.input
+            target.setFocus()
+            QTimer.singleShot(0, self.reflow)
+
+    def _update_model_shortcut(self, *_):
+        model = (self._active_model or "选择模型") if self._active_provider_enabled() else "供应商已停用"
+        controls = U.px(110)
+        if not self.allow_python.isHidden():
+            controls += U.px(85)
+        if not self.cut_btn.isHidden():
+            controls += U.px(108)
+        self.model_shortcut.setMaximumWidth(max(U.px(64), min(U.px(220), self.input_frame.width() - controls)))
+        self.model_shortcut.setText(self.model_shortcut.fontMetrics().elidedText(
+            model, Qt.TextElideMode.ElideRight, self.model_shortcut.maximumWidth() - U.px(42)))
+        self.model_shortcut.setToolTip(f"当前模型：{model} · 点击切换")
+
+    def _build_input_model_menu(self):
+        menu = QMenu(self.model_shortcut)
+        menu.setObjectName('inputModelMenu')
+        menu.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        menu.setFont(U.qfont('small'))
+        menu.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        menu.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        menu.setMinimumWidth(max(U.px(220), self.model_shortcut.width()))
+        pal = self._pal()
+        check = U.icon_path('check', pal['accent'])
+        menu.setStyleSheet(
+            f"QMenu#inputModelMenu{{background:{pal['input_bg']};color:{pal['text']};"
+            f"border:1px solid {pal['input_border']};padding:{U.px(6)}px;"
+            f"border-radius:{U.R('md')}px;menu-scrollable:1;{U.font_css()}}}"
+            f"QMenu#inputModelMenu::item{{background:transparent;color:{pal['text']};"
+            f"padding:{U.px(9)}px {U.px(18)}px;border-radius:{U.R('sm')}px;}}"
+            f"QMenu#inputModelMenu::item:checked{{background:{pal['accent_soft']};color:{pal['accent']};}}"
+            f"QMenu#inputModelMenu::item:selected{{background:{pal['accent_soft']};color:{pal['accent']};}}"
+            f"QMenu#inputModelMenu::item:disabled{{background:transparent;color:{pal['subtle']};"
+            f"padding:{U.px(5)}px {U.px(18)}px;}}"
+            f"QMenu#inputModelMenu::indicator{{width:{U.px(14)}px;height:{U.px(14)}px;}}"
+            f"QMenu#inputModelMenu::indicator:unchecked{{image:none;}}"
+            f'QMenu#inputModelMenu::indicator:checked{{image:url("{check}");}}'
+            f"QMenu#inputModelMenu::separator{{height:1px;background:{pal['input_border']};"
+            f"margin:{U.px(6)}px {U.px(10)}px;}}")
+        groups = self._input_model_groups()
+        for index, group in enumerate(groups):
+            if index:
+                menu.addSeparator()
+            heading = menu.addAction(group.get('provider_name') or self._provider_names.get(group['models'][0], '自定义供应商'))
+            heading.setEnabled(False)
+            heading.setFont(U.qfont('tiny'))
+            for model in group['models']:
+                action = menu.addAction(model)
+                action.setData(model)
+                action.setCheckable(True)
+                action.setChecked(model == self._active_model)
+                action.triggered.connect(lambda checked=False, name=model: self._switch_input_model(name))
+        if not groups:
+            empty = menu.addAction('暂无已启用的模型')
+            empty.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction('管理供应商和模型…', lambda: self.settings_btn.setChecked(True))
+        return menu
+
+    def _show_input_model_menu(self):
+        if getattr(self, '_input_model_menu', None):
+            self._input_model_menu.deleteLater()
+        menu = self._input_model_menu = self._build_input_model_menu()
+        screen = self.model_shortcut.screen().availableGeometry()
+        menu.setMaximumHeight(min(U.px(360), int(screen.height() * .65)))
+        menu.ensurePolished()
+        anchor = self.model_shortcut.mapToGlobal(QPoint(0, 0))
+        size = menu.sizeHint()
+        x = max(screen.left(), min(anchor.x(), screen.right() - size.width()))
+        y = max(screen.top(), anchor.y() - min(size.height(), menu.maximumHeight()) - U.px(6))
+        menu.popup(QPoint(x, y))
+
+    def _switch_input_model(self, model):
+        if model == self._active_model or model not in self._input_available_models():
+            return
+        self.model_shortcut.setEnabled(False)
+        self._spawn_cfg_worker({'model': model}, '/config',
+                               lambda data: self._on_input_model_switched(data, model))
+
+    def _on_input_model_switched(self, data, model):
+        self.model_shortcut.setEnabled(True)
+        if 'error' in data or data.get('backend_down'):
+            self.status.setText(data.get('error') or '模型切换失败')
+            return
+        self._active_model = data.get('model') or model
+        self._ingest_provider_groups(data)
+        self._update_model_shortcut()
+        self._refresh_saved_models(data.get('models') or self._saved_models, data.get('profile_labels'))
+        self.status.setText('已切换模型：' + self._active_model)
 
     def _toggle_key_visibility(self, shown: bool):
         self.api_key_edit.setEchoMode(
@@ -1773,55 +2666,68 @@ class AgentPanelWidget(QWidget):
 
     def _update_get_key_link(self, preset: str):
         url = PRESETS.get(preset, ("", "", ""))[2]
-        self.get_key_label.setText(f'<a href="{url}">获取密钥</a>' if url else "")
+        self.get_key_label.setText(
+            f'<a href="{url}" style="color:{self._pal()["accent"]};">获取密钥</a>' if url else "")
 
     def _on_preset(self, name: str):
         base, model, _ = PRESETS.get(name, ("", "", ""))
         if base:
+            if base != self.base_url_edit.text().strip():
+                self._reset_key_field()
             self.base_url_edit.setText(base)
-        if model:
+        if model and not self.model_combo.currentText().strip():
             self._set_model_combo_text(model)
         self._update_get_key_link(name)
 
     def _test_connection(self):
         """Probe {base_url}/models; on success render the checkable model list."""
-        payload = {"base_url": self.base_url_edit.text().strip()}
-        key = self.api_key_edit.text().strip()
-        if key:
-            payload["api_key"] = key
+        if self._profile_loading:
+            return
+        if not self.base_url_edit.text().strip():
+            self.cfg_hint.setText("请先填写供应商的 API 地址。")
+            return
+        payload = {"base_url": self.base_url_edit.text().strip(),
+                   "api_key": self.api_key_edit.text().strip()}
         self.test_btn.setEnabled(False)
         self.sync_btn.setEnabled(False)
         self.cfg_hint.setText("正在连接…")
-        self._spawn_cfg_worker(payload, "/test_connection", self._on_test_result)
+        request_id = self._profile_request_id
+        self._spawn_cfg_worker(payload, "/test_connection",
+                               lambda data: self._on_test_result(data, request_id, payload["base_url"]))
 
-    def _on_test_result(self, data: dict):
+    def _on_test_result(self, data: dict, request_id=None, requested_url=None):
+        if request_id is not None and request_id != self._profile_request_id:
+            return
         self.test_btn.setEnabled(True)
         self.sync_btn.setEnabled(True)
         if data.get("backend_down"):
             self._auto_revive(retry=self._test_connection)
             return
+        effective_url = data.get("base_url")
+        if (effective_url and requested_url is not None
+                and self.base_url_edit.text().strip() == requested_url):
+            self.base_url_edit.setText(effective_url)
         if data.get("ok"):
             models = data.get("models") or []
             current = self.model_combo.currentText().strip()
             # top combo: manual switching
             self.model_combo.clear()
             self.model_combo.addItems(models)
-            if current in models:
-                self._set_model_combo_text(current)
+            self._set_model_combo_text(current)
             # checklist: tick to use
-            self._populate_model_list(models)
+            self._populate_model_list(list(dict.fromkeys(self._editing_provider_models + models)))
             self.model_list_hint.setText(
                 f"共 {data.get('count', len(models))} 个模型（{data.get('latency_ms', '?')} ms）。"
-                "勾选即切换使用。"
+                "勾选多个模型，保存后在输入栏切换。"
             )
             self.cfg_hint.setText(
-                f"✅ 连接成功（{data.get('latency_ms', '?')} ms），已同步 {len(models)} 个模型。"
+                f"连接成功（{data.get('latency_ms', '?')} ms），已同步 {len(models)} 个模型。"
             )
             return
         if data.get("reachable"):
-            self.cfg_hint.setText(f"⚠ {data.get('error', '接口异常')}——地址可达，但没能取到模型列表。")
+            self.cfg_hint.setText(data.get("error") or "未能获取模型列表，请检查 API 地址或手动添加模型。")
         else:
-            self.cfg_hint.setText(f"❌ 连接失败：{data.get('error', '未知错误')}")
+            self.cfg_hint.setText(f"连接失败：{data.get('error', '未知错误')}")
 
     # ------------------------------------------------- model checklist
     def _populate_model_list(self, models: list):
@@ -1833,7 +2739,7 @@ class AgentPanelWidget(QWidget):
                 item = QListWidgetItem(str(name))
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(
-                    Qt.CheckState.Checked if str(name) == active else Qt.CheckState.Unchecked
+                    Qt.CheckState.Checked if str(name) in self._editing_provider_models else Qt.CheckState.Unchecked
                 )
                 self.model_list.addItem(item)
         finally:
@@ -1843,6 +2749,7 @@ class AgentPanelWidget(QWidget):
         self.model_search.setVisible(has)
         self._mark_active_model()
         self._filter_models(self.model_search.text())
+        self._adapt_responsive()
 
     def _checked_models(self) -> list:
         return [
@@ -1854,39 +2761,65 @@ class AgentPanelWidget(QWidget):
     def _on_model_item_changed(self, item: QListWidgetItem):
         if self._loading_models:
             return
-        checked = self._checked_models()
-        if item.checkState() == Qt.CheckState.Checked:
-            # ticking a model switches the active model immediately
-            self._set_model_combo_text(item.text())
-            self._apply_model_selection(item.text(), checked)
-        else:
-            # unticking only updates the persisted selection set
-            self._apply_model_selection(self.model_combo.currentText().strip(), checked)
+        self._editing_provider_models = self._checked_models()
+        self.cfg_hint.setText(f"已选择 {len(self._editing_provider_models)} 个模型，保存后可在输入栏切换。")
+
+    def _add_provider_model(self):
+        model = self.model_combo.currentText().strip()
+        if not model:
+            self.cfg_hint.setText('请输入模型名称')
+            return
+        selected = self._checked_models() if self.model_list.count() else self._editing_provider_models
+        self._editing_provider_models = list(dict.fromkeys(selected + [model]))
+        choices = [self.model_list.item(i).text() for i in range(self.model_list.count())]
+        self._populate_model_list(list(dict.fromkeys(choices + [model])))
+        self.cfg_hint.setText('已添加模型，保存后可在输入栏选择。')
 
     def _apply_model_selection(self, model: str, checked: list):
-        payload = {"models": checked}
+        payload = {"models": list(dict.fromkeys(self._saved_models + checked))}
         if model:
             payload["model"] = model
+        if model not in self._saved_models:
+            payload.update(base_url=self.base_url_edit.text().strip(),
+                           api_key=self.api_key_edit.text().strip(),
+                           provider_name=self.provider_name_edit.text().strip())
+        self._reset_key_field()
+        self.base_url_edit.clear()
+        self._set_editor_provider("")
+        self._profile_request_id += 1
+        request_id = self._profile_request_id
+        self._set_profile_loading(True)
         self.cfg_hint.setText("正在应用模型选择…")
         self._spawn_cfg_worker(payload, "/config",
-                               lambda data, m=model: self._on_model_selection_applied(data, m))
+                               lambda data, m=model: self._on_model_selection_applied(data, m, request_id))
 
-    def _on_model_selection_applied(self, data: dict, model: str):
+    def _on_model_selection_applied(self, data: dict, model: str, request_id=None):
+        same_editor = request_id is None or request_id == self._profile_request_id
+        if same_editor:
+            self._set_profile_loading(False)
         if data.get("backend_down"):
-            self._auto_revive()
+            if same_editor:
+                self._auto_revive()
             return
         if "error" in data:
-            self.cfg_hint.setText(f"应用失败：{data['error']}")
+            if same_editor:
+                self.cfg_hint.setText(f"应用失败：{data['error']}")
+                self.save_btn.setEnabled(False)
+            return
+        self._active_model = data.get("model") or model
+        self._update_model_shortcut()
+        self._refresh_saved_models(data.get("models") or self._saved_models + [model], data.get('profile_labels'))
+        if not same_editor:
             return
         self._mark_active_model()
         if model:
-            self.cfg_hint.setText(f"✅ 已切换使用模型 {model}")
+            self._edit_saved_model(model)
         else:
             self.cfg_hint.setText("已更新勾选的模型列表")
 
     def _mark_active_model(self):
         """Bold the checklist row matching the active model."""
-        active = self.model_combo.currentText().strip()
+        active = self._active_model
         bold = U.qfont("small", bold=True)
         plain = U.qfont("small")
         self._loading_models = True
@@ -1894,7 +2827,7 @@ class AgentPanelWidget(QWidget):
             for i in range(self.model_list.count()):
                 item = self.model_list.item(i)
                 item.setFont(bold if item.text() == active else plain)
-                item.setToolTip("当前使用" if item.text() == active else "勾选使用")
+                item.setToolTip("当前使用" if item.text() == active else "勾选加入供应商的模型列表")
         finally:
             self._loading_models = False
 
@@ -1905,41 +2838,61 @@ class AgentPanelWidget(QWidget):
             item.setHidden(bool(text) and text not in item.text().lower())
 
     def _save_settings(self):
-        if self.model_list.isVisible():
-            checked = self._checked_models()
-            models = checked or [self.model_combo.itemText(i) for i in range(self.model_combo.count())]
+        if self._profile_loading:
+            return
+        model = self.model_combo.currentText().strip()
+        if not model or not self.base_url_edit.text().strip():
+            self.cfg_hint.setText("请填写模型名称和 API 地址。")
+            return
+        models = self._checked_models() if self.model_list.isVisible() else []
+        if self.model_list.count():
+            if not models:
+                self.cfg_hint.setText('请至少勾选一个模型')
+                return
+            model = self._active_model if self._active_model in models else model if model in models else models[0]
         else:
-            models = [self.model_combo.itemText(i) for i in range(self.model_combo.count())]
+            models = [model]
         payload = {
             "base_url": self.base_url_edit.text().strip(),
-            "model": self.model_combo.currentText().strip(),
-            "models": models,
+            "model": model,
+            "models": list(dict.fromkeys(self._saved_models + models + [model])),
         }
-        key = self.api_key_edit.text().strip()
-        if key:
-            payload["api_key"] = key
+        payload["api_key"] = self.api_key_edit.text().strip()
+        payload["provider_enabled"] = self.provider_enabled.isChecked()
+        payload["provider_name"] = self.provider_name_edit.text().strip() or self.preset_combo.currentText()
+        payload['provider_models'] = models
+        payload['provider_model'] = self._editor_model
         self.save_btn.setEnabled(False)
         self.cfg_hint.setText("保存中…")
-        self._spawn_cfg_worker(payload, "/config", self._on_config_saved)
+        self._spawn_cfg_worker(payload, "/config",
+                               lambda data, p=payload, r=self._profile_request_id:
+                               self._on_config_saved(data, p, r))
 
-    def _on_config_saved(self, data: dict):
-        self.save_btn.setEnabled(True)
+    def _on_config_saved(self, data: dict, saved_profile=None, request_id=None):
+        same_editor = request_id is None or request_id == self._profile_request_id
+        self.save_btn.setEnabled(not self._profile_loading)
         if data.get("backend_down"):
-            self._auto_revive(retry=self._save_settings)
+            if same_editor:
+                self._auto_revive(retry=self._save_settings)
             return
         if "error" in data:
-            self.cfg_hint.setText(f"保存失败：{data['error']}")
+            if same_editor:
+                self.cfg_hint.setText(f"保存失败：{data['error']}")
             return
-        self.api_key_edit.clear()
-        self.api_key_edit.setPlaceholderText(
-            f"已保存 {data.get('api_key_hint', '')}；留空表示不修改"
-            if data.get("has_key")
-            else "尚未保存"
-        )
-        self.cfg_hint.setText("已保存并生效")
-        # close the loop: after first successful save, fetch the model list
-        if self.model_list.count() == 0:
-            self._test_connection()
+        self._active_model = data.get("model") or (saved_profile or {}).get("model") or self.model_combo.currentText().strip()
+        self._ingest_provider_groups(data)
+        self._update_model_shortcut()
+        self._refresh_saved_models(data.get("models") or self._saved_models + [self._active_model],
+                                   data.get('profile_labels') or {self._active_model: (saved_profile or {}).get('provider_name', '')})
+        if not same_editor:
+            return
+        self._editor_model = self._active_model
+        self._editing_provider_models = list((saved_profile or {}).get('provider_models') or self._provider_models_for(self._active_model))
+        self.key_eye.setChecked(False)
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.cfg_hint.clear()
+        self._update_provider_heading(self.provider_name_edit.text())
+        self.model_editor_hint.setText("编辑后点击保存并应用，即可使用该模型。")
 
     # ------------------------------------------------------- self-healing
     def _auto_revive(self, retry=None):
@@ -1950,10 +2903,11 @@ class AgentPanelWidget(QWidget):
             if retry:
                 QTimer.singleShot(0, retry)
             return
+        if retry:
+            self._revive_retries.append(retry)
         if self._reviving:
             return
         self._reviving = True
-        self._revive_retry = retry
         self.cfg_hint.setText("检测到后端未运行，正在自动启动…")
         self._revive_bridge = _ReviveBridge()
         self._revive_bridge.done.connect(self._on_revived)
@@ -1963,17 +2917,870 @@ class AgentPanelWidget(QWidget):
 
     def _on_revived(self, ok: bool, msg: str):
         self._reviving = False
+        retries, self._revive_retries = self._revive_retries, []
         if ok:
-            retry, self._revive_retry = self._revive_retry, None
-            self.cfg_hint.setText("✅ 后端已自动启动" + ("，正在重试…" if retry else ""))
-            if retry:
+            self.cfg_hint.setText("后端已自动启动" + ("，正在重试…" if retries else ""))
+            for retry in retries:
                 QTimer.singleShot(0, retry)
         else:
-            self.cfg_hint.setText(f"❌ {msg}（可手动运行 start_backend.bat 查看错误）")
+            self.cfg_hint.setText(f"{msg}（可手动运行 start_backend.bat 查看错误）")
+
+    # ------------------------------------------------- 模型压缩包附件
+    # 落点选了三处：会话区（QListWidget 的 viewport 才是真正的拖放接收者）、
+    # 输入框、以及整个面板。三处都装同一个过滤器，用户拖到哪都能放；
+    # 过滤只在"确实是 ZIP"时接管，其余事件原样放行（见 model_attachments）。
+    def _install_drop_targets(self):
+        self._drop_filter = MA.ZipDropFilter(self._on_zip_dropped,
+                                            self._on_non_zip_dropped, self)
+        for widget in (self.chat, self.chat.viewport(), self.input,
+                       self.input_frame):
+            try:
+                widget.setAcceptDrops(True)
+                widget.installEventFilter(self._drop_filter)
+            except (AttributeError, TypeError):
+                pass       # 宿主控件不支持拖放时不该把面板搞崩
+
+    def _on_pick_zip(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择模型压缩包", "", "ZIP 文件 (*.zip)")
+        if path:
+            self._start_zip_upload(path)
+
+    def _on_pasted_files(self, paths: list):
+        """粘贴文件时只接受 ZIP，绝不把本地路径写进聊天正文。"""
+        zips = [path for path in paths if MA.is_zip_path(path)]
+        others = [path for path in paths if not MA.is_zip_path(path)]
+        if zips:
+            self._on_zip_dropped(zips)
+        if others:
+            self._on_non_zip_dropped(others)
+
+    def _refresh_composer_attachments(self):
+        """重绘输入栏里的文件缩略卡片，卡片只显示当前聊天的附件。"""
+        layout = self.composer_attachment_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        active = self.projects_data.get("active")
+        records = [r for r in self._composer_attachments
+                   if r.get("project") == active]
+        pal = self._pal()
+        for record in records:
+            entry = record["entry"]
+            meta = entry.setdefault("meta", {})
+            card = QFrame()
+            card.setObjectName("composerAttachmentCard")
+            card.setFixedSize(U.px(154), U.px(88))
+            card.setToolTip(str(meta.get("filename") or entry.get("text") or "模型 ZIP"))
+            card.setStyleSheet(
+                f"QFrame#composerAttachmentCard{{background:{pal['card_bg']};"
+                f"border:1px solid {pal['card_border']};"
+                f"border-radius:{U.R('md')}px;}}"
+            )
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(U.px(6), U.px(3), U.px(6), U.px(4))
+            card_layout.setSpacing(0)
+            top = QHBoxLayout()
+            top.addStretch(1)
+            remove = QToolButton()
+            remove.setText("×")
+            remove.setAccessibleName("移除待发送附件")
+            remove.setToolTip("从本次消息中移除")
+            remove.setCursor(Qt.CursorShape.PointingHandCursor)
+            remove.setFixedSize(U.px(20), U.px(20))
+            remove.setStyleSheet(f"QToolButton{{color:{pal['subtle']};border:none;"
+                                  f"font-size:{U.fs('body')}px;}}"
+                                  f"QToolButton:hover{{color:{pal['accent']};}}")
+            remove.clicked.connect(lambda _checked=False, r=record:
+                                   self._remove_composer_attachment(r))
+            top.addWidget(remove)
+            card_layout.addLayout(top)
+            icon = QLabel()
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon.setPixmap(_draw_icon("document", pal["subtle"], U.px(24)).pixmap(
+                U.px(24), U.px(24)))
+            card_layout.addWidget(icon, 1)
+            filename = str(meta.get("filename") or entry.get("text") or "模型 ZIP")
+            status = str(meta.get("state_label") or "上传中")
+            if meta.get("state") == "uploading":
+                status = f"上传中 {int(meta.get('upload_percent') or 0)}%"
+            label = QLabel(filename)
+            label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            label.setToolTip(filename)
+            label.setFont(U.qfont("tiny"))
+            label.setStyleSheet(f"color:{pal['text']};background:transparent;border:none;")
+            label.setText(label.fontMetrics().elidedText(
+                filename, Qt.TextElideMode.ElideMiddle, U.px(138)))
+            card_layout.addWidget(label)
+            detail = QLabel(status)
+            detail.setFont(U.qfont("tiny"))
+            detail.setStyleSheet(f"color:{pal['subtle']};background:transparent;border:none;")
+            card_layout.addWidget(detail)
+            layout.addWidget(card)
+        layout.addStretch(1)
+        self.composer_attachment_strip.setVisible(bool(records))
+
+    def _remove_composer_attachment(self, record: dict):
+        """取消这份 ZIP 随下一条消息发送；已上传的会话资产卡片继续保留。"""
+        if record in self._composer_attachments:
+            self._composer_attachments.remove(record)
+        self._composer_removed_entries.add(id(record.get("entry")))
+        package_id = str((record.get("entry", {}).get("meta") or {}).get("package_id") or "")
+        project = record.get("project")
+        if package_id and project in self._pending_attachments:
+            self._pending_attachments[project] = [
+                item for item in self._pending_attachments[project]
+                if str(item.get("package_id") or "") != package_id
+            ]
+        self._refresh_composer_attachments()
+
+    def _on_non_zip_dropped(self, paths: list):
+        """拖进来的不是 ZIP：明确说不支持，不静默忽略（用户会以为发出去了）。"""
+        names = "、".join(os.path.basename(p) for p in paths[:3])
+        self._add_entry("note",
+                        f"首版只支持 ZIP 模型压缩包，收到的是：{names}。"
+                        f"其它压缩格式（tar / rar / 7z）暂不支持。")
+
+    def _on_zip_dropped(self, paths: list):
+        for path in paths:
+            self._start_zip_upload(path)
+
+    def _start_zip_upload(self, path: str, project: str | None = None,
+                          entry: dict | None = None,
+                          automatic_retry: bool = False):
+        """上传一个 ZIP：先落一张"上传中"的卡片，再起后台线程传字节流。
+
+        卡片在**上传开始前**就建出来：几十 MB 的包要传一会儿，用户需要马上
+        看到"这件事正在发生"，而不是点完按钮后界面毫无反应。
+
+        ``project`` 是这条附件归属的聊天项目（重试时必须传**原项目**，不能拿
+        "此刻屏幕上那一个"）；``entry`` 给定时**就地重传同一张卡片**（重试不
+        该再叠一张新卡片出来，否则一次失败就在会话里留下两三个同名包）。
+        """
+        if not MA.is_zip_path(path):
+            self._on_non_zip_dropped([path])
+            return
+        project = project or self.projects_data.get("active")
+        if entry is None:
+            entry = {
+                "kind": "attachment",
+                "text": os.path.basename(path),
+                "meta": {"filename": os.path.basename(path), "state": "uploading",
+                         "state_label": "上传中", "upload_percent": 0,
+                         "size_bytes": _safe_size(path)},
+                "expanded": True,
+            }
+            if not self._add_entry("attachment", entry["text"], project,
+                                   payload=None, raw_entry=entry):
+                return
+        else:
+            meta = entry.setdefault("meta", {})
+            meta.update({"state": "uploading", "state_label": "上传中",
+                         "upload_percent": 0, "error": "", "message": "",
+                         "missing": False, "missing_reason": ""})
+        if not automatic_retry:
+            entry["meta"].pop("automatic_retry_count", None)
+        worker = MA.UploadWorker(
+            path, base=_backend_base(), auth=_auth_header(),
+            session=project or "")
+        # 记住本地路径：上传失败时"重试"要能重传同一个文件。放在 entry 里
+        # 而不是闭包里，是为了让失败回执（另一个回调）也能拿到它。
+        entry["meta"]["local_path"] = path
+        record = next((r for r in self._composer_attachments
+                       if r.get("entry") is entry), None)
+        if record is None and not automatic_retry:
+            self._composer_attachments.append({"project": project, "entry": entry})
+        if not automatic_retry:
+            self._composer_removed_entries.discard(id(entry))
+        self._refresh_composer_attachments()
+        self._touch_attachment(entry, project)
+        # 用默认参数把项目名与 entry 绑进回调：上传期间切换项目，状态仍然
+        # 写回**发起上传时**的那个项目（与 _on_event 的既有做法一致）。
+        worker.result.connect(
+            lambda data, e=entry, p=project: self._on_upload_done(e, p, data))
+        worker.progress.connect(
+            lambda sent, total, e=entry: self._on_upload_progress(e, sent, total))
+        worker.finished.connect(lambda w=worker: self._gc_attach_worker(w))
+        self._attach_workers.append(worker)
+        worker.start()
+        self.status.setText(f"正在上传 {entry['text']} …（只保存文件并检查包结构，"
+                            f"不解压、不挂库）")
+
+    def _gc_attach_worker(self, worker):
+        if worker in self._attach_workers:
+            self._attach_workers.remove(worker)
+
+    def _on_upload_progress(self, entry: dict, sent: int, total: int):
+        meta = entry.setdefault("meta", {})
+        meta["upload_percent"] = int(sent * 100 / max(1, total))
+        found = self._row_for_entry(entry)
+        if found is not None:
+            found[0].set_progress(sent, total)
+        self._refresh_composer_attachments()
+
+    def _row_for_entry(self, entry: dict):
+        """找这条 entry 当前对应的行控件与它的 item（找不到返回 None）。"""
+        for i in range(self.chat.count()):
+            item = self.chat.item(i)
+            widget = self.chat.itemWidget(item)
+            if getattr(widget, "entry", None) is entry:
+                return widget, item
+        return None
+
+    def _on_upload_done(self, entry: dict, project: str | None, data: dict):
+        """上传回执：把真实结果如实写回卡片，不把失败说成成功。"""
+        meta = entry.setdefault("meta", {})
+        if not data.get("ok"):
+            # 409 no_workspace：没有打开工作区时**不**存到任何默认目录
+            if data.get("kind") == "no_workspace":
+                meta["error"] = MA.NO_WORKSPACE_HINT
+                meta["message"] = str(data.get("error") or "")
+                meta["state"], meta["state_label"] = "failed", "未上传"
+                message = "⚠ " + MA.NO_WORKSPACE_HINT
+            else:
+                meta["error"] = str(data.get("error") or "上传失败")
+                meta["state"], meta["state_label"] = "failed", "上传失败"
+                message = f"上传失败：{meta['error']}"
+            self._touch_attachment(entry, project)
+            self._refresh_composer_attachments()
+            if data.get("backend_down"):
+                retry_count = int(meta.get("automatic_retry_count") or 0)
+                path = str(meta.get("local_path") or "")
+                if path and os.path.isfile(path) and retry_count < 1:
+                    meta["automatic_retry_count"] = retry_count + 1
+                    self.status.setText(
+                        f"{entry.get('text') or '模型 ZIP'}上传连接中断，"
+                        "正在恢复连接并自动重试（最多一次）…")
+                    self._auto_revive(retry=lambda p=path, e=entry, owner=project:
+                                      self._start_zip_upload(
+                                          p, project=owner, entry=e,
+                                          automatic_retry=True))
+                else:
+                    reason = "上传连接仍未恢复" if data.get("connection_interrupted") \
+                        else "后端仍无法连接"
+                    self.status.setText(f"{reason}：{meta.get('error') or '请检查后端状态'}；"
+                                        "可点击卡片上的「重试」再次上传。")
+                    self._auto_revive()
+            elif project == self.projects_data.get("active"):
+                self.status.setText(message)
+            return
+
+        package = dict(data.get("package") or {})
+        workspace = str(data.get("workspace") or package.get("workspace") or "")
+        meta.update({
+            "filename": package.get("filename") or meta.get("filename"),
+            "size_bytes": package.get("size_bytes") or meta.get("size_bytes"),
+            "package_kind": package.get("package_kind"),
+            "package_kind_label": package.get("package_kind_label"),
+            "vendor": package.get("vendor"),
+            "version": package.get("version"),
+            "state": package.get("state") or "saved",
+            "state_label": package.get("state_label"),
+            "model_count": package.get("model_count") or 0,
+            "workspace": workspace,
+            "upload_percent": 100,
+            "message": str(data.get("message") or ""),
+            "library_backup": dict(data.get("shared_library_backup") or {}),
+        })
+        if data.get("scan_note"):
+            meta["message"] = ((meta["message"] + " ") if meta["message"] else "") \
+                + str(data["scan_note"])
+        if data.get("backup_note"):
+            meta["message"] = ((meta["message"] + " ") if meta["message"] else "") \
+                + str(data["backup_note"])
+        package_id = str(package.get("package_id") or "")
+        meta["package_id"] = package_id
+        # 本地路径只是"上传失败时重试用"，成功后就没用了 —— 不留在
+        # projects.json 里（那是用户的磁盘布局，不该被会话文件记下来）。
+        meta.pop("local_path", None)
+        meta.pop("automatic_retry_count", None)
+        entry["text"] = str(meta.get("filename") or entry.get("text") or "")
+        queued_for_composer = id(entry) not in self._composer_removed_entries
+        if package_id and queued_for_composer:
+            # 记住待发送：用户可以只点发送、不打字（附件独立发送）。
+            # 挂在**这条附件所属的项目**名下：另一个聊天里按发送不该带上它。
+            self._pending_attachments.setdefault(project or
+                                                 self.projects_data.get("active"),
+                                                 []).append(
+                {"package_id": package_id, "meta": dict(meta)})
+        self._touch_attachment(entry, project)
+        self._refresh_composer_attachments()
+        reused = "（这份 ZIP 之前已上传过，复用了已有记录）" if data.get("reused") else ""
+        if project == self.projects_data.get("active"):
+            self.status.setText(
+                f"已上传 {meta['filename']}{reused} —— 已保存到工作区，"
+                f"未解压、未加载。需要时点卡片上的「解压并导入」。")
+
+    def _touch_attachment(self, entry: dict, project: str | None) -> None:
+        """附件卡片状态变化后重画。
+
+        优先**就地刷新那一行**：导入轮询每1.6s 一次，整表重建会让会话区
+        持续重排，用户正在读的消息也会被反复打断。找不到行（刚插入、切换
+        项目后重建）才退回整表重建。
+        后台项目的附件只更新数据不重绘 —— 与 _on_event 里"事件写回原项目、
+        只在它前台时渲染"是同一条原则。
+        """
+        active = self.projects_data.get("active")
+        if (project or active) != active:
+            self._save_projects()
+            return
+        found = self._row_for_entry(entry)
+        if found is None:
+            self._rebuild()
+        else:
+            row, item = found
+            row.refresh()
+            row.reflow(max(self.chat.viewport().width() - U.P("xs"), U.px(240)), item)
+        self._save_projects()
+
+    # ---------------------------------------------------------- 卡片动作
+    def _attachment_actions(self) -> dict:
+        return {"import": self._attach_import, "view": self._attach_view,
+                "open": self._attach_open,
+                "resume": self._attach_resume,
+                "cancel": self._attach_cancel, "retry": self._attach_retry,
+                "refresh": self._attach_refresh}
+
+    def _attach_resume(self, entry: dict):
+        """从模型包的候选列表中选定 Design Kit 根目录并继续导入。"""
+        from PySide6.QtWidgets import QInputDialog
+        import uuid as _uuid
+
+        meta = entry.setdefault("meta", {})
+        detection = meta.get("detection") or {}
+        candidates = detection.get("kit_roots") or detection.get("kit_root_candidates") or []
+        candidates = [str(x) for x in candidates if str(x).strip()]
+        if not detection.get("kit_root_ambiguous") or len(candidates) < 2:
+            self.status.setText("没有多个候选套件目录可供选择，请先查看并刷新模型包详情")
+            return
+        selected, accepted = QInputDialog.getItem(
+            self, "选择 Design Kit 目录", "请选择要导入的套件根目录：",
+            candidates, 0, False)
+        if not accepted or not selected:
+            return
+        package_id = str(meta.get("package_id") or "")
+        project = self._owning_project(entry)
+        meta["state"], meta["state_label"] = "importing", "导入中"
+        meta["message"] = f"正在使用所选目录继续导入：{selected}"
+        self._touch_attachment(entry, project)
+        self._attach_poll_ticks[package_id] = 0
+        if not self._attach_poll.isActive():
+            self._attach_poll.start()
+        self._spawn_model_worker(
+            {"package_id": package_id, "kit_root": selected,
+             "request_id": _uuid.uuid4().hex}, "/models/import",
+            lambda data, e=entry, p=project: self._on_import_ack(e, p, data))
+
+    def _attach_import(self, entry: dict):
+        meta = entry.setdefault("meta", {})
+        package_id = str(meta.get("package_id") or "")
+        if not package_id:
+            self.status.setText("这张附件没有 package_id（上传还没完成或已失败），"
+                                "无法导入")
+            return
+        if meta.get("missing"):
+            # 资产不在当前工作区里：导入一定失败，不如直说，省得白等一轮
+            reason = str(meta.get("missing_reason") or "")
+            if meta.get("workspace_mismatch"):
+                self.status.setText(reason or "这个包不属于当前工作区，无法导入")
+            else:
+                self.status.setText("这个包的资产已不在当前工作区，重新导入没有意义 ——"
+                                    "请在原来那个工作区里操作，或重新上传该 ZIP")
+            return
+        project = self._owning_project(entry)
+        meta["state"], meta["state_label"] = "importing", "导入中"
+        meta["error"] = ""
+        self._touch_attachment(entry, project)
+        self.status.setText("已请求导入（后台执行，解压 + 建索引 + 挂接 ADS 工作区）…")
+        # 先把轮询点起来再发请求：万一回执丢了（后端重启、网络断），
+        # 卡片也不会永远停在"导入中" —— 轮询会把它推到真实状态。
+        self._attach_poll_ticks[package_id] = 0
+        if not self._attach_poll.isActive():
+            self._attach_poll.start()
+        self._spawn_model_worker({"package_id": package_id}, "/models/import",
+                                 lambda data, e=entry, p=project:
+                                 self._on_import_ack(e, p, data))
+
+    def _on_import_ack(self, entry: dict, project: str | None, data: dict):
+        meta = entry.setdefault("meta", {})
+        if not data.get("ok"):
+            meta["state"], meta["state_label"] = "failed", "导入失败"
+            meta["error"] = str(data.get("error") or "导入请求失败")
+            self._touch_attachment(entry, project)
+            if data.get("backend_down"):
+                self._auto_revive()
+            return
+        package_id = str(meta.get("package_id") or "")
+        op_id = str(data.get("op_id") or "")
+        if op_id:
+            self._attach_op[package_id] = op_id
+        meta["message"] = str(data.get("message") or "导入已开始（后台执行）")
+        self._touch_attachment(entry, project)
+        self._attach_poll_ticks[package_id] = 0
+        if not self._attach_poll.isActive():
+            self._attach_poll.start()
+
+    def _on_attach_poll_tick(self):
+        """轮询所有"仍在动"的包的状态。
+
+        跨项目收集：导入是后台长任务，用户中途切到别的项目不该让轮询断掉
+        （否则那条导入的状态就永远停在"导入中"）。
+
+        两个必要的去重：
+          * 同一个包被多个聊天引用时只发**一次**请求（否则 N 个聊天就是 N 倍
+            请求，状态更新还互相覆盖）；
+          * 上一次清单请求还没回来就不重复发（1.6s 一个 tick，慢后端会积压）。
+        """
+        targets = self._attachments_needing_poll()
+        if not targets:
+            self._attach_poll.stop()
+            return
+        by_id: dict = {}
+        for entry, project in targets:
+            package_id = str((entry.get("meta") or {}).get("package_id") or "")
+            if package_id:
+                by_id.setdefault(package_id, []).append((entry, project))
+        keep_polling = False
+        for package_id, owners in by_id.items():
+            self._attach_poll_ticks[package_id] = \
+                self._attach_poll_ticks.get(package_id, 0) + 1
+            if self._attach_poll_ticks[package_id] > MA.POLL_MAX_TICKS:
+                for entry, project in owners:
+                    (entry.setdefault("meta", {}))["message"] = (
+                        "已停止自动刷新导入进度（超过约 "
+                        f"{MA.POLL_MAX_TICKS * MA.POLL_INTERVAL_MS // 60000}"
+                        " 分钟）。可以点「刷新状态」手动查一次，"
+                        "或到工作区的模型目录里看实际结果。")
+                    self._touch_attachment(entry, project)
+                continue
+            keep_polling = True
+            if package_id in self._attach_inflight:
+                continue        # 上一次还没回来，这一拍跳过（不重复发请求）
+            self._attach_inflight.add(package_id)
+            self._spawn_model_worker(None, MA.packages_path(),
+                                     lambda data, pid=package_id:
+                                     self._on_packages(data, pid))
+        if not keep_polling:
+            # 所有还在动的包都超过了上限：停掉定时器，别空转
+            self._attach_poll.stop()
+
+    def _attachments_needing_poll(self) -> list:
+        """所有项目里状态仍是"导入中/检查中"的附件 [(entry, project)]。"""
+        out = []
+        for name, proj in (self.projects_data.get("projects") or {}).items():
+            for entry in (proj.get("entries") or []):
+                meta = entry.get("meta") or {}
+                if entry.get("kind") == "attachment" and \
+                        str(meta.get("state") or "") in MA.POLL_ACTIVE_STATES:
+                    out.append((entry, name))
+        return out
+
+    def _on_packages(self, data: dict, package_id: str,
+                     project: str | None = None):
+        """用 /models/packages 的最新 state 刷新卡片。
+
+        只更新**状态与计数**，不整表重建：轮询每 1.6s 一次，整表重建会让
+        会话区持续重排（用户正在读别的消息也会被打断）。
+
+        同一个包被多个聊天引用时**每个引用都要刷新**（只刷第一个的话，别的
+        聊天里那张卡片会永远停在旧状态）。
+        """
+        self._attach_inflight.discard(package_id)
+        if not data.get("ok"):
+            return
+        packages = {str(p.get("package_id")): p
+                    for p in (data.get("packages") or []) if isinstance(p, dict)}
+        live = packages.get(package_id)
+        owners = self._find_attachments(package_id)
+        if not owners:
+            return
+        truncated = MA.listing_truncated(data)
+        for entry, owner in owners:
+            meta = entry.setdefault("meta", {})
+            if live is None:
+                if truncated:
+                    # 这一页被上限截断了：没出现 ≠ 没了。如实说"没确认"，
+                    # 绝不能把好包标成资产丢失。
+                    meta["message"] = (
+                        f"本次只核对了清单里前 {data.get('returned')} 个包"
+                        f"（共 {data.get('total')} 个），这个包不在这一页里，"
+                        "暂时无法确认它是否还在 —— 可点「刷新状态」再查一次。")
+                    self._touch_attachment(entry, owner)
+                    continue
+                # 轮询时包从清单里消失：如实说不可用，不假装还在导入
+                meta["missing"] = True
+                meta["missing_reason"] = "当前工作区的模型清单里已经没有这个包"
+                meta["state"], meta["state_label"] = "missing", "资产已不可用"
+                self._touch_attachment(entry, owner)
+                continue
+            state = str(live.get("state") or "")
+            meta.update({
+                "state": state or meta.get("state"),
+                "state_label": live.get("state_label") or meta.get("state_label"),
+                "model_count": live.get("model_count", meta.get("model_count")),
+                "package_kind": live.get("package_kind") or meta.get("package_kind"),
+                "package_kind_label": live.get("package_kind_label")
+                                      or meta.get("package_kind_label"),
+                # 清单里也带挂接结果：轮询到"待验证/已就绪"后，「在 ADS 元件
+                # 列表中打开」无需等用户先点「查看模型」就该出现。
+                "library_attach": live.get("library_attach")
+                                  or meta.get("library_attach"),
+                "missing": False,
+                "workspace_mismatch": False,
+            })
+            if live.get("last_error"):
+                meta["error"] = str(live["last_error"])
+            self._touch_attachment(entry, owner)
+            if (state == "awaiting_user" and not meta.get("detection")
+                    and not meta.get("kit_root_lookup_pending")):
+                meta["kit_root_lookup_pending"] = True
+                self._spawn_model_worker(
+                    None, f"/models/package?id={package_id}",
+                    lambda detail, e=entry, p=owner:
+                    self._on_package_detail(e, p, detail))
+
+    def _attach_view(self, entry: dict):
+        """查看模型：拉包详情（识别依据 + 型号索引）并就地展开。"""
+        package_id = str((entry.get("meta") or {}).get("package_id") or "")
+        if not package_id:
+            self.status.setText("这张附件没有 package_id，无法查看模型清单")
+            return
+        entry["expanded"] = True
+        project = self._owning_project(entry)
+        # 展开状态改了要立刻重画（折叠头要翻向、详情区要露出来），
+        # 等回执到再画会让用户以为"点了没反应"
+        self._touch_attachment(entry, project)
+        self.status.setText("正在读取模型包清单…")
+        self._spawn_model_worker(
+            None, f"/models/package?id={package_id}",
+            lambda data, e=entry, p=project: self._on_package_detail(e, p, data))
+
+    def _on_package_detail(self, entry: dict, project: str | None, data: dict):
+        meta = entry.setdefault("meta", {})
+        meta["kit_root_lookup_pending"] = False
+        if not data.get("ok"):
+            meta["error"] = str(data.get("error") or "读取失败")
+            self._touch_attachment(entry, project)
+            if data.get("backend_down"):
+                self._auto_revive()
+            return
+        package = dict(data.get("package") or {})
+        for key in ("state", "state_label", "model_count", "package_kind",
+                    "package_kind_label", "vendor", "version", "last_error"):
+            if package.get(key) is not None:
+                meta[key] = package[key]
+        meta["detection"] = package.get("detection") or {}
+        meta["models"] = package.get("models") or []
+        meta["models_truncated"] = package.get("models_truncated") or 0
+        if package.get("validation"):
+            meta["validation"] = package["validation"]
+        # 挂接结果（哪些库已挂到工作区）决定「在 ADS 元件列表中打开」是否可点，
+        # 必须随详情一起落到卡片 meta 里。
+        if package.get("library_attach") is not None:
+            meta["library_attach"] = package["library_attach"]
+        if not meta.get("workspace") and package.get("workspace"):
+            meta["workspace"] = package["workspace"]
+        self._touch_attachment(entry, project)
+        self._sync_sibling_cards(entry, meta)
+        if project == self.projects_data.get("active"):
+            self.status.setText(
+                f"已读取 {meta.get('filename') or '该模型包'} 的清单："
+                f"{meta.get('model_count') or len(meta.get('models') or [])} 个型号")
+
+    def _attach_open(self, entry: dict):
+        """在 ADS 元件列表中打开：请后端把该包已挂接的库在原生入口里打开/置前。
+
+        与「查看模型」同一套后台请求（**不经 LLM**）：只把后端返回的结构化
+        证据（boot.loaded / native.* / limits）如实渲染到卡片详情区。原生打开
+        是长任务，超时按契约给足（后端 ≥240s）。
+        """
+        meta = entry.setdefault("meta", {})
+        package_id = str(meta.get("package_id") or "")
+        if not package_id:
+            self.status.setText("这张附件没有 package_id，无法请求在 ADS 元件列表中打开")
+            return
+        if meta.get("missing"):
+            self.status.setText("这个包的资产不在当前工作区，无法在 ADS 元件列表中打开")
+            return
+        entry["expanded"] = True
+        project = self._owning_project(entry)
+        # 先写"请求中"再重画：等回执到才动会让用户以为点了没反应。
+        # 注意**不**碰 meta["error"]：那是导入失败的口径，打开失败不该把
+        # 整张卡片误标成"导入失败"。
+        meta["native_list"] = {"ok": True, "outcome": "",
+                               "message": "正在请求 ADS 打开元件列表…"}
+        self._touch_attachment(entry, project)
+        self.status.setText("已请求在 ADS 元件列表中打开（后台执行，会打开/置前原生入口）…")
+        self._spawn_model_worker(
+            {"package_id": package_id}, "/models/open",
+            lambda data, e=entry, p=project: self._on_open_result(e, p, data),
+            timeout=300)
+
+    def _on_open_result(self, entry: dict, project: str | None, data: dict):
+        meta = entry.setdefault("meta", {})
+        if not data.get("ok"):
+            # 请求层失败（HTTP/连接）：错误留在 native_list 里，不动 meta["error"]。
+            meta["native_list"] = {
+                "ok": False, "outcome": "failed",
+                "error": str(data.get("error") or "打开请求失败")}
+            self._touch_attachment(entry, project)
+            if data.get("backend_down"):
+                self._auto_revive()
+            return
+        result = data.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        result = dict(result)
+        result.setdefault("ok", True)
+        meta["native_list"] = result
+        # 后端同时回带最新清单视图：顺手把状态/挂接结果刷新，避免卡片停在旧值。
+        package = dict(data.get("package") or {})
+        for key in ("state", "state_label", "model_count", "package_kind",
+                    "package_kind_label", "last_error"):
+            if package.get(key) is not None:
+                meta[key] = package[key]
+        if package.get("library_attach") is not None:
+            meta["library_attach"] = package["library_attach"]
+        self._touch_attachment(entry, project)
+        self._sync_sibling_cards(entry, meta)
+        if project == self.projects_data.get("active"):
+            self.status.setText(
+                f"已请求在 ADS 元件列表中打开 {meta.get('filename') or '该模型包'}："
+                f"{result.get('outcome') or '已返回结果'}")
+
+    def _sync_sibling_cards(self, entry: dict, meta: dict) -> None:
+        """同一个包在别的聊天里也有卡片时，把状态同步过去。
+
+        只同步"这个包是什么状态"这类事实（state / 型号数 / 类型），**不**把
+        型号清单本身复制到每张卡片 —— 那是几 KB 到几十 KB 的重复，会白白把
+        projects.json 撑大。
+        """
+        package_id = str(meta.get("package_id") or "")
+        if not package_id:
+            return
+        for other, owner in self._find_attachments(package_id):
+            if other is entry:
+                continue
+            other_meta = other.setdefault("meta", {})
+            touched = False
+            for key in ("state", "state_label", "model_count",
+                        "package_kind_label"):
+                if meta.get(key) is not None and meta.get(key) != other_meta.get(key):
+                    other_meta[key] = meta[key]
+                    touched = True
+            if touched:
+                self._touch_attachment(other, owner)
+
+    def _attach_cancel(self, entry: dict):
+        package_id = str((entry.get("meta") or {}).get("package_id") or "")
+        op_id = self._attach_op.get(package_id)
+        if not op_id:
+            self.status.setText("这次导入没有可取消的操作号（可能已经结束）")
+            return
+        project = self._owning_project(entry)
+        meta = entry.setdefault("meta", {})
+        # 文案必须区分"已请求取消"与"已完成的前置步骤保留"：解压到一半的
+        # 目录不会自动回滚，说成"已完全取消"是不诚实的。
+        meta["message"] = ("已请求取消导入。已完成的前置步骤（解压、建索引）"
+                           "会保留，取消后不会继续进入仿真。")
+        self._touch_attachment(entry, project)
+        self.status.setText("已请求取消导入…")
+        self._spawn_model_worker({"op_id": op_id}, "/models/cancel",
+                                 lambda data, e=entry, p=project:
+                                 self._on_cancel_ack(e, p, data))
+
+    def _on_cancel_ack(self, entry: dict, project: str | None, data: dict):
+        meta = entry.setdefault("meta", {})
+        if data.get("ok") is False and not data.get("known"):
+            meta["message"] = "该导入操作已经结束或不存在（可能已经完成）"
+        elif not data.get("ok"):
+            meta["error"] = str(data.get("error") or "取消失败")
+        self._touch_attachment(entry, project)
+
+    def _attach_retry(self, entry: dict):
+        """失败后的重试：先看失败发生在哪一步，再决定重做哪一步。
+
+        上传阶段失败 → 重传同一个本地文件（文件还在磁盘上才有意义，
+        不在就如实说需要重新选）；导入阶段失败 → 再导入一次（导入是幂等的）；
+        资产已不可用 → 只重新核对一次（重传/重导入都救不回一个不在工作区里的包）。
+        """
+        meta = entry.get("meta") or {}
+        project = self._owning_project(entry)
+        if meta.get("missing"):
+            self._attach_view(entry)
+            return
+        if not meta.get("package_id"):
+            path = str(meta.get("local_path") or "")
+            if path and os.path.exists(path):
+                # 回写**这张卡片所在的那个聊天**，不是此刻屏幕上那一个
+                self._start_zip_upload(path, project=project, entry=entry)
+                return
+            self.status.setText("这个 ZIP 没上传成功，且本地文件已不在原路径 —— "
+                                "请重新添加附件")
+            return
+        self._attach_import(entry)
+
+    def _attach_refresh(self, entry: dict):
+        self._attach_view(entry)
+
+    def _owning_project(self, entry: dict) -> str | None:
+        """找这条附件属于哪个项目（异步回写要落到它主人那里）。"""
+        active = self.projects_data.get("active")
+        for name, proj in (self.projects_data.get("projects") or {}).items():
+            if entry in (proj.get("entries") or []):
+                return name
+        return active
+
+    def _find_attachment(self, package_id: str):
+        """按 package_id 找附件（第一个引用）；返回 (entry, project)。"""
+        found = self._find_attachments(package_id)
+        return found[0] if found else (None, None)
+
+    def _find_attachments(self, package_id: str) -> list:
+        """按 package_id 找出**所有**引用，返回 [(entry, project)]。
+
+        同一个包可以被多个聊天引用（例如把同一个 ZIP 拖进两个项目，或一次
+        上传后在别的聊天里也发过）。状态刷新必须覆盖每一处引用，否则其余
+        卡片会停在旧状态。
+        """
+        out = []
+        for name, proj in (self.projects_data.get("projects") or {}).items():
+            for entry in (proj.get("entries") or []):
+                meta = entry.get("meta") or {}
+                if entry.get("kind") == "attachment" and \
+                        str(meta.get("package_id") or "") == package_id:
+                    out.append((entry, name))
+        return out
+
+    def _spawn_model_worker(self, payload: dict | None, path: str, callback,
+                            timeout: int = 120) -> None:
+        worker = MA.ModelApiWorker(path, payload=payload, base=_backend_base(),
+                                   auth=_auth_header(), timeout=timeout)
+        worker.result.connect(callback)
+        worker.finished.connect(lambda w=worker: self._gc_attach_worker(w))
+        self._attach_workers.append(worker)
+        worker.start()
+
+    def _verify_attachments(self):
+        """重启后核对附件引用是否还有效：资产不在了就如实标注。
+
+        只核对**当前项目**里的附件 —— 切到别的项目时再核一遍，避免启动即发
+        一堆请求。核对结果只写回**发起核对时那一组** entry：请求是异步的，
+        回调到达时用户可能已经切到别的项目，不能顺着 self.entries 乱改。
+        """
+        entries = [e for e in self.entries if e.get("kind") == "attachment"]
+        if not entries:
+            return
+        self._spawn_model_worker(None, MA.packages_path(),
+                                 lambda data, es=entries: self._on_verify_packages(data, es))
+
+    def _on_verify_packages(self, data: dict, entries: list | None = None):
+        if entries is None:
+            entries = [e for e in self.entries if e.get("kind") == "attachment"]
+        if not data.get("ok"):
+            if data.get("backend_down"):
+                self._auto_revive(retry=self._verify_attachments)
+            return
+        packages = {str(p.get("package_id")): p
+                    for p in (data.get("packages") or []) if isinstance(p, dict)}
+        current_ws = str(data.get("workspace") or "")
+        truncated = MA.listing_truncated(data)
+        changed = False
+        for entry in entries:
+            if entry.get("kind") != "attachment":
+                continue
+            meta = entry.setdefault("meta", {})
+            package_id = str(meta.get("package_id") or "")
+            if not package_id:
+                # 重启前那次上传根本没完成（ADS 被关了/崩了）。如实说是
+                # "上传中断"，不能让它一直显示"上传中"，也不能算"资产丢失"。
+                if str(meta.get("state") or "") == "uploading":
+                    meta["state"], meta["state_label"] = "failed", "上传中断"
+                    meta["error"] = ("上次上传没有完成（面板已重启或被关闭）。"
+                                     "请重新添加这个 ZIP —— 后端没有收到完整的包。")
+                    changed = True
+                continue
+            live = packages.get(package_id)
+            if live is None:
+                if truncated:
+                    # 清单被返回上限截断：没在这一页里 ≠ 没了。
+                    meta["message"] = (
+                        f"本次只核对了清单里前 {data.get('returned')} 个包"
+                        f"（共 {data.get('total')} 个），这个包不在这一页里，"
+                        "暂时无法确认它是否还在 —— 可点「刷新状态」再查一次。")
+                    changed = True
+                    continue
+                recorded_ws = str(meta.get("workspace") or "")
+                mismatch = bool(current_ws and recorded_ws
+                                and current_ws != recorded_ws)
+                meta["missing"] = True
+                meta["workspace_mismatch"] = mismatch
+                meta["missing_reason"] = (
+                    MA.workspace_mismatch_reason(recorded_ws, current_ws)
+                    if mismatch else
+                    "当前工作区的模型清单里没有这个包"
+                    "（可能换了工作区，或资产已被移除）")
+                changed = True
+                continue
+            if meta.get("missing") or meta.get("workspace_mismatch"):
+                meta["missing"] = False
+                meta["missing_reason"] = ""
+                meta["workspace_mismatch"] = False
+                changed = True
+            if current_ws and meta.get("workspace") != current_ws:
+                meta["workspace"] = current_ws
+                changed = True
+            for key in ("state", "state_label", "model_count", "package_kind",
+                        "package_kind_label", "library_attach"):
+                if live.get(key) is not None and live.get(key) != meta.get(key):
+                    meta[key] = live[key]
+                    changed = True
+        if changed and entries and entries[0] in (self.entries or []):
+            self._rebuild()
+            self._save_projects()
+        elif changed:
+            self._save_projects()
+
+    # ---------------------------------------------------------- 附件（续）
+    def _take_pending_attachments(self, project: str | None = None) -> list:
+        """取走**这个项目**待发送的附件（发出后就清空，避免重复声明）。
+
+        按项目取而不是"全取"：A 项目刚上传的附件不能因为在 B 项目里按了发送
+        就被带进 B 的对话 —— 那等于把 A 的上下文偷偷塞给了 B。
+        """
+        name = project or self.projects_data.get("active")
+        return self._pending_attachments.pop(name, [])
+
+    def _attachment_manifest(self, attachments: list) -> str:
+        """把附件渲染成一小段说明文字。
+
+        只包含**标识与元数据**：文件名、大小、package_id、类型、状态。
+        刻意不包含任何模型文件内容 —— ZIP 从不进入对话历史与 LLM 请求
+        （与 backend/agent.py 系统提示里「上传 ≠ 导入」「先查再用」的纪律配套）。
+        """
+        lines = ["我上传了原厂模型压缩包，作为本轮的附件（内容没有进对话，"
+                 "只给你标识与元数据）："]
+        for item in attachments:
+            meta = dict(item.get("meta") or {})
+            bits = [f"- {meta.get('filename') or '（未命名）'}",
+                    MA.human_size(meta.get("size_bytes")),
+                    meta.get("package_kind_label") or "类型未识别"]
+            vendor = meta.get("vendor")
+            if vendor:
+                bits.append(f"厂商 {vendor}")
+            bits.append(MA.state_label(meta))
+            lines.append(" ".join(str(b) for b in bits)
+                         + f"（package_id: {item.get('package_id')}）")
+        lines.append("请先用模型包清单工具核对里面真实有哪些型号再回答；"
+                     "不要现在就解压或导入，我确认后再说。")
+        return "\n".join(lines)
 
     # ---------------------------------------------------------------- chat
     def _add_entry(self, kind: str, text: str, project: str | None = None,
-                   payload: dict | None = None) -> bool:
+                   payload: dict | None = None,
+                   raw_entry: dict | None = None) -> bool:
         """把一条对话条目写进 `project`（默认当前项目）。
 
         一轮对话在**发送时**就固定了所属项目；如果用户在等待回复期间切到别的
@@ -1984,6 +3791,10 @@ class AgentPanelWidget(QWidget):
         ``payload`` 用于结构化条目（目前是 ``kind="result"`` 的设计结果页）：
         entry 里只存 ``job_id``（轻量、可持久化），完整 job 从内存缓存或
         ``design_jobs/<job_id>.json`` 取 —— 重启 ADS 后仍能重新渲染。
+
+        ``raw_entry`` 用于调用方**自己构造好**整条 entry 的场合（模型附件）：
+        卡片要带自己的 meta 快照（package_id + 元数据），由调用方组装更清楚，
+        这里只负责落到正确的项目里。
         """
         active = self.projects_data.get("active")
         target = project or active
@@ -1995,12 +3806,15 @@ class AgentPanelWidget(QWidget):
         entries = proj.setdefault("entries", [])
         visible = target == active
         had_entries = bool(entries)
-        entry = {"kind": kind, "text": text}
-        if payload:
-            job_id = str(payload.get("job_id") or "")
-            if job_id:
-                entry["job_id"] = job_id
-                self._jobs[job_id] = payload
+        if raw_entry is not None:
+            entry = raw_entry
+        else:
+            entry = {"kind": kind, "text": text}
+            if payload:
+                job_id = str(payload.get("job_id") or "")
+                if job_id:
+                    entry["job_id"] = job_id
+                    self._jobs[job_id] = payload
         entries.append(entry)
 
         if visible:
@@ -2018,7 +3832,8 @@ class AgentPanelWidget(QWidget):
                 self.chat.scrollToBottom()
         elif project is not None:
             # 后台项目收到内容：只在状态栏提示，不渲染到当前会话
-            label = "设计结果页" if kind == "result" else "新消息"
+            label = {"result": "设计结果页",
+                     "attachment": "新附件"}.get(kind, "新消息")
             self.status.setText(f"项目「{target}」有{label}（切回该项目可查看）")
         self._save_projects()
         return True
@@ -2062,6 +3877,11 @@ class AgentPanelWidget(QWidget):
                 on_refresh=self._refresh_job,
                 on_export_full=self._export_full_data,
             )
+        if entry.get("kind") == "attachment":
+            row = AttachmentRow(entry, self._pal(), self._attachment_actions(),
+                                on_toggle=self._attachment_layout_changed)
+            row.entry = entry
+            return row
         row = BubbleRow(entry["kind"], entry["text"], self._pal())
         row.entry = entry           # 流式刷新按 entry 身份找这一行
         return row
@@ -2111,9 +3931,19 @@ class AgentPanelWidget(QWidget):
                 widget.reflow(avail, item)
             elif isinstance(widget, ActivityRow):
                 widget.reflow(avail, item)
+            elif isinstance(widget, AttachmentRow):
+                widget.reflow(avail, item)
 
     def _activity_layout_changed(self):
         self.reflow()
+        self._save_projects()
+
+    def _attachment_layout_changed(self, entry: dict, expanded: bool):
+        """折叠/展开附件卡片：重排 + 落盘（expanded 要能跨重启保留）。"""
+        found = self._row_for_entry(entry)
+        if found is not None:
+            found[0].reflow(max(self.chat.viewport().width() - U.P("xs"), U.px(240)),
+                            found[1])
         self._save_projects()
 
     def _update_clipboard_buttons(self, *_):
@@ -2121,7 +3951,8 @@ class AgentPanelWidget(QWidget):
         self.cut_btn.setEnabled(selected)
         self.copy_btn.setEnabled(selected)
         data = QApplication.clipboard().mimeData()
-        self.paste_btn.setEnabled(bool(data is not None and data.hasText()))
+        self.paste_btn.setEnabled(bool(data is not None and
+                                       (data.hasText() or data.hasUrls())))
 
     def _on_clear(self):
         del self.history[:]
@@ -2132,6 +3963,11 @@ class AgentPanelWidget(QWidget):
     def eventFilter(self, obj, event):  # noqa: N802 — Enter-to-send
         from PySide6.QtCore import QEvent
 
+        if obj is self.input and event.type() in (QEvent.Type.FocusIn, QEvent.Type.FocusOut):
+            self.input_frame.setProperty('focused', event.type() == QEvent.Type.FocusIn)
+            style = self.input_frame.style()
+            style.unpolish(self.input_frame)
+            style.polish(self.input_frame)
         if obj is self.input and event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
                 event.modifiers() & Qt.KeyboardModifier.ShiftModifier
@@ -2141,11 +3977,26 @@ class AgentPanelWidget(QWidget):
         return super().eventFilter(obj, event)
 
     def _on_send(self):
+        if not self._active_provider_enabled():
+            self.status.setText("该供应商已停用，请启用供应商或选择其他模型。")
+            return
         text = self.input.toPlainText().strip()
-        if not text:
+        # 只取**当前这个聊天**的待发送附件：别的项目的附件不能被这一发带上
+        project = self.projects_data.get("active")
+        if any(r.get("project") == project and
+               (r.get("entry", {}).get("meta") or {}).get("state") == "uploading"
+               for r in self._composer_attachments):
+            self.status.setText("模型压缩包还在上传，完成后即可发送。")
+            return
+        attachments = self._take_pending_attachments(project)
+        if not text and not attachments:
             return
         if self._worker is not None and self._worker.isRunning():
             self._add_entry("note", "上一轮还在进行中；可点右下角 ■ 键停止后再发…")
+            # 附件不能丢：放回**同一个项目**的待发送队列，这一轮结束后还能直接发
+            if attachments:
+                self._pending_attachments[project] = \
+                    attachments + self._pending_attachments.get(project, [])
             return
         # 固定本轮所属项目：之后所有异步事件都写回它，而不是"此刻屏幕上那一个"
         project = self.projects_data.get("active")
@@ -2153,19 +4004,33 @@ class AgentPanelWidget(QWidget):
         self._activity_entry = None
         self._activity_t0 = 0.0
         self.input.clear()
+        sent_ids = {str(item.get("package_id") or "") for item in attachments}
+        if sent_ids:
+            self._composer_attachments = [
+                r for r in self._composer_attachments
+                if str((r.get("entry", {}).get("meta") or {}).get("package_id") or "")
+                not in sent_ids
+            ]
+            self._refresh_composer_attachments()
+        # 附件独立发送：只发标识与元数据，绝不把 ZIP 内容或路径以外的
+        # 文件数据塞进消息（更不会进 LLM 请求）。
+        if attachments:
+            text = (text + "\n\n" if text else "") + self._attachment_manifest(attachments)
         self.history.append({"role": "user", "content": text})
         self._add_entry("user", text, project)
 
         self._worker = ChatWorker(
-            list(self.history), self.allow_python.isChecked(), self.model_combo.currentText().strip()
+            list(self.history), self.allow_python.isChecked(), self._active_model
         )
         # 用默认参数把项目名绑进回调 —— 用户中途切换项目不会改变这一轮的目标项目
         self._worker.event_received.connect(lambda ev, p=project: self._on_event(ev, p))
         self._worker.failed.connect(lambda msg, p=project: self._on_failed(msg, p))
         self._worker.finished.connect(lambda p=project: self._on_worker_done(p))
         self._worker.start()
+        self._run_error = ""
+        self._run_error_project = None
         self._set_run_state(True)
-        self.status.setText(f"Agent 工作中（模型: {self.model_combo.currentText().strip()}）…")
+        self.status.setText("正在连接模型…")
 
     def _on_worker_done(self, project: str | None = None):
         self._finish_activity(project)
@@ -2186,6 +4051,8 @@ class AgentPanelWidget(QWidget):
             self._dropped_events = 0
         elif project and project != self.projects_data.get("active"):
             self.status.setText(f"项目「{project}」的回复已完成（切回该项目可查看）")
+        if self._run_error and self._run_error_project == self.projects_data.get("active"):
+            self.status.setText(self._run_error)
         self._save_projects()
 
     def _on_send_clicked(self):
@@ -2203,17 +4070,50 @@ class AgentPanelWidget(QWidget):
         # 正在执行的 ADS 工具无法强杀，会在安全边界收尾（读线程随后退出）
         self.status.setText("正在停止后续步骤…")
         self.send.setEnabled(False)
+        self.run_stop_btn.setEnabled(False)
         self._worker.stop()
 
     def _set_run_state(self, running: bool):
-        """运行中把发送键换成红色停止方块，结束后换回向上箭头。"""
+        """发送键在运行时切换为停止键，停止请求发出后等待安全收尾。"""
         self.send.setProperty("busy", running)
-        self.send.setToolTip("停止生成" if running else "发送 (Enter)")
-        self.send.setIcon(_draw_icon("stop" if running else "send", "#ffffff", size=18))
+        self.send.setEnabled(not (running and self._stopping))
+        self.send.setToolTip("停止本轮回复（正在执行的操作会安全收尾）" if running else "发送 (Enter)")
+        self.send.setAccessibleName("停止本轮回复" if running else "发送消息")
+        color = self._pal()['text'] if running else ('#ffffff' if not self.dark else self._pal()['panel_bg'])
+        self.send.setIcon(_draw_icon("stop" if running else "send", color, size=U.px(18)))
         # 属性选择器不会因 setProperty 自动重算，必须手动重新 polish
         style = self.send.style()
         style.unpolish(self.send)
         style.polish(self.send)
+        self._sync_composer_status()
+
+    def _sync_composer_status(self):
+        if not hasattr(self, 'send'):
+            return
+        raw = self.status.text()
+        active = self.projects_data.get('active')
+        running = bool(self.send.property('busy')) and self._turn_project in (None, active)
+        text = re.sub(r'（第\s*\d+\s*/\s*\d+\s*步）', '', raw).strip()
+        if text.startswith('正在思考'):
+            text = '正在分析问题…'
+        if raw.startswith('执行 ') and self._tool_name:
+            phases = {'run_simulation': '正在运行仿真', 'publish_design_result': '正在整理设计结果',
+                      'read_dataset': '正在读取数据', 'read_traces': '正在读取曲线',
+                      'get_workspace_info': '正在读取工作区', 'list_designs': '正在读取电路',
+                      'get_design_variables': '正在读取电路参数', 'build_schematic': '正在构建电路',
+                      'set_design_variables': '正在修改电路参数', 'run_python': '正在执行脚本'}
+            text = phases.get(self._tool_name, '正在执行工具') + '…'
+            elapsed = re.search(r'已用 (\d+)s', raw)
+            if elapsed:
+                text += ' · ' + elapsed.group(1) + ' 秒'
+        finished = raw in ('', '就绪', '完成', '已停止本轮回复')
+        self.run_status_row.setVisible(bool(raw) and not finished)
+        self.run_status_text.setText(text)
+        self.run_status_text.setToolTip(raw)
+        self.run_status_text.setAccessibleDescription(raw)
+        self.run_status_dot.setVisible(running and not finished)
+        self.run_stop_btn.setVisible(False)
+        self.run_stop_btn.setEnabled(not self._stopping)
 
     # ------------------------------------------------- 长耗时工具的可见状态
     def _start_tool_timer(self, name: str, project: str | None) -> None:
@@ -2433,10 +4333,16 @@ class AgentPanelWidget(QWidget):
                 self._refresh_activity(entry, project)
             self._start_tool_timer(ev.get("name", ""), project)
         elif t == "reasoning":
+            if foreground and not self._stopping:
+                self.status.setText("正在分析问题…")
             self._append_reasoning(ev.get("text", ""), project)
         elif t == "reasoning_delta":
+            if foreground and not self._stopping and self.status.text() != "正在分析问题…":
+                self.status.setText("正在分析问题…")
             self._append_reasoning_delta(ev.get("text", ""), bool(ev.get("first")), project)
         elif t == "content_delta":
+            if foreground and not self._stopping and self.status.text() != "正在生成回复…":
+                self.status.setText("正在生成回复…")
             self._append_content_delta(ev.get("text", ""), project)
         elif t == "tool_result":
             self._stop_tool_timer()
@@ -2456,8 +4362,9 @@ class AgentPanelWidget(QWidget):
                 summary = job.get("summary") or {}
                 if job.get("save_errors"):
                     # "算完了"和"存上了"是两回事：保存失败必须让用户看见
-                    self.status.setText(
-                        "结果已完成，但保存到磁盘失败（重启后可能找不回该结果页）")
+                    self._run_error = "结果已完成，但保存到磁盘失败（重启后可能找不回该结果页）"
+                    self._run_error_project = project
+                    self.status.setText(self._run_error)
                 else:
                     self.status.setText(
                         "设计结果页已生成："
@@ -2473,7 +4380,7 @@ class AgentPanelWidget(QWidget):
                     "stat", _format_stats(stats, ev.get("message") or ""), project
                 )
             if foreground:
-                self.status.setText("完成")
+                self.status.setText(self._run_error if self._run_error_project == project and self._run_error else "完成")
         elif t == "cancelled":
             # 后端已停止本轮后续步骤（停止按钮 → /chat/cancel 的回执）。
             # 文案必须如实：正在执行的操作会在安全边界收尾，不是"一切已中断"。
@@ -2489,11 +4396,19 @@ class AgentPanelWidget(QWidget):
             self._stop_tool_timer()
             self._finish_activity(project)
             self._add_entry("note", f"错误：{ev.get('message', '')}", project)
+            if foreground:
+                self._run_error = "执行失败：" + ev.get('message', '')
+                self._run_error_project = project
+                self.status.setText(self._run_error)
 
     def _on_failed(self, message: str, project: str | None = None):
         self._stop_tool_timer()
         self._finish_activity(project)
         self._add_entry("note", f"连接失败：{message}", project)
+        if project == self.projects_data.get('active'):
+            self._run_error = "连接失败：" + message
+            self._run_error_project = project
+            self.status.setText(self._run_error)
         self._auto_revive()  # auto-start the backend so the next send works
 
     # ------------------------------------------------- 设计结果页的三个动作
@@ -2664,6 +4579,112 @@ DOCK_OBJECT_NAME = "AdsAgentDockPanel"
 HANDLE_OBJECT_NAME = "AdsAgentDockHandle"
 
 
+class _DockTitleBar(QWidget):
+    """Only gestures starting on the three-dot grip reach Qt's dock machinery."""
+
+    def __init__(self, dock, pal):
+        super().__init__(dock)
+        self.setObjectName('agentDockTitleBar')
+        self.setFixedHeight(U.px(32))
+        self.setMinimumWidth(U.px(100))
+        self.setMouseTracking(True)
+        self._dragging = False
+        self._grip_hover = False
+        self.setAccessibleName('面板控制栏：仅左侧三圆点区域可拖动')
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(U.px(12), U.px(3), U.px(8), U.px(3))
+        layout.addStretch()
+        self.collapse_btn = QToolButton(self)
+        self.collapse_btn.setFixedSize(U.px(26), U.px(26))
+        self.collapse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.collapse_btn.setToolTip('折叠到侧栏，点击侧边 ADS Agent 标签可重新展开')
+        self.collapse_btn.setAccessibleName('折叠 ADS Agent 到侧栏')
+        self.collapse_btn.clicked.connect(dock.hide)
+        layout.addWidget(self.collapse_btn)
+        self.restyle(pal)
+
+    def restyle(self, pal):
+        self._pal = pal
+        self.setStyleSheet(
+            f"QWidget#agentDockTitleBar{{background:{pal['header_bg']};}}"
+        )
+        self.collapse_btn.setIcon(_draw_icon('collapse', pal['subtle'], U.px(16)))
+        self.collapse_btn.setIconSize(QSize(U.px(16), U.px(16)))
+        self.collapse_btn.setStyleSheet(
+            f"QToolButton{{border:none;background:transparent;padding:0;"
+            f"border-radius:{U.R('sm')}px;}}"
+            f"QToolButton:hover{{background:{pal['accent_soft']};}}"
+            f"QToolButton:focus{{border:1px solid {pal['accent']};}}"
+        )
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QColor, QPainter
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(self._pal['header_bg']))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        if self._grip_hover or self._dragging:
+            painter.setBrush(QColor(self._pal['hover']))
+            painter.drawRoundedRect(self._grip_rect(), U.px(6), U.px(6))
+        # One drag surface, styled with macOS-inspired muted traffic lights.
+        for x, color in ((17, '#ee8b86'), (33, '#e6bb65'), (49, '#7fbe98')):
+            painter.setBrush(QColor(color))
+            painter.drawEllipse(QPointF(U.px(x), self.height() / 2), U.px(4.5), U.px(4.5))
+        painter.end()
+
+    def mousePressEvent(self, event):
+        self._dragging = (event.button() == Qt.MouseButton.LeftButton
+                          and self._grip_rect().contains(event.position().toPoint()))
+        self.update()
+        event.ignore() if self._dragging else event.accept()
+
+    def mouseMoveEvent(self, event):
+        # Qt may take the mouse grab during a dock drag and handle its release.
+        if self._dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._dragging = False
+        self._update_grip_feedback(event.position().toPoint())
+        event.ignore() if self._dragging else event.accept()
+
+    def mouseReleaseEvent(self, event):
+        was_dragging = self._dragging
+        self._dragging = False
+        self._update_grip_feedback(event.position().toPoint())
+        event.ignore() if was_dragging else event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._grip_rect().contains(event.position().toPoint()):
+            event.ignore()
+        else:
+            event.accept()
+
+    def leaveEvent(self, event):
+        self._grip_hover = False
+        if not self._dragging:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+        super().leaveEvent(event)
+
+    def _update_grip_feedback(self, position):
+        self._grip_hover = self._grip_rect().contains(position)
+        self.setCursor(Qt.CursorShape.SizeAllCursor if self._grip_hover or self._dragging
+                       else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def _grip_rect(self):
+        # A padded group target, not three tiny individual dot targets.
+        return QRect(U.px(8), U.px(3), U.px(52), U.px(26))
+
+
+def _install_dock_title_bar(dock, widget):
+    bar = _DockTitleBar(dock, widget._pal())
+    dock.setTitleBarWidget(bar)
+    widget._dock_title_bar = bar
+    return bar
+
+
 def _restyle_handle(pal: dict) -> None:
     """边缘标签跟随面板主题换色（_apply_theme 会调过来）。"""
     if _handle_tab is not None:
@@ -2712,6 +4733,7 @@ def open_panel():
         dock = QDockWidget(DOCK_TITLE, main_win)
         dock.setObjectName(DOCK_OBJECT_NAME)
         dock.setWidget(panel_widget)
+        _install_dock_title_bar(dock, panel_widget)
         dock.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetClosable
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
@@ -2744,7 +4766,7 @@ def open_panel():
         _handle, _handle_tab = handle, tab
         _restyle_handle(panel_widget._pal())
 
-        # 面板被折叠（»按钮）或被标题栏 X 关闭，都通过这条联动亮出展开标签
+        # 自定义标题栏 » 是唯一的折叠入口，隐藏后显示侧边展开标签。
         dock.visibilityChanged.connect(_sync_handle)
     else:
         # fallback: standalone window (main window not found)

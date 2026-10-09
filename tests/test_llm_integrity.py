@@ -95,6 +95,90 @@ def test_stream_without_done_with_tool_calls_is_blocked():
         llm_mod.urllib.request.urlopen = real
 
 
+def test_complete_stream_preserves_interleaved_tool_calls():
+    lines = _sse(
+        _tool_chunk("list_designs", '{"library":', index=1, with_id=True),
+        _tool_chunk("get_workspace_info", "{", index=0, with_id=True),
+        _tool_chunk("", '"AI_lib"}', index=1),
+        _tool_chunk("", "}", index=0),
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+         "usage": {"completion_tokens": 12}},
+    ) + ["data: [DONE]"]
+    resp = _FakeResp(lines)
+    real = _patch_urlopen(lambda req, timeout=None: resp)
+    try:
+        msg, usage = llm_mod.chat_stream(CFG, [])
+    finally:
+        llm_mod.urllib.request.urlopen = real
+    eq(msg["complete"], True)
+    eq(msg["tool_calls"], [
+        {"id": "call_0", "type": "function", "function": {
+            "name": "get_workspace_info", "arguments": "{}"}},
+        {"id": "call_1", "type": "function", "function": {
+            "name": "list_designs", "arguments": '{"library":"AI_lib"}'}},
+    ])
+    eq(usage, {"completion_tokens": 12})
+    ok(resp.closed)
+
+
+def test_stream_transport_failure_preserves_partial_calls():
+    class BrokenResp(_FakeResp):
+        def __iter__(self):
+            yield from self._lines
+            raise ConnectionError("connection lost")
+
+    resp = BrokenResp(_sse(_tool_chunk("run_simulation", '{"cell":', with_id=True)))
+    real = _patch_urlopen(lambda req, timeout=None: resp)
+    try:
+        try:
+            llm_mod.chat_stream(CFG, [])
+            raise AssertionError("中断流必须抛异常")
+        except llm_mod.StreamIncomplete as exc:
+            eq(exc.partial_message["complete"], False)
+            eq(exc.partial_message["tool_calls"][0]["function"]["arguments"], '{"cell":')
+    finally:
+        llm_mod.urllib.request.urlopen = real
+    ok(resp.closed)
+
+
+def test_real_stream_client_reaches_agent_dispatch_and_followup():
+    requests, executed = [], []
+
+    def fake_open(req, timeout=None):
+        body = json.loads(req.data)
+        requests.append(body)
+        if len(requests) == 1:
+            return _FakeResp(_sse(
+                _tool_chunk("get_workspace_info", "{", with_id=True),
+                _tool_chunk("", "}"),
+            ) + ["data: [DONE]"])
+        return _FakeResp(_sse(_content_chunk("已读取工作区")) + ["data: [DONE]"])
+
+    real_open = _patch_urlopen(fake_open)
+    real_call = agent.tools_mod.call
+
+    def fake_call(cfg, name, args, **kwargs):
+        executed.append((name, args))
+        return {"workspace": "test_workspace"}
+
+    agent.tools_mod.call = fake_call
+    try:
+        events = []
+        agent.Turn(dict(CFG, max_tool_steps=3), [
+            {"role": "user", "content": "查看工作区"},
+        ]).run(events.append)
+    finally:
+        llm_mod.urllib.request.urlopen = real_open
+        agent.tools_mod.call = real_call
+    eq(executed, [("get_workspace_info", {})])
+    eq(len(requests), 2)
+    tool_msgs = [m for m in requests[1]["messages"] if m.get("role") == "tool"]
+    eq(tool_msgs[0]["tool_call_id"], "call_0")
+    contains(tool_msgs[0]["content"], "test_workspace")
+    eq(events[-1]["type"], "done")
+    eq(events[-1]["message"], "已读取工作区")
+
+
 def test_stream_without_done_text_only_flags_incomplete():
     lines = _sse(_content_chunk("回复写到一半就断了"))
     real = _patch_urlopen(lambda req, timeout=None: _FakeResp(lines))
@@ -303,6 +387,37 @@ def test_content_deltas_are_forwarded_without_duplicate_final():
         eq(finals[0]["text"], full)
     finally:
         agent.llm = real_llm
+
+
+def test_stepfun_root_uses_versioned_models_and_chat_paths():
+    from unittest.mock import patch
+    class ModelsResponse:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return b'{"data":[{"id":"test-model"}]}'
+    requests = []
+    def respond(req, timeout=None):
+        requests.append(req.full_url)
+        if req.full_url.endswith("/models"):
+            return ModelsResponse()
+        return _FakeResp(_sse(_content_chunk("ok")) + ["data: [DONE]"])
+    for host in ("api.stepfun.com", "api.stepfun.ai"):
+        with patch.object(llm_mod.urllib.request, "urlopen", respond):
+            eq(llm_mod.list_models("https://" + host, "test-key"), ["test-model"])
+            cfg = dict(CFG, llm_base_url="https://" + host)
+            llm_mod.chat_stream(cfg, [{"role": "user", "content": "hello"}])
+        eq(requests[-2:], ["https://" + host + "/v1/models",
+                           "https://" + host + "/v1/chat/completions"])
+
+
+def test_base_url_normalization_preserves_custom_paths():
+    eq(llm_mod.normalize_base_url(" https://api.stepfun.com/ "),
+       "https://api.stepfun.com/v1")
+    for url in ("https://api.stepfun.com/v1", "https://api.stepfun.com/step-plan",
+                "https://open.bigmodel.cn/api/paas/v4", "https://api.deepseek.com",
+                "http://127.0.0.1:8080", "https://api.stepfun.com.example.org",
+                "https://api.stepfun.com?route=custom"):
+        eq(llm_mod.normalize_base_url(url), url)
 
 
 if __name__ == "__main__":

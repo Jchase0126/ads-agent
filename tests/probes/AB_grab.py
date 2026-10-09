@@ -1,4 +1,4 @@
-"""在 ADS 进程内截图指定原理图窗口（Qt widget.grab），保存 PNG。
+r"""在 ADS 进程内截图指定原理图窗口（Qt widget.grab），保存 PNG。
 
 用法: python tests/probe_via_ads.py tests/probes/AB_grab.py -- D:\...\out.png
 （直接改脚本尾部 OUT_PATH / TITLE_PAT 再跑更稳）

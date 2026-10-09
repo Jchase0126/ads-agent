@@ -415,7 +415,8 @@ def _run_gate_build(netlist_fn):
             "instances": _GK_INST, "connections": []}
     with tempfile.TemporaryDirectory() as tmp:
         patches = [
-            mock.patch.object(ads_ops, "_require_workspace", lambda: object()),
+            mock.patch.object(ads_ops, "_require_workspace",
+                              lambda: type("WS", (), {"path": tmp})()),
             mock.patch.object(ads_ops, "_ensure_cell_view",
                               lambda ws, l, c, v: {"created": False}),
             mock.patch.object(ads_ops, "_backup_design",
