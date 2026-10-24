@@ -52,12 +52,17 @@ CASES = [
     ("test_design_workspace.py", "工作区绑定：跨工作区拦截 / 网表指纹复用验证", "logic", False),
     ("test_llm_integrity.py", "LLM：流完整性 / 残缺参数拦截 / 结果摘要 / 上下文预算 / 免密", "logic", False),
     ("test_project_store.py", "会话原子保存 / 备份恢复", "logic", False),
+    ("test_model_store.py", "模型包资产：保存去重 / 中文路径 / 识别 / 越界拒绝 / 并发 / 迁移", "logic", False),
+    ("test_model_http.py", "模型包 HTTP：二进制上传 / 鉴权 / 中文名 / 工作区绑定 / 幂等", "http", False),
+    ("test_model_ops.py", "模型包 ADS 侧纯逻辑：lib.defs 解析 / 路径解析 / 工具名齐全", "logic", False),
+    ("test_model_ops_flow.py", "模型包 ADS 侧流程：挂接幂等 / 只读约束 / 卸载不越界 / 验证门禁", "logic", False),
     # ---------------- qt ----------------
     ("test_project_isolation.py", "项目会话隔离 / 如实报告仿真行为", "qt", True),
     ("test_design_isolation.py", "设计结果页：项目隔离与重启恢复", "qt", True),
     ("test_result_page_labeling.py", "结果页数据标识：显示采样点 vs 完整数据 / 完整导出", "qt", True),
     ("test_md_plain.py", "Markdown 气泡清洗：修饰符剥离 / 结构转换 / 标识符保护", "qt", True),
     ("test_thinking.py", "深度思考链路：thinking 门控与降级 / reasoning 下发 / 折叠行", "qt", True),
+    ("test_model_attachments.py", "模型包附件：拖放 / 上传 / 卡片状态 / 项目隔离与恢复", "qt", True),
 ]
 
 DEFAULT_TIMEOUT_S = 240

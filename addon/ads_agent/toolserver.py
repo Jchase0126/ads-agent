@@ -240,7 +240,10 @@ def active_jobs() -> list:
 _ADS_OPS_PATH = os.path.join(_HERE, "ads_ops.py")
 # ads_ops 依赖的本地纯计算模块：ads_ops 热重载前要先重载它们，
 # 否则 reload(ads_ops) 里的 import 命中 sys.modules 缓存，改了也不生效
-_ADS_OPS_DEPS = ("rf_audit",)
+# model_ops 不是"纯计算"（它要 keysight.ads.de），但同样必须列进来 ——
+# 不列的话改 model_ops.py 后只重载了 ads_ops，model_ops 仍是旧代码，
+# 而且症状是"我明明改了却不生效"，极难定位（同 rf_audit 当初踩的坑）。
+_ADS_OPS_DEPS = ("rf_audit", "model_ops")
 
 
 def _get_ads_ops():

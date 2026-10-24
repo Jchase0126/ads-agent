@@ -51,24 +51,38 @@ check("配置文件 config.ini + LLM Key", cfg_check)
 
 # 2. backend modules compile
 def backend_check():
+    """编译**整个** backend/ 目录，而不是一份硬编码的文件名清单。
+
+    硬编码清单有个隐蔽的失效方式：新加的模块（比如模型包层的
+    model_store.py / model_tools.py）如果忘了登记进来，环境自检照样
+    报「语法 OK」，而这个模块在发布包里是坏的 —— 自检通过了，问题却要
+    等到用户上传压缩包时才暴露。扫目录让新增文件自动进入检查范围。
+    """
     import py_compile
 
-    for f in ("ads_auth.py", "adslog.py", "config.py", "llm.py", "tools.py",
-              "agent.py", "server.py"):
-        py_compile.compile(os.path.join(PROJECT_ROOT, "backend", f), doraise=True)
-    return "backend/*.py 语法 OK"
+    backend_dir = os.path.join(PROJECT_ROOT, "backend")
+    files = sorted(f for f in os.listdir(backend_dir) if f.endswith(".py"))
+    if not files:
+        raise RuntimeError("backend/ 下没有 .py 文件，路径不对？")
+    for f in files:
+        py_compile.compile(os.path.join(backend_dir, f), doraise=True)
+    return f"backend/*.py 语法 OK（{len(files)} 个模块）"
 
 
 check("后端代码语法", backend_check)
 
 # 3. addon modules compile (with system python; PySide6 import deferred)
 def addon_check():
+    """同 backend_check：扫目录，新模块自动纳入（model_ops 等）。"""
     import py_compile
 
-    for f in ("__init__.py", "ads_ops.py", "toolserver.py", "panel.py",
-              "authbridge.py", "uiscale.py", "backend_launcher.py"):
-        py_compile.compile(os.path.join(PROJECT_ROOT, "addon", "ads_agent", f), doraise=True)
-    return "addon/ads_agent/*.py 语法 OK"
+    addon_dir = os.path.join(PROJECT_ROOT, "addon", "ads_agent")
+    files = sorted(f for f in os.listdir(addon_dir) if f.endswith(".py"))
+    if not files:
+        raise RuntimeError("addon/ads_agent/ 下没有 .py 文件，路径不对？")
+    for f in files:
+        py_compile.compile(os.path.join(addon_dir, f), doraise=True)
+    return f"addon/ads_agent/*.py 语法 OK（{len(files)} 个模块）"
 
 
 check("插件代码语法", addon_check)

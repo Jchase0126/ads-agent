@@ -354,6 +354,11 @@ def _run_design_locked(cfg: dict, spec: dict, project_root: str,
         # 跨工作区防误操作使用（结果页也会展示）
         if result.get("design_version"):
             job.design_version = dict(result["design_version"])
+        # 模型依赖指纹：原厂模型可以整体被换掉（同一路径、同一个网表，
+        # 内容不同），只比网表会把过期结果当成有效结果复用。这里把
+        # 「哪个模型包 / 哪个文件 / 什么哈希」随任务一起持久化，供追溯。
+        if result.get("model_fingerprint"):
+            job.set_sim(model_fingerprint=dict(result["model_fingerprint"]))
         ws_path = (result.get("workspace") or {}).get("path") or ""
         if ws_path:
             job.set_sim(workspace=ws_path)

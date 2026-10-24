@@ -358,6 +358,177 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_model_packages",
+            "description": (
+                "列出当前 ADS Workspace 里已保存的**原厂模型压缩包资产**"
+                "（用户通过聊天附件上传的 ZIP）。返回每个包的 package_id、原始文件名、"
+                "识别出的包类型（touchstone / design_kit / mixed / unknown）、供应商、版本、"
+                "处理状态、型号数量。\n"
+                "**package_id 是唯一稳定的句柄**（形如 pkg_xxxxxxxxxxxxxxxx），"
+                "后续所有模型工具都用它，不要用文件名指代。\n"
+                "用户说「我之前上传的村田/TDK 模型」「上次那个包」时先调它。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_kind": {
+                        "type": "string",
+                        "enum": ["", "touchstone", "design_kit", "mixed", "unknown"],
+                        "description": "按包类型过滤，留空返回全部",
+                    },
+                    "state": {
+                        "type": "string",
+                        "description": "按状态过滤，如 ready / pending_import / failed；留空返回全部",
+                    },
+                    "max_items": {"type": "integer", "description": "最多返回条数，默认 50"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_model_package",
+            "description": (
+                "查看某个模型包的详细信息：包结构识别依据（evidence）、套件根目录候选、"
+                "内含文件类型统计、型号索引、库挂接信息、验证结果与最近错误。\n"
+                "**不解压、不加载、不执行包内任何脚本** —— 只读清单与索引。"
+                "用户问「这个包里有什么」「能不能用」时先调它再决定是否导入。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_id": {"type": "string", "description": "包 ID，如 pkg_ab12cd34ef567890"},
+                    "include_models": {
+                        "type": "boolean",
+                        "description": "是否返回完整型号索引，默认 true",
+                    },
+                    "max_models": {"type": "integer", "description": "型号索引返回上限，默认 200"},
+                },
+                "required": ["package_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "import_model_package",
+            "description": (
+                "把已保存的模型包**按需**解压并导入当前 ADS Workspace："
+                "安全解压 → 识别套件根目录 → 通过官方 API 挂接到本工作区 → 建模型索引。\n"
+                "**只有用户明确要求导入/解压/使用某个包时才调用**（如「解压刚才那个包」"
+                "「导入之前上传的 TDK 模型」）。上传本身不会自动导入。\n"
+                "Design Kit 默认以**只读**方式挂接到目标工作区（不会去改全局 Favorite "
+                "Design Kit 设置，也不会给原厂库写权限）。\n"
+                "同一个包重复导入是幂等的，不会产生重复挂接。\n"
+                "导入完成**不等于**模型可用 —— 必须再用 validate_model_import 验证。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package_id": {"type": "string", "description": "包 ID"},
+                    "kit_root": {
+                        "type": "string",
+                        "description": "可选：套件根目录的包内相对路径。识别出多个候选时必须先"
+                                       "inspect_model_package 看 candidates，再由你或用户选定，"
+                                       "不要武断选第一个",
+                    },
+                    "vendor_filter": {
+                        "type": "string",
+                        "description": "可选：只导入属于该供应商的库（如 tdk / murata / infineon）",
+                    },
+                },
+                "required": ["package_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_vendor_models",
+            "description": (
+                "在**已挂接到当前工作区的**原厂模型库里检索可用元件（cell），"
+                "包含只读的原厂库 —— 这弥补了 list_designs 只能看到可写库的限制。\n"
+                "可按库名、名称前缀、类型（design_kit / builtin / workspace）过滤。\n"
+                "返回元件的库:cell 引用、视图列表与元件模型定义（model_def）里真实读到的"
+                "参数定义 —— 拿不到参数就如实标 null，**不要根据元件名猜参数默认值**。"
+                "\n选型时**必须先调用本工具拿到真实的库名与 cell 名**，"
+                "绝不编造库名、cell 名或参数值。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": {"type": "string", "description": "限定某个库；留空查所有已挂接库"},
+                    "name_prefix": {"type": "string", "description": "cell 名前缀过滤，如 TDK_ / BFP"},
+                    "max_items": {"type": "integer", "description": "最多返回条数，默认 100"},
+                    "include_params": {
+                        "type": "boolean",
+                        "description": "是否读取每个元件的 model_def 参数定义，默认 true；"
+                                       "元件很多时建议关掉以免响应过大",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_vendor_model_info",
+            "description": (
+                "查看**单个**元件的详细信息：所属库与库模式（只读/可写）、cell、视图、"
+                "model_def 的参数定义（名称/类型/默认值/取值范围/单位）、端口定义、"
+                "以及该元件在模型索引里的频率范围与参考阻抗（仅当文件里真实声明时才给值）。\n"
+                "用于回答「这个型号有哪些参数可设」「参考阻抗是多少」这类问题。"
+                "\n**频率范围覆盖不到目标频段时要明确提示，不静默外推**；"
+                "**固定型号的 S 参数模型不能当连续电容/电感值修改** —— "
+                "外围连续参数优化与原厂型号离散选型是两件事，不要混为一谈。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": {"type": "string"},
+                    "cell": {"type": "string"},
+                    "view": {"type": "string", "description": "默认 schematic"},
+                },
+                "required": ["library", "cell"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_model_import",
+            "description": (
+                "验证某个元件模型在当前工作区里**真的可用**：库是否已挂接、"
+                "cell 是否存在且可解析、请求参数是否与元件定义一致、"
+                "端口定义与数量、以及当前工作区与模型包所属工作区是否一致。\n"
+                "**这是「模型就绪」的唯一依据** —— 只有本工具通过，才能对用户说"
+                "「模型可用，可以放进电路仿真」。\n"
+                "run_smoke_sim=true 时会额外做一次最小基础仿真（建临时 cell、放元件、"
+                "跑仿真）来实证；默认 false，**用户没要求验证就不要自动跑耗时仿真**。"
+                "\n型号切换时用它核对端口定义、参数与连接方式是否匹配。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": {"type": "string"},
+                    "cell": {"type": "string"},
+                    "parameters": {
+                        "type": "object",
+                        "description": "要放置的元件参数，如 {\"Freq\": \"2.4 GHz\"}；留空只做静态校验",
+                    },
+                    "run_smoke_sim": {
+                        "type": "boolean",
+                        "description": "是否额外做一次最小基础仿真实证，默认 false",
+                    },
+                },
+                "required": ["library", "cell"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "publish_design_result",
             "description": (
                 "把一次设计评估发布成对话里的「设计结果页」。后端会用真实 .ds 数据"
@@ -464,12 +635,32 @@ TIMEOUTS = {
     "run_python": 600,
     # 只读：打开设计 + 生成网表算指纹（结果复用的版本验证用），不给模型直接调用
     "design_fingerprint": 120,
+    # ---- 原厂模型包 ----
+    # 模型包工具的等待上限要按"最坏情况"给：解压 40MB 级 Design Kit + 建索引
+    # 是几十秒级，挂接要进 ADS 工作区；只读库浏览在大套件里上万个 cell 也偏慢。
+    "list_model_packages": 60,
+    "inspect_model_package": 120,
+    # 解压 + 挂接 + 建索引合并在一次调用里，给足预算（120s 在 40MB 包上会超时）
+    "import_model_package": 900,
+    # 上万个 cell 的原厂库：翻库本身不慢，但读取 model_def 参数定义很贵
+    "list_vendor_models": 300,
+    "get_vendor_model_info": 180,
+    "validate_model_import": 300,
 }
 
 # 这些工具**不**派发到 ADS 端，由后端自己处理（见 agent.py）。
 # 放进 TOOLS 是为了让模型能调用；放进这里是为了让 tools.call() 明确拒绝，
 # 避免误当成 ADS 工具发出去变成一句莫名其妙的"未知工具"。
 LOCAL_TOOLS = {"publish_design_result"}
+
+# 原厂模型包工具：由后端读取 Workspace 的模型清单来回答（纯读本地清单，
+# 不必把 ADS 叫起来），只有真正要动 ADS 库的导入/验证才派发到 ADS 端。
+# 目标 Workspace 一律由**可信应用上下文**（ADS 当前打开的工作区）绑定，
+# 绝不接受 LLM 传入的任意路径 —— 否则模型一句"导入到 C:\..."就能写到别处。
+MODEL_LOCAL_TOOLS = {
+    "list_model_packages",
+    "inspect_model_package",
+}
 DEFAULT_SIM_TIMEOUT = 900
 # ADS 端比后端多等一会儿：让"超时"由后端统一报出，而不是 ADS 端先回 504
 # 结果后端还在傻等（两边用同一个数值时会出现这种竞态）。
@@ -509,6 +700,11 @@ def timeout_for(cfg: dict, name: str) -> int:
 def is_local(name: str) -> bool:
     """是否是后端本地处理的工具（不派发到 ADS 端）。"""
     return name in LOCAL_TOOLS
+
+
+def is_model_local(name: str) -> bool:
+    """是否是模型包的本地只读工具（读清单即可回答，不必叫起 ADS）。"""
+    return name in MODEL_LOCAL_TOOLS
 
 
 def describe_result(name: str, result) -> tuple:

@@ -43,6 +43,7 @@ import threading
 import time
 
 import rf_audit  # 射频物理审查的纯计算层（同为本地模块，可离线测试）
+import model_ops  # 原厂模型包的挂接/只读浏览/可用性验证（转发到 model_ops 的实现）
 
 # toolserver 热重载 ads_ops 时，依赖模块会命中 sys.modules 缓存拿旧代码；
 # 这里在每次 ads_ops（重）加载时强制刷新，保证审查逻辑与磁盘一致。
@@ -6669,11 +6670,21 @@ def audit_rf(args: dict, ctx=None) -> dict:
 
 
 def design_fingerprint(args: dict, ctx=None) -> dict:
-    """只读：返回当前工作区信息与指定设计的网表指纹（不做任何修改）。
+    """只读：返回当前工作区信息、指定设计的网表指纹，以及模型依赖指纹。
 
     用途：结果页"结果复用"的版本验证 —— 发布结果时记录仿真时的网表指纹，
     复用前重算一次，不一致说明设计（参数/结构/VAR）已经变化，旧数据集
     不能再代表当前设计。同时带回工作区路径，防止跨工作区误操作同名设计。
+
+    **模型依赖指纹（include_models=True）**
+    ------------------------------------------
+    网表指纹只覆盖网表**文本**。原厂模型的情况是：用户把同一个 .s2p 路径上
+    的文件换成新版（原厂重新下载、版本升级、改了偏压条件），网表一个字都不会
+    变，但仿真结果完全不同 —— 只比网表会复用出一份过期结论。
+
+    所以这里额外扫一遍设计里引用到的模型文件，按"路径 → 内容 SHA-256"返回。
+    拿不到就算不出来，**返回空 dict 而不是猜一个值**：调用方按保守策略决定
+    是否复用（宁可重跑，也不要给错结果）。
     """
     library = args["library"]
     cell = args["cell"]
@@ -6696,6 +6707,8 @@ def design_fingerprint(args: dict, ctx=None) -> dict:
             out["error"] = f"网表生成失败：{type(e).__name__}: {e}"
             out["design_version"] = {}
             return out
+        if args.get("include_models"):
+            out["model_fingerprint"] = _model_file_fingerprints(design)
     finally:
         _close_design(design)
     netlist = netlist if isinstance(netlist, str) else str(netlist)
@@ -6706,6 +6719,48 @@ def design_fingerprint(args: dict, ctx=None) -> dict:
     }
     out["design_ref"] = name
     return out
+
+
+def _model_file_fingerprints(design) -> dict:
+    """设计引用到的外部模型文件的内容指纹（路径 → SHA-256 前 16 位）。
+
+    只认**盘上真实存在**的模型文件：原厂 S 参数元件的 File 参数通常指向
+    .sNp/.ts，Touchstone 的路径可以从元件参数里读到。读不到就不给，
+    绝不返回猜的哈希 —— 一个假的"没变化"比明说"不知道"危险得多。
+    """
+    import hashlib as _hashlib
+    import os as _os
+
+    suffixes = (".s2p", ".s1p", ".s3p", ".s4p", ".snp", ".ts")
+    found: dict = {}
+    try:
+        instances = list(design.instances or [])
+    except Exception:
+        return found
+    for inst in instances:
+        try:
+            master = str(_inst_master(inst) or "")
+            params = {k: str(v) for k, v in _inst_params(inst).items()}
+        except Exception:
+            continue
+        for key, value in params.items():
+            if not key:
+                continue
+            # 只看明显是文件路径的值：后缀匹配 + 盘上存在
+            low = value.strip().strip('"').lower()
+            if not low.endswith(suffixes):
+                continue
+            path = value.strip().strip('"')
+            try:
+                if not _os.path.isfile(path):
+                    continue
+                with open(path, "rb") as stream:
+                    digest = _hashlib.sha256(stream.read()).hexdigest()[:16]
+            except OSError:
+                continue
+            # 键带元件名：同一路径被两个元件共用时仍能定位是谁在用
+            found[f"{_inst_name(inst)}:{key}"] = f"{digest}"
+    return found
 
 
 DISPATCH = {
@@ -6723,3 +6778,13 @@ DISPATCH = {
     "audit_rf": audit_rf,
     "design_fingerprint": design_fingerprint,
 }
+
+# 原厂模型包工具：实现全在 model_ops（同一套 attach / 只读浏览 / 验证逻辑），
+# 这里只做转发 —— 保持 DISPATCH 是"全部工具名"的唯一清单，
+# toolserver 的 pump 只认这张表。
+#
+# 键必须与 backend/model_tools.py 实际派发的名字一致：后端调的是
+# attach_design_kit / list_vendor_models / get_vendor_model_info /
+# validate_model_import，少一个后端就会拿到"未知工具"。其余四个是语义
+# 更细的别名，共用同一批实现，不是两套代码。
+DISPATCH.update(model_ops.HANDLERS)
