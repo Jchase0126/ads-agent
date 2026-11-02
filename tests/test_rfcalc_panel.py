@@ -79,7 +79,7 @@ def _le(page, name):
 
 def test_window_build_and_pages():
     win = _window()
-    eq(win.windowTitle(), "RF 计算器（AppCAD 风格）", "窗口标题")
+    eq(win.windowTitle(), "RF 计算器", "窗口标题")
     eq(list(win._order), _EXPECT_PAGES, "29 页构建顺序")
     eq(win._stack.count(), len(_EXPECT_PAGES), "栈页数应为 29")
     eq(len(win._pages), len(win._order), "_pages 与 _order 一一对应")

@@ -253,7 +253,7 @@ def generate_menu(addon, win_def) -> None:
         )
         menu.add_action(
             app.Action(
-                "RF 计算器（AppCAD 风格）…",
+                "RF 计算器…",
                 lambda action, window: _open_rfcalc_panel(),
                 None,
             )

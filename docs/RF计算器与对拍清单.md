@@ -1,4 +1,4 @@
-# RF 计算器（AppCAD 风格）与数值对拍清单
+# RF 计算器与数值对拍清单
 
 1.3.0 新增的 RF 计算器窗口是对 Avago/Broadcom AppCAD 4.00 中计算器功能的
 **clean-room 重实现**：只依据公开教科书与期刊文献中的公式重新编写，未反编译、
@@ -7,7 +7,7 @@
 
 ## 使用入口
 
-- ADS 内：`Tools ▸ ADS Agent ▸ RF 计算器（AppCAD 风格）…`。
+- ADS 内：`Tools ▸ ADS Agent ▸ RF 计算器…`。
 - 脱离 ADS 预览：`python addon/ads_agent/rfcalc_panel.py`（需要 PySide6）。
 - 引擎直调（供脚本/测试）：`backend/rfcalc.py`，全部函数收 SI 单位、返回
   `{"ok": True, ...}` 或 `{"ok": False, "error": ...}`，不抛异常。

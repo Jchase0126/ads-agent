@@ -7234,7 +7234,7 @@ class RfCalcWindow(QtWidgets.QMainWindow):
         super().__init__(parent)
         if parent is not None:
             self.setWindowFlag(Qt.WindowType.Window, True)
-        self.setWindowTitle("RF 计算器（AppCAD 风格）")
+        self.setWindowTitle("RF 计算器")
         self.resize(1000, 700)
         self._pages = {}
         self._order = []

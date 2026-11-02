@@ -88,7 +88,7 @@ ADDON_FILES = [
     "project_store.py",  # 会话原子保存
     "result_page.py",    # 设计结果页
     "rf_audit.py",       # 射频/Layout 审查
-    "rfcalc_panel.py",   # RF 计算器窗口（AppCAD 风格，引擎经 pathbridge 共享）
+    "rfcalc_panel.py",   # RF 计算器窗口（引擎经 pathbridge 共享）
     "toolserver.py",     # ADS 进程内工具服务
     "uiscale.py",        # 自适应缩放与设计令牌
 ]
