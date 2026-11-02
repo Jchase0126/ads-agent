@@ -77,6 +77,7 @@ with open(os.environ["ADS_AGENT_CONFIG"], "w", encoding="utf-8") as _f:
 
 import panel  # noqa: E402
 import model_attachments as MA  # noqa: E402
+import project_store  # noqa: E402
 
 _APP = None
 
@@ -146,11 +147,13 @@ def _install_stubs():
     """把面板与外部世界隔开：所有替身都记住原件，_teardown 时逐个还原。"""
     _REAL["ChatWorker"] = panel.ChatWorker
     _REAL["UploadWorker"] = MA.UploadWorker
+    _REAL["DatasheetWorker"] = MA.DatasheetWorker
     _REAL["reload_config"] = panel.AgentPanelWidget.reload_config
     _REAL["auto_revive"] = panel.AgentPanelWidget._auto_revive
     _REAL["backend_base"] = panel._backend_base
     panel.ChatWorker = _StubChatWorker
     MA.UploadWorker = _StubUploadWorker
+    MA.DatasheetWorker = _StubUploadWorker
     panel.AgentPanelWidget.reload_config = lambda self: None
     panel.AgentPanelWidget._auto_revive = lambda self, retry=None: None
     panel._backend_base = lambda: "http://127.0.0.1:1"
@@ -162,6 +165,8 @@ def _restore_stubs():
             panel.ChatWorker = value
         elif key == "UploadWorker":
             MA.UploadWorker = value
+        elif key == "DatasheetWorker":
+            MA.DatasheetWorker = value
         elif key == "reload_config":
             panel.AgentPanelWidget.reload_config = value
         elif key == "auto_revive":
@@ -437,8 +442,8 @@ def test_attach_button_exists_next_to_send():
            if foot.itemAt(i).widget() in order]
     eq(len(idx), 2, "附件按钮与发送键都应在输入区的按钮行里")
     ok(idx[0] < idx[1], "附件按钮应排在发送键之前")
-    eq(w.attach_btn.toolTip().startswith("添加模型压缩包附件"), True,
-       "附件按钮应有中文提示，说明只支持 .zip 与拖放")
+    contains(w.attach_btn.toolTip(), "PDF", "附件按钮应说明 PDF 支持")
+    contains(w.attach_btn.toolTip(), "ZIP", "附件按钮应说明 ZIP 支持")
 
 
 def test_non_zip_drop_is_reported_not_silently_ignored():
@@ -451,7 +456,7 @@ def test_non_zip_drop_is_reported_not_silently_ignored():
     accepted = w._drop_filter.eventFilter(w.chat, _drop_event(_mime_for([path])))
     eq(accepted, True, "过滤器应接管这次放下")
     texts = " | ".join(e["text"] for e in _entries(w, "A"))
-    contains(texts, "只支持 ZIP", "拖入非 ZIP 应给出明确提示")
+    contains(texts, "支持 ZIP 模型包和 PDF", "拖入不支持文件应给出明确提示")
     contains(texts, "notes.txt", "提示里应说明收到的是哪个文件")
 
 
@@ -463,7 +468,7 @@ def test_pick_zip_rejects_non_zip_path():
         f.write("x")
     w._start_zip_upload(path)
     eq(len(_entries(w, "A")), 1, "非 ZIP 不应建卡片，只留一条提示")
-    contains(_entries(w, "A")[0]["text"], "只支持 ZIP")
+    contains(_entries(w, "A")[0]["text"], "支持 ZIP 模型包和 PDF")
 
 
 # ---------------------------------------------------------------------------
@@ -1337,13 +1342,20 @@ def test_clear_chat_does_not_delete_model_assets():
         not_contains(panel_src, bad, "面板不应有删除模型资产的入口")
 
 
-def test_pending_attachments_are_not_persisted():
-    """待发送附件只在内存里：重启后不该把老附件又当成新附件发一遍。"""
-    w = _new_panel(("A",))
-    w._pending_attachments["A"] = [{"package_id": "p1",
-                                    "meta": {"filename": "a.zip"}}]
-    eq(json_dumps(w.projects_data).count('"pending_attachments"'), 0,
-       "待发送队列不应进projects.json")
+def test_pending_attachments_are_persisted_per_project():
+    """待发送附件队列随项目持久化；重启加载可恢复，而不是只留文件卡片。"""
+    w = _new_panel(("A", "B"))
+    attachment = {"package_id": "p1", "meta": {"filename": "a.zip"}}
+    w._pending_attachments["A"] = [attachment]
+    w._persist_pending()
+    eq(w.projects_data["projects"]["A"].get("pending_attachments"), [attachment],
+       "待发送队列必须镜像到所属项目")
+    eq(w.projects_data["projects"]["B"].get("pending_attachments"), [],
+       "队列不可跨项目")
+    # projects.json 确实落盘；重载时由 _load_projects_state 读取此字段
+    loaded, _restored = project_store.load(w._PROJECTS_FILE)
+    eq(loaded["projects"]["A"]["pending_attachments"], [attachment])
+    eq(loaded["projects"]["B"]["pending_attachments"], [])
 
 
 # ---------------------------------------------------------------------------
@@ -1359,6 +1371,48 @@ def test_card_renders_without_any_backend():
     ok(row.toggle.text(), "没有后端也要能把卡片画出来")
     w.reflow()
     ok(w.chat.item(0).sizeHint().height() > 0)
+
+
+def test_pdf_drop_receipt_is_project_bound_and_sent_as_text():
+    w = _new_panel(("A", "B"))
+    path = os.path.join(_TMP, "datasheet.pdf")
+    with open(path, "wb") as stream:
+        stream.write(b"%PDF-1.4\n")
+    w._drop_filter.eventFilter(w.chat, _drop_event(_mime_for([path])))
+    entry = _entries(w, "A")[0]
+    w._apply_project("B")
+    w._on_datasheet_done(entry, "A", {"ok": True, "sha256": "a" * 64,
+        "document_id": "a" * 64, "text": "PART123 10 pF", "chars": 13,
+        "has_text_layer": True, "parameter_extraction_safe": True})
+    eq(w._pending_attachments.get("B", []), [])
+    w._apply_project("A")
+    row = _one_row(w)
+    ok(row.import_btn.isHidden(), "PDF 不应出现 ZIP 的导入按钮")
+    w._on_send()
+    contains(w.history[0]["content"], "PART123 10 pF")
+    contains(w.history[0]["content"], "document_id")
+    eq(w._composer_attachments, [])
+
+
+def test_pdf_removed_before_parse_completion_is_not_queued():
+    w = _new_panel(("A",))
+    w._start_datasheet_parse(os.path.join(_TMP, "datasheet.pdf"))
+    record = w._composer_attachments[0]
+    w._remove_composer_attachment(record)
+    w._on_datasheet_done(record["entry"], "A", {"ok": True, "sha256": "b" * 64,
+        "document_id": "b" * 64, "text": "PART123", "parameter_extraction_safe": True})
+    eq(w._pending_attachments.get("A", []), [])
+
+
+def test_pdf_receipt_after_deleted_project_does_not_resurrect_project():
+    w = _new_panel(("A", "B"))
+    w._start_datasheet_parse(os.path.join(_TMP, "datasheet.pdf"))
+    entry = w._composer_attachments[0]["entry"]
+    w.projects_data["projects"].pop("A")
+    w._apply_project("B")
+    w._on_datasheet_done(entry, "A", {"ok": True, "sha256": "c" * 64, "text": "text"})
+    eq(w._pending_attachments.get("A", []), [])
+    ok("A" not in w.projects_data["projects"])
 
 
 # 替身在模块加载时装好（pytest 直接收集时也一样生效），_teardown 时逐个还原

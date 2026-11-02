@@ -48,6 +48,12 @@ def test_ortho_points_elbow():
        [(0, 0), (1, 0), (1, 5)], "纵向为主：目标侧竖直拐弯")
 
 
+def test_linear_fet_measured_pin_geometry():
+    eq(ads_ops._AUTO_PIN_OFFS["FET"],
+       {"1": (0.0, 0.0), "2": (0.5, 0.5), "3": (0.5, -0.5)},
+       "ADS 2027 FET: gate 1, drain 2, source 3")
+
+
 def test_rot_off_matches_measured_symbol_pins():
     # 实测：MLIN R90 的 2 脚在 origin+(0,1)；Term R180 的射频脚朝左
     eq(ads_ops._rot_off(1, 0, 90), (0, 1), "R90: (1,0)->(0,1)")
@@ -970,6 +976,44 @@ def test_fm_sc_shared_ground_groups_locally():
         if n in placed:
             ok(placed[n]["y"] >= -4.0,
                f"共享地下 {n} 仍应就近: {placed[n]}")
+
+
+def test_multistage_source_returns_stay_local():
+    """Both identical series source returns must stay below their own FET."""
+    inst = [{"name": "P1", "master": "ads_simulation:TermG"},
+            {"name": "P2", "master": "ads_simulation:TermG"},
+            {"name": "G", "master": "ads_rflib:GROUND"}]
+    for stage in (1, 2):
+        inst.extend({"name": f"{prefix}{stage}", "master": f"ads_rflib:{master}"}
+                    for prefix, master in (("Q", "FET"), ("R", "R"), ("L", "L")))
+    def wire(a, ap, b, bp):
+        return {"a": [a, ap], "b": [b, bp]}
+    conns = [wire("P1", 1, "Q1", 1), wire("Q1", 2, "Q2", 1),
+             wire("Q2", 2, "P2", 1)]
+    for stage in (1, 2):
+        conns += [wire(f"Q{stage}", 3, f"R{stage}", 1),
+                  wire(f"R{stage}", 2, f"L{stage}", 1),
+                  wire(f"L{stage}", 2, "G", 1)]
+    for cs in (conns, [dict(c, a=c["b"], b=c["a"])
+                       for c in reversed(conns)]):
+        ii, cc = ads_ops._localize_shared_grounds(inst, cs)
+        placed = ads_ops.auto_layout_positions(ii, cc)
+        for stage in (1, 2):
+            q, r, l = (placed[f"{prefix}{stage}"] for prefix in ("Q", "R", "L"))
+            ok(abs(l["x"] - q["x"]) < 1.5, "source inductor stays local")
+            eq(r["x"], l["x"], "series source parts share a column")
+            ok(l["y"] < r["y"] < q["y"], "source chain descends")
+        eq(len(ii), len(inst) + 1, "shared ground gets one local copy")
+        eq(len(cc), len(conns), "connections are preserved")
+        for c in cc:
+            for side, other in (("a", "b"), ("b", "a")):
+                if str(c[side][0]).startswith("G"):
+                    eq(placed[c[side][0]]["x"], placed[c[other][0]]["x"],
+                       "ground is directly below its branch")
+        ii2, cc2 = ads_ops._localize_shared_grounds(ii, cc)
+        eq(len(ii2), len(ii), "ground normalization is idempotent")
+    eq(len(inst), 9, "caller instances are not mutated")
+    eq(conns[-1]["b"][0], "G", "caller connections are not mutated")
 
 
 if __name__ == "__main__":

@@ -201,8 +201,9 @@ def test_protected_gets_accept_correct_token():
     eq(status, 200)
     data = _json(raw)
     for key in ("base_url", "model", "models", "has_key", "api_key_hint",
-                "sim_off_main_thread", "sim_timeout"):
+                "sim_off_main_thread", "sim_timeout", "context_budget_chars"):
         ok(key in data, f"/config 缺少字段 {key}")
+    eq(data["context_budget_chars"], server.CFG["context_budget_chars"])
     not_contains(raw, TOKEN, "/config 不应回显回环令牌")
     not_contains(raw, "test-key-not-a-real-secret", "/config 不应回显明文 API Key")
 
@@ -214,6 +215,14 @@ def test_protected_gets_accept_correct_token():
 # ---------------------------------------------------------------------------
 # POST 接口
 # ---------------------------------------------------------------------------
+
+def test_config_status_preserves_explicit_zero_context_budget():
+    from unittest.mock import patch
+    with patch.dict(server.CFG, {"context_budget_chars": 0}):
+        status, raw = _call("/config", token=TOKEN)
+        eq(status, 200)
+        eq(_json(raw)["context_budget_chars"], 0)
+
 
 def test_config_post_rejects_missing_token_and_does_not_write():
     before = _cfg_text()
@@ -509,6 +518,27 @@ def test_provider_switch_persists_shared_state_and_blocks_chat():
     status, raw = _call('/config', method='POST', token=TOKEN, body=connection)
     eq(status, 500)
     eq(server.config_mod.model_profile('toggle-a')['enabled'], True)
+
+
+def test_model_context_api_preserves_sibling_limits_and_reports_capacity():
+    payload = dict(base_url="https://contexts.invalid/v1", api_key="fake-context-key",
+                   model="ctx-a", provider_name="Context Test", provider_models=["ctx-a", "ctx-b"],
+                   context_model="ctx-a", context_window_tokens=8192)
+    status, raw = _call('/config', method='POST', token=TOKEN, body=payload)
+    eq(status, 200)
+    eq(_json(raw)['model_contexts']['ctx-a']['max'], 8192)
+    payload.update(provider_model="ctx-a", context_model="ctx-b", context_window_tokens=32768)
+    status, raw = _call('/config', method='POST', token=TOKEN, body=payload)
+    eq(status, 200)
+    eq(_json(raw)['model_contexts']['ctx-a']['max'], 8192)
+    eq(_json(raw)['model_contexts']['ctx-b']['max'], 32768)
+    status, raw = _call('/config/model', method='POST', token=TOKEN, body=dict(model="ctx-b"))
+    eq(status, 200)
+    eq(_json(raw)['context_window_tokens'], 32768)
+    payload.update(context_window_tokens=-10)
+    status, _ = _call('/config', method='POST', token=TOKEN, body=payload)
+    eq(status, 500)
+    eq(server.config_mod.model_profile('ctx-b')['context_window_tokens'], 32768)
 
 
 if __name__ == "__main__":

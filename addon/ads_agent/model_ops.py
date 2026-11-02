@@ -382,10 +382,17 @@ def _db_uu():
 
 
 def _require_workspace():
+    # 延迟导入 ads_ops：它在顶层 import 本模块，顶层互相引会循环。
+    # 无工作区文案/最近工作区记忆与 ads_ops 保持同一份 —— 模型包工具
+    # 报错时同样要指路 open_workspace，而不是各自一套说法。
+    import ads_ops
+
     de = _de()
     if not de.workspace_is_open():
-        raise RuntimeError("当前没有打开的工作区，请先在 ADS 中打开或新建一个 Workspace")
-    return de.active_workspace()
+        raise RuntimeError(ads_ops._no_workspace_hint())
+    ws = de.active_workspace()
+    ads_ops._remember_workspace(getattr(ws, "path", ""))
+    return ws
 
 
 def _norm_path(p) -> str:
@@ -424,13 +431,13 @@ def _workspace_guard(args: dict, action: str) -> tuple:
 def _cancel_requested(ctx) -> bool:
     """尽力探测取消信号。
 
-    **诚实说明**：当前 toolserver.JobContext（toolserver.py L327的
-    __slots__）只暴露 job_id / name / box / done / deferred /
-    sim_off_main_thread / _lock / _settled，**没有**取消标志；取消只
-    记在 toolserver 的 _active_jobs 里（那是 toolserver 的私有表，
-    本模块不该去戳）。所以这里按鸭子类型探测一个可选属性：将来
-    JobContext 补上 cancel_requested 就自动生效，现在恒为 False。
-    与其去猜一个不存在的属性，不如让调用链自己长出来。
+    toolserver.JobContext 现在提供了 ``cancelled()``（读 _active_jobs 的
+    cancel_requested 与 _cancelled_ids）以及 ``set_phase()``，所以下面的
+    鸭子类型探测会**自动生效**：取消不再只记在 toolserver 的私有表里，
+    而是能被仿真/建模路径真正读到。
+
+    仍然按鸭子类型探测而不是 import toolserver：本模块在离线脚本里也要能
+    单独 import，且 JobContext 的 __slots__ 不许被外部依赖成硬契约。
     """
     if ctx is None:
         return False
@@ -3557,9 +3564,12 @@ def _sim_phase(netlist: str, out_dir: str, dataset_name: str, netlist_path: str,
                  and hasattr(ctx, "defer") and hasattr(ctx, "finish"))
     if can_defer:
         def _worker():
+            # ctx 一路传下去：仿真子进程的取消与执行预算都靠它
+            # （JobContext.cancelled() / set_phase()，鸭子类型使用）。
             try:
                 finish(ads_ops._simulate(netlist, out_dir, dataset_name,
-                                         netlist_path, audit, note=note), None)
+                                         netlist_path, audit, note=note,
+                                         ctx=ctx), None)
             except Exception as e:  # noqa: BLE001
                 finish(None, e)
 
@@ -3571,7 +3581,7 @@ def _sim_phase(netlist: str, out_dir: str, dataset_name: str, netlist_path: str,
 
     try:
         result = ads_ops._simulate(netlist, out_dir, dataset_name, netlist_path,
-                                   audit, note=note)
+                                   audit, note=note, ctx=ctx)
     except Exception as e:  # noqa: BLE001
         if finish is not None:
             finish(None, e)

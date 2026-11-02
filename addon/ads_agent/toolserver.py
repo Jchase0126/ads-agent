@@ -30,6 +30,7 @@ import threading
 import time
 import sys
 import traceback
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import authbridge
@@ -313,8 +314,17 @@ def _sim_off_main_thread() -> bool:
 #   tool_queue_capacity   排队作业数上限，满了直接拒绝（503），不再无限堆积
 #   pump_max_jobs         Qt 主线程每次 pump() 最多执行的作业数 —— 防止大量
 #                         排队作业一次性占死界面线程
+#   pump_time_budget_ms   pump() 软时间预算（毫秒）：超时即停止"启动下一个
+#                         作业"（正在执行的处理器不受影响，主线程无法抢占）
+#   active_job_limit      活跃（执行中/已转后台，不含排队）作业数上限，
+#                         满了同样拒绝（503），防止后台线程被作业淹没
+#   gui_heartbeat_ms      GUI 心跳定时器间隔：独立 QTimer 只写时间戳，
+#                         /health 以此判断"主线程是否疑似阻塞"
 _DEFAULT_QUEUE_CAPACITY = 64
 _DEFAULT_PUMP_MAX_JOBS = 16
+_DEFAULT_PUMP_TIME_BUDGET_MS = 8.0    # pump 软时间预算（毫秒）
+_DEFAULT_ACTIVE_JOB_LIMIT = 4         # 活跃（执行中/已转后台）作业上限
+_DEFAULT_GUI_HEARTBEAT_MS = 200       # GUI 心跳定时器间隔
 
 
 class BusyError(RuntimeError):
@@ -343,6 +353,25 @@ _job_seq = itertools.count(1)
 _cancelled_ids: set = set()
 _cancel_lock = threading.Lock()
 
+# 入队锁：submit 的"容量检查 → 活跃上限检查 → 登记 → put"必须整体原子，
+# 否则并发提交会在检查与 put 之间互相插队，超卖队列名额
+_enqueue_lock = threading.Lock()
+
+# 终态作业小历史（最新在尾部）：请求超时返回后，作业"其实执行到什么程度"
+# 仍可经 job_snapshot() 查询。字段见 _job_settle。
+_finished_jobs: "deque" = deque(maxlen=256)
+
+# GUI 心跳（monotonic 时间戳；0.0 = 从未刷新）。pump() 每次执行刷新兜底，
+# ensure_heartbeat_timer() 在有 Qt 事件循环时用独立 QTimer 高频刷新。
+# 心跳停跳只说明"主线程疑似阻塞"，不能断言死锁。
+_gui_heartbeat: float = 0.0
+_heartbeat_timer = None  # QTimer，创建于 Qt 主线程
+
+# 限频：pump 预算截断日志与 set_phase 同名阶段日志各自的最低间隔，防刷屏
+_BUDGET_LOG_INTERVAL_S = 5.0
+_PHASE_LOG_INTERVAL_S = 5.0
+_last_budget_log: float = 0.0
+
 
 def _queue_capacity() -> int:
     try:
@@ -358,6 +387,77 @@ def _pump_max_jobs() -> int:
                                    str(_DEFAULT_PUMP_MAX_JOBS))))
     except (TypeError, ValueError):
         return _DEFAULT_PUMP_MAX_JOBS
+
+
+def _pump_time_budget_ms() -> float:
+    """pump() 软时间预算（毫秒）。<=0 视为不限制（不建议）。"""
+    try:
+        value = float(_setting("agent", "pump_time_budget_ms",
+                               str(_DEFAULT_PUMP_TIME_BUDGET_MS)))
+    except (TypeError, ValueError):
+        return _DEFAULT_PUMP_TIME_BUDGET_MS
+    return value if value > 0 else 0.0
+
+
+def _active_job_limit() -> int:
+    """活跃（执行中/已转后台，不含纯排队）作业数上限。"""
+    try:
+        return max(1, int(_setting("agent", "active_job_limit",
+                                   str(_DEFAULT_ACTIVE_JOB_LIMIT))))
+    except (TypeError, ValueError):
+        return _DEFAULT_ACTIVE_JOB_LIMIT
+
+
+def _gui_heartbeat_ms() -> int:
+    """GUI 心跳定时器间隔（毫秒），下限 20ms 防止误配成 0 打满 CPU。"""
+    try:
+        return max(20, int(_setting("agent", "gui_heartbeat_ms",
+                                    str(_DEFAULT_GUI_HEARTBEAT_MS))))
+    except (TypeError, ValueError):
+        return _DEFAULT_GUI_HEARTBEAT_MS
+
+
+def _touch_gui_heartbeat() -> None:
+    """刷新 GUI 心跳时间戳（monotonic）。
+
+    任何线程调用都安全：只写一个 float（GIL 下原子）。GUI 线程上的独立
+    QTimer 高频刷新；pump() 每次执行也刷新兜底。心跳停跳只说明"主线程
+    疑似阻塞"（长时间没回到事件循环），不能断言死锁。
+    """
+    global _gui_heartbeat
+    _gui_heartbeat = time.monotonic()
+
+
+def ensure_heartbeat_timer():
+    """在 Qt 主线程创建独立的 GUI 心跳 QTimer（与 pump 定时器分开）。
+
+    只在 QApplication/QCoreApplication 实例已存在时创建；后端进程与测试
+    没有事件循环，返回 None（pump() 的兜底刷新仍然有效）。重复调用复用
+    已有定时器（与 ensure_started 的 _pump_timer 同一套防重入风格，模块
+    重载时最多泄漏一个空转定时器，与现状一致、无副作用）。
+    """
+    global _heartbeat_timer
+    if _heartbeat_timer is not None:
+        return _heartbeat_timer
+    try:
+        import qtcompat
+
+        QtCore = qtcompat.QtCore()
+        app = QtCore.QCoreApplication.instance()
+        if app is None:
+            return None
+        timer = QtCore.QTimer()
+        timer.timeout.connect(_touch_gui_heartbeat)
+        interval = _gui_heartbeat_ms()
+        timer.setInterval(interval)
+        timer.start()
+        _heartbeat_timer = timer
+        _log("INFO", f"GUI 心跳定时器已启动（{interval}ms，独立于 pump）")
+        return timer
+    except Exception as e:  # noqa: BLE001 — 心跳失败绝不能影响工具服务
+        _log("WARN", f"GUI 心跳定时器创建失败（仅影响主线程活性探测）: "
+                     f"{type(e).__name__}: {e}")
+        return None
 
 
 def request_cancel(client_ids) -> dict:
@@ -391,9 +491,39 @@ def request_cancel(client_ids) -> dict:
                 out["cancelled"].append(cid)
     if out["running"]:
         _log("INFO", f"取消请求：已开跑不可中断 {out['running']}（标记 cancel_requested）")
+        # 仿真作业是个例外：它的子进程是本插件自己 spawn 的，可以**真的**
+        # 终止。这里主动踢一脚，而不是等 _simulate 的等待循环下一轮才
+        # 发现取消标志 —— 用户按下停止后 hpeesofsim 应该马上开始收尾。
+        _cancel_running_sims(out["running"])
     if out["cancelled"]:
         _log("INFO", f"取消请求：排队中已跳过 {out['cancelled']}")
     return out
+
+
+def _cancel_running_sims(client_ids) -> None:
+    """对正在跑的仿真子进程发起终止（只针对本插件 spawn 的 pid）。
+
+    尽力而为：没有仿真在跑、或 ads_ops 尚未加载时静默跳过。这里**不**把
+    结果写进回执 —— 回执里的 "running" 表示"已请求取消"，进程是否真的
+    退出由 /health 与 job_snapshot() 的最终状态如实反映。
+    """
+    try:
+        # 直接用已加载的 ads_ops，**不走 _get_ads_ops()**：那个会做热重载，
+        # 重载后 _SIM_PROCS 是新的空表，我们就会"取消不到正在跑的进程"。
+        ads_ops = sys.modules.get("ads_ops")
+        cancel = getattr(ads_ops, "cancel_sim_process", None) if ads_ops else None
+        if cancel is None:
+            return
+        for cid in client_ids:
+            try:
+                receipt = cancel(None, str(cid))
+                if receipt.get("outcome") not in (None, "not_running"):
+                    _log("INFO", f"仿真子进程已终止：job={cid} outcome={receipt['outcome']} "
+                                 f"pid={receipt.get('pid')}")
+            except Exception as e:  # noqa: BLE001 — 取消失败不能连累整个取消回执
+                _log("WARN", f"终止仿真子进程失败：job={cid} {type(e).__name__}: {e}")
+    except Exception as e:  # noqa: BLE001 — ads_ops 不可用（未安装/热重载中）
+        _log("WARN", f"取消仿真跳过：{type(e).__name__}: {e}")
 
 
 def _job_begin(name: str, client_id: str = "") -> int:
@@ -401,11 +531,12 @@ def _job_begin(name: str, client_id: str = "") -> int:
     with _jobs_lock:
         _active_jobs[jid] = {"name": name, "started": time.time(), "timed_out": False,
                              "client_id": str(client_id or ""), "cancel_requested": False,
-                             "queued": True}
+                             "queued": True, "phase": ""}
     return jid
 
 
 def _job_end(jid: int) -> None:
+    """仅摘除忙碌记录（兼容旧调用；正式收尾请用 _job_settle 写终态历史）。"""
     with _jobs_lock:
         _active_jobs.pop(jid, None)
 
@@ -417,6 +548,79 @@ def _job_mark_timeout(jid: int) -> None:
             rec["timed_out"] = True
 
 
+def _job_settle(jid: int, state: str, was_queued: bool = None) -> None:
+    """终态收尾：从忙碌表摘除，并写一条终态历史（_finished_jobs）。
+
+    state ∈ succeeded | failed | cancelled | timed_out。请求已超时
+    （_job_mark_timeout 打过标记）而作业最终又跑完的，如实记为
+    timed_out —— 调用方拿到的就是超时结果，不谎报成功。
+
+    was_queued：pump 在"跳过执行"路径上需要显式传 True —— 取到作业的
+    那一刻 queued 标志已翻转，不能据此谎称作业已开跑过。
+    """
+    with _jobs_lock:
+        rec = _active_jobs.pop(jid, None)
+        if rec is None:
+            return
+        if rec.get("timed_out") and state == "succeeded":
+            state = "timed_out"
+        _finished_jobs.append({
+            "id": jid,
+            "name": rec["name"],
+            "state": state,
+            "elapsed_s": round(time.time() - rec["started"], 3),
+            "cancel_requested": bool(rec.get("cancel_requested")),
+            "queued": bool(rec.get("queued")) if was_queued is None else bool(was_queued),
+            "client_id": str(rec.get("client_id") or ""),
+        })
+
+
+def _phase_of(rec: dict) -> str:
+    """作业阶段：处理器自报的细粒度阶段优先，否则给生命周期粗粒度阶段。
+
+    排队时是 "queued"，开跑后处理器还没 set_phase 之前是 "running" ——
+    这样 /health 的 jobs[].phase 既不会空着，也不会把排队作业误报成执行中。
+    """
+    phase = str(rec.get("phase") or "")
+    if phase:
+        return phase
+    return "queued" if rec.get("queued") else "running"
+
+
+def job_snapshot(client_id=None) -> list:
+    """按调用方作业标识（client_id，即 /execute 的 job_id）查询作业真实状态。
+
+    解决"请求已经超时（调用方拿到 504），作业其实还在执行 / 刚刚完成"
+    时的真实状态查询。返回项的 state ∈ {queued, running, succeeded,
+    failed, cancelled, timed_out}：活跃作业带 phase 与 timed_out 标记；
+    终态记录含 elapsed_s / cancel_requested / queued。client_id 为 None
+    时返回全部（活跃在前，终态按最新在前）。
+    """
+    cid = str(client_id) if client_id else None
+    now = time.time()
+    out: list = []
+    with _jobs_lock:
+        for jid, rec in sorted(_active_jobs.items()):
+            if cid is not None and rec.get("client_id") != cid:
+                continue
+            out.append({
+                "id": jid,
+                "name": rec["name"],
+                "state": "queued" if rec.get("queued") else "running",
+                "phase": _phase_of(rec),
+                "elapsed_s": round(now - rec["started"], 1),
+                "timed_out": bool(rec.get("timed_out")),
+                "cancel_requested": bool(rec.get("cancel_requested")),
+                "queued": bool(rec.get("queued")),
+                "client_id": str(rec.get("client_id") or ""),
+            })
+        for rec in reversed(_finished_jobs):
+            if cid is not None and rec.get("client_id") != cid:
+                continue
+            out.append(dict(rec))
+    return out
+
+
 def active_jobs() -> list:
     """当前仍在执行的作业（含已超时但后台线程还没结束的），按开始顺序。"""
     now = time.time()
@@ -425,9 +629,16 @@ def active_jobs() -> list:
             {
                 "id": jid,
                 "name": rec["name"],
+                # state 与 job_snapshot() 同义：排队 / 执行中。phase 是处理器
+                # 自报的阶段明细（可能仍是 "running"），两者不要混用。
+                "state": "queued" if rec.get("queued") else "running",
                 "elapsed_s": round(now - rec["started"], 1),
                 "timed_out": bool(rec["timed_out"]),
                 "cancel_requested": bool(rec.get("cancel_requested")),
+                "queued": bool(rec.get("queued")),
+                # 处理器还没自报阶段时按生命周期给出粗粒度阶段，
+                # 避免 /health 里排队作业显示成 "running" 或空白
+                "phase": _phase_of(rec),
             }
             for jid, rec in sorted(_active_jobs.items())
         ]
@@ -435,10 +646,10 @@ def active_jobs() -> list:
 _ADS_OPS_PATH = os.path.join(_HERE, "ads_ops.py")
 # ads_ops 依赖的本地纯计算模块：ads_ops 热重载前要先重载它们，
 # 否则 reload(ads_ops) 里的 import 命中 sys.modules 缓存，改了也不生效
-_ADS_OPS_DEPS = ("rf_audit", "model_ops")
+_ADS_OPS_DEPS = ("rf_audit", "model_ops", "netlist_check")
 
 
-def _get_ads_ops():
+def _get_ads_ops(starting_job_id=None):
     """取 ads_ops 模块，文件改动过就热重载。
 
     没有这个机制时，每次改 ads_ops.py 都得重启 ADS（要重新打开 workspace、
@@ -469,10 +680,13 @@ def _get_ads_ops():
         return ads_ops
     if loaded == _fingerprint():
         return ads_ops
-    if _active_jobs:
+    with _jobs_lock:
+        running = [jid for jid, rec in _active_jobs.items()
+                   if jid != starting_job_id and not rec.get("queued", False)]
+    if running:
         # 有作业正在执行：推迟热重载，防止任务中途切换模块版本
         # （下个 pump 周期空闲了会自动再试）
-        _log("INFO", f"ads_ops.py 有新版本，但当前 {len(_active_jobs)} 个作业在执行，"
+        _log("INFO", f"ads_ops.py 有新版本，但当前 {len(running)} 个作业在执行，"
                      f"热重载推迟到空闲")
         return ads_ops
 
@@ -508,6 +722,8 @@ class JobContext:
       * ``ctx.finish(result)``       后台线程结束时回填结果
       * ``ctx.fail(message)``        后台线程失败时回填错误
       * ``ctx.note(message)``        记一条进度到 ads_toolserver.log
+      * ``ctx.cancelled()``          是否已请求取消（线程安全，随时可查）
+      * ``ctx.set_phase(name)``      更新作业阶段（/health jobs[].phase 可见）
       * ``ctx.sim_off_main_thread``  是否允许把仿真移出主线程
 
     为什么需要它：keysight.ads.de 必须在 Qt 主线程调用，而 pump() 是主线程里
@@ -515,26 +731,68 @@ class JobContext:
     （打开设计、生成网表）留在主线程，把"不碰 DE 数据库"的仿真交给后台线程，
     主线程就能立刻回到事件循环。
 
-    收尾（无论走哪条路）都会把本作业从 ``_active_jobs`` 摘掉 ——
-    /health 的"忙碌"状态因此始终等于"确实还在跑的作业集合"。
+    收尾（无论走哪条路）都会把本作业从 ``_active_jobs`` 摘掉并写一条终态
+    历史（``_finished_jobs``）—— /health 的"忙碌"状态因此始终等于"确实
+    还在跑的作业集合"，收尾后的真实结局可经 job_snapshot() 查询。
     """
 
     __slots__ = ("job_id", "name", "box", "done", "deferred", "sim_off_main_thread",
-                 "_lock", "_settled")
+                 "client_id", "_lock", "_settled", "_phase_log")
 
     def __init__(self, job_id: int, name: str, box: dict, done: threading.Event,
-                 sim_off_main_thread: bool = False):
+                 sim_off_main_thread: bool = False, client_id: str = ""):
         self.job_id = job_id
         self.name = name
         self.box = box
         self.done = done
         self.deferred = False
         self.sim_off_main_thread = sim_off_main_thread
+        self.client_id = str(client_id or "")
         self._lock = threading.Lock()
         self._settled = False
+        self._phase_log = ["", 0.0]   # [上次记录的阶段, 上次记录时间]，限频用
 
     def defer(self) -> None:
         self.deferred = True
+
+    def cancelled(self) -> bool:
+        """是否已请求取消（/cancel 对执行中作业只打标记、不强杀）。
+
+        处理器应在安全边界（例如仿真主循环的迭代间隙）自查并尽早收尾；
+        返回 True 时由处理器自己决定如何结束 —— 作业的最终状态如实反映
+        处理器的实际结局，不会被谎报成"已中断"。线程安全。
+        """
+        with _jobs_lock:
+            rec = _active_jobs.get(self.job_id)
+            if rec is not None and rec.get("cancel_requested"):
+                return True
+        if self.client_id:
+            with _cancel_lock:
+                return self.client_id in _cancelled_ids
+        return False
+
+    def set_phase(self, phase: str) -> None:
+        """更新作业阶段（线程安全）；/health 的 jobs[].phase 可见。
+
+        阶段变化立即记一条 INFO 日志；同名阶段重复上报按
+        _PHASE_LOG_INTERVAL_S 限频，防止长循环里反复上报刷屏。
+        """
+        phase = str(phase or "").strip()
+        if not phase:
+            return
+        now = time.monotonic()
+        with self._lock:
+            should_log = (phase != self._phase_log[0]
+                          or now - self._phase_log[1] >= _PHASE_LOG_INTERVAL_S)
+            if should_log:
+                self._phase_log[0] = phase
+                self._phase_log[1] = now
+        with _jobs_lock:
+            rec = _active_jobs.get(self.job_id)
+            if rec is not None:
+                rec["phase"] = phase
+        if should_log:
+            _log("INFO", f"{self.name} 阶段: {phase}")
 
     def finish(self, result) -> None:
         self._settle("result", result)
@@ -552,7 +810,9 @@ class JobContext:
                 return
             self._settled = True
         self.box[key] = value
-        _job_end(self.job_id)      # 真正收尾了才从忙碌表里摘掉
+        # 真正收尾了才从忙碌表摘掉，并写终态历史
+        # （请求超时后后台才跑完的，如实记 timed_out，不谎报成功）
+        _job_settle(self.job_id, "failed" if key == "error" else "succeeded")
         self.done.set()
 
 
@@ -570,30 +830,62 @@ def submit(name: str, args: dict, timeout: float = 300.0,
         后台线程无法被强制终止，作业仍留在 ``_active_jobs`` 里并打上
         ``timed_out`` 标记：/health 继续如实报告"还在跑"。
 
-    队列满时抛 ``BusyError``（HTTP 503），调用方稍后重试。
+    队列满或活跃作业达到上限时抛 ``BusyError``（HTTP 503），调用方稍后
+    重试。容量检查、活跃上限检查、登记与入队在 ``_enqueue_lock`` 内整体
+    原子完成 —— 分开的话并发提交会在检查与 put 之间互相插队，超卖名额。
     """
     done = threading.Event()
     box: dict = {}
     # 总预算 deadline = now + timeout；HTTP 等待多给 2s 宽限，让 pump 能在
     # 放弃之前把"排队超时（未执行）"如实回填给调用方，而不是一律 504
     deadline = time.time() + max(1.0, float(timeout))
-    if _jobs.qsize() >= _queue_capacity():
-        raise BusyError(
-            f"ADS 工具队列已满（{_queue_capacity()}），请稍后重试；"
-            f"当前可能有仿真或建图正在执行（见 /health）"
-        )
-    jid = _job_begin(name, client_id)
-    _jobs.put((jid, name, args, box, done, deadline, str(client_id or "")))
+    cid = str(client_id or "")
+    with _enqueue_lock:
+        if _jobs.qsize() >= _queue_capacity():
+            raise BusyError(
+                f"ADS 工具队列已满（{_queue_capacity()}），请稍后重试；"
+                f"当前可能有仿真或建图正在执行（见 /health）"
+            )
+        # 活跃上限：执行中 + 已转后台（deferred）的作业数（不含纯排队）。
+        # deferred 作业后台线程可能要跑几分钟，不设上限会把后台线程淹没。
+        with _jobs_lock:
+            running = sum(1 for rec in _active_jobs.values()
+                          if not rec.get("queued"))
+            limit = _active_job_limit()
+        if running >= limit:
+            raise BusyError(
+                f"ADS 活跃作业已达上限（{running}/{limit} 个执行中或后台作业），"
+                f"请稍后重试；详情见 /health"
+            )
+        jid = _job_begin(name, cid)
+        _jobs.put((jid, name, args, box, done, deadline, cid))
     if not done.wait(float(timeout) + 2.0):
         _job_mark_timeout(jid)
         raise TimeoutError(f"工具 {name} 在 {timeout:.0f}s 内未完成")
     if "error" in box:
+        if box.get("kind") == "precondition":
+            raise PreconditionFailure(box["error"])
         raise RuntimeError(box["error"])
     return box["result"]
 
 
+class PreconditionFailure(RuntimeError):
+    """HTTP 层据此返回 400：请求本身没错，但当前状态不满足前置条件。"""
+
+
 def _ms(since: float) -> str:
     return f"{int((time.perf_counter() - since) * 1000)}ms"
+
+
+def _log_budget_truncated(remaining: int) -> None:
+    """pump 时间预算截断日志（限频，防止长队列每个 tick 刷一条）。"""
+    global _last_budget_log
+    now = time.monotonic()
+    if now - _last_budget_log < _BUDGET_LOG_INTERVAL_S:
+        return
+    _last_budget_log = now
+    _log("INFO", f"pump 时间预算用尽，本 tick 停止启动新作业"
+                 f"（队列剩余 {remaining} 个，执行中的处理器不受影响）")
 
 
 def pump() -> None:
@@ -607,18 +899,38 @@ def pump() -> None:
     取消/过期的作业在取出的那一刻直接跳过执行并收尾：
       * 已取消（client_id 在 _cancelled_ids）—— "已取消，未执行"；
       * 排队超时（now > deadline）—— "排队超时，未执行"。
+
+    软时间预算 ``pump_time_budget_ms``：本 tick 从开始计时，预算用尽就
+    停止"启动下一个作业"（剩余留在队列里）。它**绝不会中断正在执行的
+    处理器** —— ADS 主线程上的处理器无法被安全抢占；预算只决定要不要
+    再拿一个新的。作业数上限 ``pump_max_jobs`` 仍然同时生效。
     """
+    _touch_gui_heartbeat()      # pump 在跑 = 主线程活着（心跳兜底刷新）
     executed = 0
+    budget_ms = _pump_time_budget_ms()
+    tick_t0 = time.perf_counter()
     while executed < _pump_max_jobs():
+        # 软时间预算检查（放在取作业之前：只挡"启动下一个"，不碰在跑的）。
+        # executed 为 0 时不截断：预算再小也必须让本 tick 至少推进一个作业，
+        # 否则队列会永久饿死（misconfig / 极小预算 = 所有请求等到超时）。
+        if (executed > 0 and budget_ms > 0
+                and (time.perf_counter() - tick_t0) * 1000.0 >= budget_ms):
+            remaining = _jobs.qsize()
+            if remaining:
+                _log_budget_truncated(remaining)
+            break
         try:
             jid, name, args, box, done, deadline, client_id = _jobs.get_nowait()
         except queue.Empty:
             return
-        # 作业开跑：queued 标志翻转，取消判定从这里起只能"标记"不能"跳过"
+        # 作业开跑：queued 标志翻转，取消判定从这里起只能"标记"不能"跳过"。
+        # 翻转前先快照"取到时还在排队"，跳过路径的终态历史靠它如实记录。
         with _jobs_lock:
             rec = _active_jobs.get(jid)
+            was_queued = bool(rec.get("queued")) if rec is not None else True
             if rec is not None:
                 rec["queued"] = False
+                rec["phase"] = "running"
             was_cancelled = (rec.get("cancel_requested") if rec is not None
                              else False)
         if not was_cancelled and client_id:
@@ -629,7 +941,7 @@ def pump() -> None:
         if was_cancelled:
             box["error"] = f"工具 {name} 已被用户取消（排队中跳过，未执行）"
             _log("INFO", f"{name} 已取消（client_id={client_id}），跳过执行")
-            _job_end(jid)
+            _job_settle(jid, "cancelled", was_queued=was_queued)
             done.set()
             executed += 1
             continue
@@ -637,14 +949,19 @@ def pump() -> None:
             box["error"] = (f"工具 {name} 排队超时：截止时间已过仍未开始执行"
                             f"（主线程忙或前面的作业耗时过长），本次未执行")
             _log("WARN", f"{name} 排队超时（client_id={client_id}），跳过执行")
-            _job_end(jid)
+            _job_settle(jid, "timed_out", was_queued=was_queued)
             done.set()
             executed += 1
             continue
-        ctx = JobContext(jid, name, box, done, sim_off_main_thread=_sim_off_main_thread())
+        ctx = JobContext(jid, name, box, done,
+                         sim_off_main_thread=_sim_off_main_thread(),
+                         client_id=client_id)
         _t0 = time.perf_counter()
         try:
-            ads_ops = _get_ads_ops()
+            # This request has not entered its handler yet. Queued requests
+            # and this starting request must not prevent an idle reload;
+            # another running/deferred job still blocks it.
+            ads_ops = _get_ads_ops(starting_job_id=jid)
 
             handler = ads_ops.DISPATCH.get(name)
             if handler is None:
@@ -659,7 +976,7 @@ def pump() -> None:
                                     f"[{gate.get('code') or 'denied'}]：{gate.get('reason')}")
                     _log("WARN", f"{name} 被兼容门禁拒绝 [{gate.get('code')}]: "
                                  f"{gate.get('reason')}")
-                    _job_end(jid)
+                    _job_settle(jid, "failed")
                     done.set()
                     executed += 1
                     continue
@@ -683,13 +1000,17 @@ def pump() -> None:
             # 否则 HTTP 线程会一直等到超时。fail() 会把作业标记为已收尾，
             # 后台线程稍后再 finish() 也不会覆盖这个错误。
             ctx.deferred = False
+            # 前置条件（未打开工作区、最近记录失效）是调用方可直接改正的状态
+            # 问题，不是服务崩溃：保留类别，让 HTTP 层回 4xx 而不是 500。
+            if isinstance(e, getattr(ads_ops, "PreconditionError", ())):
+                box["kind"] = "precondition"
             ctx.fail(f"{type(e).__name__}: {e}")
         finally:
             # 只有"本次作业真的结束了"才摘掉忙碌记录；
             # defer 过的作业交给后台线程收尾（_settle 里摘），
             # 否则一个作业结束会把其它仍在跑的作业的状态一起清空。
             if not ctx.deferred:
-                _job_end(jid)
+                _job_settle(jid, "failed" if "error" in box else "succeeded")
                 done.set()
         executed += 1
 
@@ -716,6 +1037,14 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             jobs = active_jobs()
             head = jobs[0] if jobs else None
+            # GUI 心跳：pump()/独立 QTimer 每次都会刷新时间戳。age 为 None
+            # 表示从未刷新（后端进程/测试没有主线程泵）。心跳陈旧只说明
+            # "主线程疑似阻塞"（长时间没回到事件循环），不能断言死锁。
+            hb = _gui_heartbeat
+            hb_interval_ms = _gui_heartbeat_ms()
+            hb_age_ms = (round((time.monotonic() - hb) * 1000.0) if hb else None)
+            heartbeat_stale = bool(hb_age_ms is not None
+                                   and hb_age_ms > max(2000, 4 * hb_interval_ms))
             # 开放接口：只报告"忙不忙"和作业名/时长，不含任何令牌信息
             self._json({
                 "status": "ok",
@@ -737,6 +1066,17 @@ class _Handler(BaseHTTPRequestHandler):
                 # 请求已超时但后台线程仍在跑的作业数（界面据此说明"还在收尾"）
                 "timed_out_count": sum(1 for j in jobs if j["timed_out"]),
                 "cancel_requested_count": sum(1 for j in jobs if j.get("cancel_requested")),
+                # 正在按取消意图收尾的**执行中**作业数（排队待跳过的不算
+                # "正在取消"，它们下一拍就会被直接跳过；与
+                # cancel_requested_count 的差值即"排队等跳过"的数量）
+                "cancelling_count": sum(1 for j in jobs if j.get("cancel_requested")
+                                        and not j.get("queued")),
+                # 活跃作业上限（与 busy_count 对照即可看出是否接近饱和）
+                "active_limit": _active_job_limit(),
+                # 终态作业小历史长度：job_snapshot() 可查收尾后的真实结局
+                "finished_recent": len(_finished_jobs),
+                "gui_heartbeat_age_ms": hb_age_ms,
+                "heartbeat_stale": heartbeat_stale,
                 # 身份：让探测方能确认"这是不是我这份安装的工具服务"。
                 # 面板/后端据此识别"另一个 ADS Agent 安装的 toolserver 占着端口"
                 # 的情况，而不是连上去才发现令牌对不上。见 backend/instance.py
@@ -826,13 +1166,16 @@ class _Handler(BaseHTTPRequestHandler):
             result = submit(name, args, timeout=timeout, client_id=client_id)
             self._json(result)
         except BusyError as e:
-            _log("WARN", f"{name} 拒绝（队列满）: {e}")
+            _log("WARN", f"{name} 拒绝（忙碌）: {e}")
             self._json({"error": str(e), "kind": "busy", "job_id": client_id}, 503)
         except TimeoutError as e:
             _log("ERROR", f"{name} 执行超时 >{timeout}s")
             # job_id 原样带回：调用方可以稍后用 /health 查它是否仍在收尾
             self._json({"error": str(e), "kind": "exec_timeout",
                         "job_id": client_id}, 504)
+        except PreconditionFailure as e:
+            _log("WARN", f"{name} 前置条件未满足: {e}")
+            self._json({"error": str(e), "kind": "precondition"}, 400)
         except RuntimeError as e:
             _log("ERROR", f"{name} 运行错误: {e}")
             self._json({"error": str(e)}, 500)
@@ -860,6 +1203,11 @@ def ensure_started() -> str:
         _pump_timer.timeout.connect(pump)
         _pump_timer.start(50)  # ms
 
+    # GUI 心跳：独立于 pump 的 QTimer（同样在 Qt 主线程创建），只写时间戳。
+    # pump 定时器在 toolserver.py 内创建（ensure_started），心跳就近挂接；
+    # 无 Qt 事件循环时（后端进程/测试）返回 None，pump 兜底刷新仍有效。
+    ensure_heartbeat_timer()
+
     if _server is None:
         host = _setting("ads", "host", "127.0.0.1")
         port = int(_setting("ads", "port", "8761"))
@@ -881,11 +1229,18 @@ def ensure_started() -> str:
 
 
 def shutdown() -> None:
-    global _server, _server_thread, _pump_timer
+    global _server, _server_thread, _pump_timer, _heartbeat_timer
     if _pump_timer is not None:
         _pump_timer.stop()
         _pump_timer.deleteLater()
         _pump_timer = None
+    if _heartbeat_timer is not None:
+        try:
+            _heartbeat_timer.stop()
+            _heartbeat_timer.deleteLater()
+        except Exception:  # noqa: BLE001 — 关停路径不抛异常
+            pass
+        _heartbeat_timer = None
     if _server is not None:
         _server.shutdown()
         _server.server_close()

@@ -253,6 +253,13 @@ def generate_menu(addon, win_def) -> None:
         )
         menu.add_action(
             app.Action(
+                "RF 计算器（AppCAD 风格）…",
+                lambda action, window: _open_rfcalc_panel(),
+                None,
+            )
+        )
+        menu.add_action(
+            app.Action(
                 "启动/重启工具服务",
                 lambda action, window: _ensure_server(),
                 None,
@@ -285,6 +292,23 @@ def _open_panel() -> None:
         panel.open_panel()
     except Exception as e:  # noqa: BLE001
         _show_message("ADS Agent", "无法打开对话面板", f"{type(e).__name__}: {e}", warning=True)
+
+
+def _open_rfcalc_panel() -> None:
+    try:
+        _ensure_sys_path()
+        import rfcalc_panel
+
+        parent = None
+        try:
+            import keysight.ads.de.app as app
+
+            parent = app.window.main_window().qwidget
+        except Exception:  # noqa: BLE001 — 拿不到主窗口就退化独立窗口
+            parent = None
+        rfcalc_panel.open_rfcalc_panel(parent)
+    except Exception as e:  # noqa: BLE001
+        _show_message("ADS Agent", "无法打开 RF 计算器", f"{type(e).__name__}: {e}", warning=True)
 
 
 def _show_message(title: str, text: str, details: str = "", warning: bool = False) -> None:

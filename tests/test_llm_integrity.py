@@ -321,6 +321,104 @@ def test_context_budget_keeps_system_requirement_and_tail():
     eq(turn._apply_context_budget(short), short)
 
 
+def _tool_pairs_valid(messages: list) -> bool:
+    """API 配对不变量：每条 tool 消息的 owner assistant 必须在其前方连续出现。"""
+    active: set = set()
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            active = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
+        elif role == "tool":
+            if m.get("tool_call_id") not in active:
+                return False
+        else:
+            active = set()
+    return True
+
+
+def test_context_budget_never_orphans_tool_messages():
+    """实测线上 400：预算切在 assistant(tool_calls) 与其 tool 响应之间。
+
+    旧实现从最新往回收，assistant 被挤出预算、它的 tool 响应留在尾部
+    → HTTP 400 "Messages with role 'tool' must be a response to a
+    preceding message with 'tool_calls'"。修剪后必须保持配对完整。
+    """
+    tool_calls = [{"id": "c1", "type": "function",
+                   "function": {"name": "list_designs", "arguments": "{}"}}]
+    messages = [
+        {"role": "system", "content": "S" * 100},
+        {"role": "user", "content": "N" * 100},
+        {"role": "assistant", "content": "A" * 100, "tool_calls": tool_calls},
+        {"role": "tool", "tool_call_id": "c1", "content": "R" * 100},
+        {"role": "assistant", "content": "F" * 100},
+    ]
+    # 预算 600：head(system+user)=248；尾部 final(124)+tool(124) 放得下，
+    # assistant-with-tool_calls(≈194) 放不下 —— 恰好制造孤儿边界。
+    turn = agent.Turn({"llm_model": "m", "context_budget_chars": 600}, [])
+    out = turn._apply_context_budget(messages)
+    ok(_tool_pairs_valid(out), f"修剪后不得出现孤儿 tool 消息: {out}")
+    eq(out[-1]["content"], "F" * 100, "最近的 assistant 消息必须保留")
+    # 并行工具调用：响应都在尾部、owner 被挤掉 → 全部按孤儿处理
+    calls2 = [{"id": "a1", "type": "function",
+               "function": {"name": "t1", "arguments": "{}"}},
+              {"id": "a2", "type": "function",
+               "function": {"name": "t2", "arguments": "{}"}}]
+    messages2 = [
+        {"role": "system", "content": "S" * 100},
+        {"role": "user", "content": "N" * 100},
+        {"role": "assistant", "content": "A" * 100, "tool_calls": calls2},
+        {"role": "tool", "tool_call_id": "a1", "content": "R1" * 50},
+        {"role": "tool", "tool_call_id": "a2", "content": "R2" * 50},
+        {"role": "assistant", "content": "F" * 100},
+    ]
+    out2 = turn._apply_context_budget(messages2)
+    ok(_tool_pairs_valid(out2), f"并行工具调用的修剪边界同样不得留孤儿: {out2}")
+
+
+def test_sanitize_tool_pairs_repairs_all_shapes():
+    """配对清洗的三条规则：孤儿丢弃 / 重复丢弃 / 缺响应补占位。"""
+    # 孤儿（owner 不在前）
+    out, dropped = agent._sanitize_tool_pairs([
+        {"role": "tool", "tool_call_id": "x", "content": "r"},
+        {"role": "user", "content": "u"},
+    ])
+    eq(dropped, 1, "孤儿 tool 必须被丢弃")
+    eq([m["role"] for m in out], ["user"])
+    # 重复响应
+    out, dropped = agent._sanitize_tool_pairs([
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "function": {"name": "t"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        {"role": "tool", "tool_call_id": "c1", "content": "dup"},
+    ])
+    eq(dropped, 1, "重复 tool 响应必须被丢弃")
+    # 缺响应 → 补占位，assistant(tool_calls) 后必须能跟上全部 id
+    out, dropped = agent._sanitize_tool_pairs([
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "function": {"name": "t1"}},
+                        {"id": "c2", "function": {"name": "t2"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ])
+    eq(dropped, 0)
+    eq([m.get("tool_call_id") for m in out if m.get("role") == "tool"],
+       ["c1", "c2"], "缺失的响应必须补占位")
+    ok(_tool_pairs_valid(out))
+
+
+def test_context_budget_under_budget_also_sanitizes():
+    """不触发压缩时也要兜底清洗：上游带来的孤儿同样会 400。"""
+    turn = agent.Turn({"llm_model": "m", "context_budget_chars": 120000}, [])
+    dirty = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "tool", "tool_call_id": "ghost", "content": "孤儿"},
+        {"role": "assistant", "content": "a"},
+    ]
+    out = turn._apply_context_budget(dirty)
+    ok(_tool_pairs_valid(out), "预算内路径同样不得放行孤儿 tool 消息")
+    eq(len(out), 3, "孤儿被清掉，其余保留")
+
+
 def test_agent_blocks_tool_calls_from_incomplete_stream():
     """流中断响应里的工具调用：不执行，给 notice，正常收尾。"""
     class _FakeLlm:
@@ -418,6 +516,124 @@ def test_base_url_normalization_preserves_custom_paths():
                 "http://127.0.0.1:8080", "https://api.stepfun.com.example.org",
                 "https://api.stepfun.com?route=custom"):
         eq(llm_mod.normalize_base_url(url), url)
+
+
+def test_context_usage_reports_trimmed_request_and_latest_provider_tokens():
+    from unittest.mock import patch
+    turn = agent.Turn(dict(CFG, context_budget_chars=200, max_tool_steps=3),
+                      [{"role": "user", "content": "需求"}]
+                      + [{"role": "assistant", "content": "旧消息" * 100}] * 10
+                      + [{"role": "user", "content": "继续"}])
+    events, sizes = [], []
+
+    def stream(cfg, messages, tools=None, **kw):
+        sizes.append(turn._context_size(messages))
+        if len(sizes) == 1:
+            return {"tool_calls": [{"id": "one", "function": {
+                "name": "get_workspace_info", "arguments": "{}"}}]}, {
+                    "prompt_tokens": 100, "completion_tokens": 5}
+        return {"content": "已读取"}, {"prompt_tokens": 120, "completion_tokens": 6}
+
+    with patch.object(turn, "_system_prompt", return_value="系统"), \
+         patch.object(agent.llm, "chat_stream", stream), \
+         patch.object(agent.tools_mod, "call", return_value={"ok": True}), \
+         patch.object(agent.tools_mod, "is_local", return_value=False):
+        turn.run(events.append)
+    context = [e for e in events if e["type"] == "context_usage"]
+    eq([e["phase"] for e in context], ["request", "response"] * 2)
+    eq([e["request_used"] for e in context], [sizes[0]] * 2 + [sizes[1]] * 2)
+    eq(context[-1]["used"], sizes[1] + len("已读取"))
+    eq(context[-1]["generated_chars"], len("已读取"))
+    eq(context[0]["prompt_tokens"], None)
+    eq(context[-1]["prompt_tokens"], 120, "当前请求 tokens 不能累加为历史计费用量")
+    eq(context[-1]["completion_tokens"], 6)
+    eq(context[-1]["max"], 200)
+    eq(context[-1]["unit"], "chars")
+    eq(context[-1]["basis"], "context_budget")
+    eq(context[-1]["model"], "m")
+    ok(sizes[0] < turn._context_size(turn.history), "统计经过压缩的实际请求")
+    eq(events[-1]["stats"]["prompt_tokens"], 220, "计费统计仍为本轮累计")
+
+
+def test_context_usage_missing_or_malformed_tokens_and_disabled_budget():
+    turn = agent.Turn({"context_budget_chars": -1}, [])
+    for usage in (None, {}, {"prompt_tokens": "bad", "completion_tokens": -1},
+                  {"prompt_tokens": True, "completion_tokens": 1.5}):
+        events = []
+        turn._emit_context_usage(events.append, [{"content": "中文"}], {}, "response", usage)
+        eq(events[0]["used"], 26)
+        eq(events[0]["max"], None, "关闭预算时不得伪造模型上限")
+        eq(events[0]["prompt_tokens"], None)
+        eq(events[0]["completion_tokens"], None)
+
+
+def test_zero_context_budget_disables_trimming_and_usage_limit():
+    messages = [{"role": "user", "content": "需求" * 100000}]
+    turn = agent.Turn({"context_budget_chars": 0}, [])
+    ok(turn._apply_context_budget(messages) is messages)
+    events = []
+    turn._emit_context_usage(events.append, messages, {}, "request")
+    eq(events[0]["max"], None, "显式零值应关闭预算")
+    eq(events[0]["used"], turn._context_size(messages))
+    eq(agent.Turn({}, [])._context_budget(), 120000)
+    eq(agent.Turn({"context_budget_chars": None}, [])._context_budget(), 120000)
+
+
+def test_summary_context_usage_includes_the_finalize_hint():
+    from unittest.mock import patch
+    turn = agent.Turn(CFG, [])
+    events, sent = [], []
+
+    def stream(cfg, messages, **kw):
+        sent.extend(messages)
+        return {"content": "总结"}, None
+
+    with patch.object(agent.llm, "chat_stream", stream):
+        turn._finalize(CFG, [{"role": "user", "content": "需求"}], events.append)
+    context = [e for e in events if e["type"] == "context_usage"]
+    eq(len(context), 2)
+    eq(context[0]["used"], turn._context_size(sent))
+    contains(sent[-1]["content"], agent.FINALIZE_HINT)
+    eq(context[-1]["prompt_tokens"], None)
+
+
+def test_streaming_context_progress_counts_content_and_throttles_reasoning():
+    from unittest.mock import patch
+    turn = agent.Turn(CFG, [])
+    messages = [{"role": "user", "content": "需求"}]
+    events = []
+    reasoning, content = turn._stream_context_callbacks(events.append, messages, CFG)
+    with patch.object(agent.time, "perf_counter", side_effect=[0.0, 0.01, 0.20, 0.21, 0.40]):
+        reasoning("很长的推理过程" * 100)
+        reasoning("更多推理")
+        content("第一段")
+        content("第二段")
+        content("第三段")
+    updates = [e for e in events if e["type"] == "context_usage"]
+    eq(len(updates), 3, "频繁流式事件节流，同时在第一个推理片段立即更新")
+    eq([e["phase"] for e in updates], ["streaming"] * 3)
+    eq([e["generated_chars"] for e in updates], [0, 3, 9])
+    eq([e["used"] for e in updates], [26, 29, 35])
+    ok(all(e["prompt_tokens"] is None for e in updates), "生成期间不得猜测 token 用量")
+    eq("".join(e["text"] for e in events if e["type"] == "content_delta"),
+       "第一段第二段第三段")
+
+
+def test_context_event_has_selected_model_capacity_and_latest_measured_tokens():
+    cfg = dict(CFG, llm_model="step-3.7-flash", llm_base_url="https://api.stepfun.com/v1")
+    turn = agent.Turn(cfg, [])
+    turn._context_tools = [{"function": {"description": "schema" * 100}}]
+    events = []
+    turn._emit_context_usage(events.append, [{"role": "user", "content": "中文"}], cfg,
+                             "response", {"prompt_tokens": 900, "completion_tokens": 100})
+    data = events[-1]["model_context"]
+    eq(data["model"], "step-3.7-flash")
+    eq(data["max"], 256000)
+    eq(data["used"], 1000)
+    eq(data["estimated"], False)
+    turn._emit_context_usage(events.append, [], cfg, "request")
+    ok(events[-1]["model_context"]["used"] > 100, "estimate includes actual tool schemas")
+    eq(events[-1]["model_context"]["estimated"], True)
 
 
 if __name__ == "__main__":

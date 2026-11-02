@@ -204,7 +204,7 @@ def _get(path, token=TOKEN):
 
 
 def _upload(zip_bytes, filename="models.zip", token=TOKEN,
-            content_type="application/zip", session="proj1"):
+            content_type="application/zip", session="proj1", endpoint="/models/upload"):
     _ensure_server()
     headers = {
         "Content-Type": content_type,
@@ -215,7 +215,7 @@ def _upload(zip_bytes, filename="models.zip", token=TOKEN,
         "X-Ads-Session": session,
     }
     req = urllib.request.Request(
-        f"http://{_HOST}:{_PORT}/models/upload", data=zip_bytes,
+        f"http://{_HOST}:{_PORT}{endpoint}", data=zip_bytes,
         headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=180) as r:
@@ -496,6 +496,68 @@ def test_upload_does_not_need_llm():
         eq(status, 200, "LLM 不可达时附件保存仍要能用")
     finally:
         shutil.rmtree(ws, ignore_errors=True)
+
+
+def test_pdf_parse_authentication_persistence_and_unicode_filename():
+    import zlib
+    import datasheet_models
+    import doc_assets
+    payload = b"%PDF-1.4\nstream\n" + zlib.compress(
+        b"BT (PART123 capacitance nominal 10 pF at 1 MHz) Tj ET") + b"\nendstream"
+    old_workspace = FAKE_STATE["workspace"]
+    FAKE_STATE["workspace"] = None
+    try:
+        kwargs = {"filename": "元器件手册.pdf", "content_type": "application/pdf", "endpoint": "/datasheets/parse"}
+        status, _ = _upload(payload, token=None, **kwargs)
+        eq(status, 401)
+        status, data = _upload(payload, **kwargs)
+        eq(status, 200)
+        eq(data["filename"], "元器件手册.pdf")
+        eq(data["parameter_extraction_safe"], True)
+        ok("10 pF" in datasheet_models.get_document({"document_id": data["document_id"]})["text"])
+        # 原文件按 SHA-256 落盘：可按 document_id 重新读取原始字节
+        eq(data["has_original"], True)
+        eq(doc_assets.read_bytes(data["document_id"]), payload)
+        eq(doc_assets.store(payload)["reused"], True)
+        eq(_upload(b"not a PDF", **kwargs)[0], 400)
+    finally:
+        FAKE_STATE["workspace"] = old_workspace
+
+
+def test_real_datasheet_upload_reports_true_page_count_and_asset():
+    """真实 SMMBFJ310L：聊天上传路径要给出真实页码与原文件资产（样本不在则跳过）。"""
+    import datasheet_models
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "fixtures", "SMMBFJ310L.pdf")
+    if not os.path.isfile(fixture):
+        return
+    try:
+        import pymupdf  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return
+    with open(fixture, "rb") as stream:
+        payload = stream.read()
+    old_workspace = FAKE_STATE["workspace"]
+    FAKE_STATE["workspace"] = None
+    try:
+        kwargs = {"filename": "SMMBFJ310L.pdf", "content_type": "application/pdf",
+                  "endpoint": "/datasheets/parse"}
+        status, data = _upload(payload, **kwargs)
+        eq(status, 200)
+        eq(data["page_count_approx"], 5, "必须是页树口径的真实页数，而不是文本流计数")
+        eq(data["page_numbers_available"], True)
+        eq(data["parse_engine"], "pymupdf")
+        eq(data["has_original"], True)
+        overview = datasheet_models.inspect_document({"document_id": data["document_id"]})
+        eq(overview["page_count"], 5)
+        eq(overview["page_count_source"], "page_tree")
+        page = datasheet_models.read_page({"document_id": data["document_id"], "page": 2})
+        joined = " ".join(ln["text"] for ln in page["lines"])
+        ok("−6.5" in joined, "负号必须保真")
+        ok(any(not ln["reliable"] for ln in page["lines"]),
+           "含未映射字形的行必须被标出")
+    finally:
+        FAKE_STATE["workspace"] = old_workspace
 
 
 if __name__ == "__main__":

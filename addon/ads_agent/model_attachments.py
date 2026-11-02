@@ -1,4 +1,4 @@
-"""模型压缩包附件：上传 worker + 附件卡片（PySide6）。
+"""模型与数据手册附件：上传 worker + 附件卡片（PySide6）。
 
 为什么单独一个模块：``panel.py`` 已经是 2700 多行的面板主体，附件这条链
 （拖放、二进制上传、导入轮询、卡片渲染）自成一体，塞进去会让面板更难读。
@@ -12,6 +12,8 @@
 * **上传不依赖 LLM 服务连通**：这里只用 HTTP，不碰任何模型服务。
 * **ZIP 内容不进对话/LLM 请求**：只有文件名、大小、package_id 这类标识会
   出现在聊天消息里（见 panel 的 ``_attachment_manifest``）。
+* **PDF 文件卡片与解析文本分离**：对话中只展示文件名卡片，抽取文本只进入
+  发给模型的上下文。
 """
 
 from __future__ import annotations
@@ -30,7 +32,8 @@ QtWidgets = qtcompat.QtWidgets()
 Qt = QtCore.Qt
 QObject, QThread, Signal, QSize = (QtCore.QObject, QtCore.QThread,
                                    QtCore.Signal, QtCore.QSize)
-QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget = (
+QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QToolButton, QVBoxLayout, QWidget = (
+    QtWidgets.QFrame,
     QtWidgets.QHBoxLayout, QtWidgets.QLabel, QtWidgets.QPlainTextEdit,
     QtWidgets.QPushButton, QtWidgets.QToolButton, QtWidgets.QVBoxLayout,
     QtWidgets.QWidget)
@@ -41,6 +44,64 @@ import uiscale as U
 # models_truncated 的口径一致：截断是**可见的**，不假装完整。
 _MODELS_SHOWN = 20
 _MODELS_VIEW_MAX_H = 240
+
+
+class SentPdfRow(QWidget):
+    """Compact outgoing PDF tile, visually separate from the prompt text."""
+
+    def __init__(self, entry: dict, pal: dict, parent=None):
+        super().__init__(parent)
+        self.entry = entry
+        meta = entry.get("meta") or {}
+        filename = str(meta.get("filename") or entry.get("text") or "document.pdf")
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(U.P("xl"), U.P("sm"), U.P("xl"), U.P("sm"))
+        outer.setSpacing(0)
+        outer.addStretch(1)
+
+        card = QFrame(self)
+        card.setObjectName("sentPdfCard")
+        card.setFixedSize(U.px(208), U.px(58))
+        card.setStyleSheet(
+            f"QFrame#sentPdfCard{{background:{pal['card_bg']};"
+            f"border:1px solid {pal['card_border']};border-radius:{U.R('lg')}px;}}"
+        )
+        row = QHBoxLayout(card)
+        row.setContentsMargins(U.P("sm"), U.P("xs"), U.P("md"), U.P("xs"))
+        row.setSpacing(U.P("sm"))
+
+        badge = QLabel("PDF", card)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedSize(U.px(28), U.px(30))
+        badge.setStyleSheet(
+            f"background:{pal['error']};color:white;border-radius:{U.R('xs')}px;"
+            f"font-size:{U.fs('tiny')}px;font-weight:700;"
+        )
+        row.addWidget(badge)
+
+        labels = QVBoxLayout()
+        labels.setContentsMargins(0, 0, 0, 0)
+        labels.setSpacing(0)
+        name = QLabel(filename, card)
+        name.setToolTip(filename)
+        name.setTextFormat(Qt.TextFormat.PlainText)
+        name.setFont(U.qfont("small", bold=True))
+        name.setStyleSheet(f"color:{pal['user_text']};background:transparent;border:none;")
+        name.setFixedWidth(U.px(150))
+        fm = name.fontMetrics()
+        name.setText(fm.elidedText(filename, Qt.TextElideMode.ElideMiddle, U.px(150)))
+        kind = QLabel("PDF", card)
+        kind.setFont(U.qfont("tiny"))
+        kind.setStyleSheet(f"color:{pal['subtle']};background:transparent;border:none;")
+        labels.addWidget(name)
+        labels.addWidget(kind)
+        row.addLayout(labels, 1)
+        outer.addWidget(card)
+        self.setMinimumHeight(U.px(66))
+
+    def reflow(self, avail_w: int, item):
+        item.setSizeHint(QSize(max(U.px(100), avail_w), U.px(66)))
 
 # 状态 → 中文说明。与 backend/model_tools.py 的 STATE_LABELS 保持同一份口径，
 # 这里只是**兜底**：卡片优先显示后端给的 state_label（口径以服务端为准）。
@@ -110,6 +171,10 @@ def workspace_mismatch_reason(recorded: str, current: str) -> str:
 
 def is_zip_path(path: str) -> bool:
     return str(path or "").lower().endswith(".zip")
+
+
+def is_spice_path(path: str) -> bool:
+    return os.path.splitext(str(path or ""))[1].lower() in {".cir", ".sp", ".net", ".spice"}
 
 
 def human_size(size) -> str:
@@ -207,7 +272,7 @@ def local_paths(mime) -> tuple:
 
 
 class ZipDropFilter(QObject):
-    """在若干控件上接管 ZIP 拖放。
+    """在若干控件上接管 ZIP、PDF 与 SPICE 网表拖放。
 
     用事件过滤器而不是给每个控件写子类：输入框（QTextEdit 默认自己接受拖放，
     会把文件 URL 当文本插进去）、会话区（QListWidget 自带滚动/选择语义）都
@@ -227,18 +292,19 @@ class ZipDropFilter(QObject):
                         QEvent.Type.Drop):
             return False
         paths, _has_any = local_paths(event.mimeData())
-        zips = [p for p in paths if is_zip_path(p)]
+        accepted = [p for p in paths if is_zip_path(p) or str(p).lower().endswith(".pdf")
+                    or is_spice_path(p)]
         if kind in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
             # 悬停阶段只决定"要不要接收光标"，不弹提示 —— 一次拖入会经过
             # 几十个 DragMove，提示会刷屏。真正的提示放在 drop。
-            if zips:
+            if accepted:
                 event.acceptProposedAction()
             else:
                 event.ignore()
             return True
-        if zips:
+        if accepted:
             event.acceptProposedAction()
-            self._on_zip(zips)
+            self._on_zip(accepted)
         else:
             event.ignore()
             if paths:
@@ -471,6 +537,88 @@ class UploadWorker(QThread):
             self.result.emit({"ok": False,
                               "error": f"{type(e).__name__}: {e}",
                               "local_retryable": True})
+
+
+class DatasheetWorker(QThread):
+    """Upload a PDF to the local parser; only extracted text enters chat history."""
+
+    result = Signal(dict)
+    progress = Signal(int, int)
+
+    def __init__(self, path: str, base: str = "", auth: dict | None = None,
+                 session: str = "", parent=None):
+        super().__init__(parent)
+        self._path, self._base = path, base
+        self._auth, self._session = dict(auth or {}), session or ""
+
+    def run(self):
+        filename = os.path.basename(self._path)
+        try:
+            size = os.path.getsize(self._path)
+            if size <= 0 or size > 32 * 1024 * 1024:
+                raise ValueError("PDF 大小必须在 1 字节至 32 MiB 之间")
+            headers = {
+                "Content-Type": "application/pdf",
+                "Content-Length": str(size),
+                "X-Ads-Filename": "datasheet.pdf",
+                "X-Ads-Filename-Star": "UTF-8''" + urllib.parse.quote(filename, safe=""),
+                **self._auth,
+            }
+            if self._session:
+                headers["X-Ads-Session"] = self._session
+            with open(self._path, "rb") as stream:
+                raw_pdf = stream.read()
+            self.progress.emit(size, size)
+            req = urllib.request.Request(self._base + "/datasheets/parse", data=raw_pdf,
+                                         headers=headers, method="POST")
+            with _opener().open(req, timeout=120) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            self.result.emit({"ok": True, **(data if isinstance(data, dict) else {})})
+        except urllib.error.HTTPError as e:
+            message, detail = _error_body(e)
+            self.result.emit({"ok": False, "error": message, **detail})
+        except Exception as e:  # noqa: BLE001
+            self.result.emit({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+class SchematicNetlistWorker(QThread):
+    """Upload an exported SPICE netlist and return a bounded, parsed circuit IR."""
+
+    result = Signal(dict)
+
+    def __init__(self, path: str, base: str = "", auth: dict | None = None,
+                 session: str = "", parent=None):
+        super().__init__(parent)
+        self._path, self._base = path, base
+        self._auth, self._session = dict(auth or {}), session or ""
+
+    def run(self):
+        filename = os.path.basename(self._path)
+        try:
+            size = os.path.getsize(self._path)
+            if size <= 0 or size > 4 * 1024 * 1024:
+                raise ValueError("SPICE 网表大小必须在 1 字节至 4 MiB 之间")
+            with open(self._path, "rb") as stream:
+                raw = stream.read()
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(raw)),
+                "X-Ads-Filename": "schematic.cir",
+                "X-Ads-Filename-Star": "UTF-8''" + urllib.parse.quote(filename, safe=""),
+                **self._auth,
+            }
+            if self._session:
+                headers["X-Ads-Session"] = self._session
+            req = urllib.request.Request(self._base + "/schematics/parse-spice",
+                                         data=raw, headers=headers, method="POST")
+            with _opener().open(req, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            self.result.emit({"ok": True, **(data if isinstance(data, dict) else {})})
+        except urllib.error.HTTPError as e:
+            message, detail = _error_body(e)
+            self.result.emit({"ok": False, "error": message, **detail})
+        except Exception as e:  # noqa: BLE001
+            self.result.emit({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +979,9 @@ class AttachmentRow(QWidget):
         for btn in (self.import_btn, self.open_btn, self.view_btn, self.cancel_btn,
                     self.resume_btn, self.retry_btn, self.refresh_btn):
             btn.setVisible(False)
-        if not self._is_missing():
+        is_datasheet = meta.get("kind") == "datasheet"
+        is_schematic = meta.get("kind") == "schematic"
+        if not self._is_missing() and not (is_datasheet or is_schematic):
             has_id = bool(meta.get("package_id"))
             if self._is_uploading():
                 pass                      # 上传中：什么都不给点
@@ -866,6 +1016,46 @@ class AttachmentRow(QWidget):
         if not self.toggle.isChecked():
             return
         pal = self._pal
+        if is_datasheet:
+            pages = meta.get("page_count_approx") or 0
+            if meta.get("page_numbers_available"):
+                page_text = f"{int(pages)} 页（真实页码）"
+            elif pages:
+                page_text = f"约 {int(pages)} 个文本页（页数仅估算）"
+            else:
+                page_text = "页数未知"
+            detail = f"文本：{int(meta.get('chars') or 0):,} 字符；{page_text}"
+            glyphs = int(meta.get("unknown_glyph_lines") or 0)
+            if glyphs:
+                detail += f"；{glyphs} 行含未映射字形（已标出，须复核）"
+            self._line(0, detail)
+            self._line(1, str(meta.get("note") or ""))
+            self._line(2, "原始 PDF 已按内容哈希存档，可按 document_id 重读；"
+                          "参数/曲线证据由建模工具核对。")
+            self._line(3, str(meta.get("error") or ""), pal["error"])
+            for idx in range(4, len(self._labels)):
+                self._line(idx, "")
+            self.models_view.clear()
+            self.models_view.setVisible(False)
+            return
+        if is_schematic:
+            components = int(meta.get("device_count") or 0)
+            nets = int(meta.get("net_count") or 0)
+            self._line(0, f"格式：SPICE 导出网表；解析到 {components} 个器件、{nets} 个网络")
+            self._line(1, "解析结果进入本轮会话供拓扑审阅；尚未映射 ADS 模型或生成 ADS 原理图。")
+            diagnostics = meta.get("diagnostics") or []
+            shown = []
+            for item in diagnostics[:3]:
+                if isinstance(item, dict):
+                    line_no = ",".join(str(n) for n in (item.get("source_lines") or []))
+                    shown.append(f"第 {line_no or '?'} 行：{item.get('message') or item.get('code')}")
+            self._line(2, "；".join(shown) if shown else "未发现解析诊断；仍需核对模型和引脚映射。")
+            self._line(3, str(meta.get("error") or ""), pal["error"])
+            for idx in range(4, len(self._labels)):
+                self._line(idx, "")
+            self.models_view.clear()
+            self.models_view.setVisible(False)
+            return
         workspace = str(meta.get("workspace") or "（未记录，通常是上传时所在的工作区）")
         self._line(0, f"工作区：{workspace}")
         vendor = meta.get("vendor") or "包内未标注"

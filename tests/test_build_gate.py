@@ -320,6 +320,18 @@ def test_bind_pins_merges_entire_existing_nets():
        "合并已有网络时，旧网络的其它引脚也必须迁移")
 
 
+def test_bind_pins_preserves_ground_in_either_order():
+    from types import SimpleNamespace as Obj
+    for reverse in (False, True):
+        ground = Obj(name="gnd!", is_global_ground=True)
+        signal = Obj(name="N1", is_global_ground=False)
+        g, a, peer = Obj(net=ground), Obj(net=signal), Obj(net=signal)
+        design = Obj(instances=[Obj(inst_pins=[g]), Obj(inst_pins=[a, peer])])
+        ads_ops._bind_pins(design, a if reverse else g, g if reverse else a)
+        ok(all(p.net is ground for p in (g, a, peer)),
+           "Both connection orders preserve global ground and the whole signal net")
+
+
 def test_layout_scale_blocks_invisible_symbols():
     class Point:
         def __init__(self, x, y):

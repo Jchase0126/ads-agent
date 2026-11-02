@@ -28,6 +28,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # (文件, 说明, 层级, 需要PySide6)
 CASES = [
+    ("test_datasheet_models.py", "手册证据、单位换算、参数持久化和 RLC 模板", "logic", False),
+    ("test_parameter_semantics.py", "参数结构化条件语义绑定 / 表格证据 / semantic_verified", "logic", False),
+    ("test_datasheet_curves.py", "曲线矩阵组装硬化 / 复核门禁 / 幅相配对", "logic", False),
+    ("test_device_library.py", "器件模型库：身份分层 / 原子发布 / 检索 / 导入 / 放置 / 版本去重", "logic", False),
+    ("test_harness_zero_guard.py", "测试运行器：零执行不得计为通过", "logic", False),
+    ("test_component_symbol.py", "器件封装：层次引脚锚点 / symbol API 契约", "logic", False),
+    ("test_pdf_modeling.py", "PDF 资产 / 曲线记录 / 有源建模 / 验证分账与负例", "logic", False),
+    # 2026-10-14 A 阶段：仿真来源绑定（必须真跑；缺 numpy/scipy 会跳过，
+    # 而这套负例历史上曾被静默跳过后仍报"全部通过"）
+    ("test_sim_provenance.py", "仿真来源可信执行记录 / 占位指纹 / 独立网表状态机", "logic", False),
+    # 2026-10-14 B 阶段：实测符号盒 + 引脚感知的三端封装布局走线
+    ("test_three_terminal_layout.py", "三端封装布局走线 / 端点豁免 / 实测符号盒", "logic", False),
+    ("test_model_context.py", "模型上下文容量来源 / 独立上限 / 实测与估算", "logic", False),
+    ("test_python_helpers.py", "跨调用脚本助手恢复 / 用户变量保留", "logic", False),
     # ---------------- logic ----------------
     ("test_token_migration.py", "令牌生成 / 迁移 / 两端一致 / 并发收敛", "logic", False),
     ("test_config_write_race.py", "config.ini 并发写入协调 / 不丢设置与令牌", "logic", False),
@@ -42,9 +56,23 @@ CASES = [
     ("test_netlist_check.py", "网表级电气等价校验：解析/划分/破坏实验", "logic", False),
     ("test_rf_audit.py", "射频物理审查：单位/闭式阻抗/MTEE 角色/宽度/Layout 几何/诚实标注", "logic", False),
     ("test_sp_traces.py", "S 参数矩阵表达式与 dB 曲线", "logic", False),
+    ("test_rfcalc.py", "RF 计算引擎：传输线/噪声/杂散/偏置公式", "logic", False),
     ("test_toolserver_busy.py", "toolserver 忙碌状态 / 多作业互不干扰", "http", False),
     ("test_turn_budget.py", "轮次预算收尾 / 重复失败保护 / 总结取消", "logic", False),
     ("test_cancel_chain.py", "取消链路：排队取消 / 过期跳过 / 队列容量 / pump 预算", "logic", False),
+    # ---- 2026-10-30 ADS 未响应修复（run_compute / 取消链贯通）----
+    ("test_compute_worker.py", "计算 worker：有界计算 / 协作取消 / 超时看门狗 / 输出洪泛", "logic", False),
+    ("test_compute_manager.py", "计算管理器：队列容量 / 并发上限 / 崩溃回收 / 幂等 / 重启清扫", "logic", False),
+    ("test_pump_budget.py", "pump 时间预算 / 原子入队 / 活跃上限 / 心跳 / health", "http", False),
+    ("test_chat_cancel_http.py", "真实 HTTP 取消链：聊天停止→/cancel 作业身份贯穿", "http", False),
+    ("test_submit_timeout_state.py", "submit 等待超时后作业仍执行的真实状态", "http", False),
+    ("test_compute_turn_cancel.py", "跨模块集成：轮次取消传播到计算作业并回收", "logic", False),
+    ("test_run_python_boundary.py", "run_python 取消边界 / 主线程占用提示 / 阶段上报", "logic", False),
+    ("test_panel_stop_latency.py", "面板停止：读线程及时退出 / turn_id 传播 / 取消两阶段文案", "qt", True),
+    ("test_layout_golden.py", "布局/走线 golden 基线锁（固定 PYTHONHASHSEED 子进程）", "logic", False),
+    ("test_save_throttle.py", "会话保存合并写 / 活动行就地刷新 / 关闭前落定", "qt", True),
+    ("test_health_compute.py", "后端 /health 的计算作业视图（running/queued/降级不 500）", "http", False),
+    ("test_sim_cancel.py", "仿真取消：进程树回收 / 执行预算 / 输出洪泛 / 无孤儿", "logic", False),
     ("test_design_metrics.py", "设计指标：数据解析 / 指标计算 / 不编造数值", "logic", False),
     ("test_design_metrics_edge.py", "指标判定边界：覆盖不足 / 单位不可比 / 越界取点 / 带宽口径", "logic", False),
     ("test_design_job.py", "设计任务：状态机 / 持久化 / 编排与失败保留产物", "logic", False),
@@ -78,6 +106,7 @@ CASES = [
     ("test_thinking.py", "深度思考链路：thinking 门控与降级 / reasoning 下发 / 折叠行", "qt", True),
     ("test_ui_navigation.py", "设置返回 / 草稿保留 / 小窗滚动 / 侧栏恢复 / 关闭面板", "qt", True),
     ("test_model_attachments.py", "模型包附件：拖放 / 上传 / 卡片状态 / 项目隔离与恢复", "qt", True),
+    ("test_rfcalc_panel.py", "RF 计算器窗口：页面树/表单栈/冒烟计算/基片填值", "qt", True),
 ]
 
 DEFAULT_TIMEOUT_S = 240

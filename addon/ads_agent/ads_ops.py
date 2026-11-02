@@ -41,17 +41,36 @@ import math
 import os
 import re
 import shutil
+import io
+import subprocess
+import sys
 import threading
 import time
 
 import rf_audit  # 射频物理审查的纯计算层（同为本地模块，可离线测试）
 import model_deps  # 模型依赖指纹：本次仿真到底吃了哪些模型文件（纯计算层）
 import model_ops  # 原厂模型包的挂接/只读浏览/可用性验证（转发到 model_ops 的实现）
+import netlist_check  # 网表引脚划分核对（build_schematic 的网表门禁）
+import geometry_policy  # 几何判定原语：规划/写入/复核三处共用的唯一实现
+import schematic_rules  # 建图规则登记表：规则号、阶段、严重级、关联关系
 
 # toolserver 热重载 ads_ops 时，依赖模块会命中 sys.modules 缓存拿旧代码；
 # 这里在每次 ads_ops（重）加载时强制刷新，保证审查逻辑与磁盘一致。
 importlib.reload(rf_audit)
 importlib.reload(model_deps)
+# netlist_check 也被 build_schematic 的网表门禁使用：不刷新会让新参数
+# （如 ignore_names）在运行中的 toolserver 里变成 TypeError。
+importlib.reload(netlist_check)
+# 几何规则是"规划合法 ⇒ 保存后合法"的唯一依据，跨阶段必须同一份代码；
+# 不刷新会变成"规划用新规则、复核用旧规则"，正是要消除的那类不一致。
+importlib.reload(geometry_policy)
+importlib.reload(schematic_rules)
+
+# 几何判定的阶段容差：三处历史取值不同，用显式常量标注而不是抹平。
+# 规划/写入用 1e-8（设计刻意"贴边即算命中"，避免规划期放过的贴边线在
+# 在线 add_wire 后被复核判违规）；复核用 1e-6（读回坐标只有约 6 位有效）。
+_GEOM_EPS_WRITE = 1e-8
+_GEOM_EPS_VERIFY = 1e-6
 
 
 def _de():
@@ -66,11 +85,74 @@ def _db_uu():
     return db_uu
 
 
+def _last_workspace_file() -> str:
+    """``<数据根>/last_workspace.txt`` —— ADS 重启后恢复最近工作区的依据。"""
+    try:
+        import pathbridge
+
+        paths = pathbridge.load_backend_module("paths.py", "paths")
+        return os.path.join(paths.data_root(), "last_workspace.txt")
+    except Exception:  # noqa: BLE001 — 拿不到 paths 就降级，恢复入口不能因此不可用
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "ADSAgent", "last_workspace.txt")
+
+
+def _last_workspace_path() -> str:
+    """最近一次成功使用、且当前仍在磁盘上的工作区路径；没有则空串。"""
+    try:
+        with open(_last_workspace_file(), encoding="utf-8") as f:
+            p = f.read().strip()
+        return p if p and os.path.isdir(p) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _remember_workspace(path) -> None:
+    """记下最近工作区。失败静默 —— 记不住只是退化成手动打开，不该报错。"""
+    p = os.path.normpath(str(path or "").strip())
+    if not p:
+        return
+    try:
+        fp = _last_workspace_file()
+        try:  # 值没变就不写：_require_workspace 每次工具调用都会经过这里
+            with open(fp, encoding="utf-8") as f:
+                if f.read().strip() == p:
+                    return
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(p)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class PreconditionError(RuntimeError):
+    """前置条件不满足（如没有打开工作区、最近工作区记录失效）。
+
+    与真正的服务端崩溃区分开：这类错误是调用方可直接改正的状态问题，
+    工具服务应以 4xx 返回，而不是 500 —— 500 会把"请先打开工作区"误报
+    成后端故障，模型也会据此判断服务不可用而放弃恢复。
+    """
+
+
+def _no_workspace_hint() -> str:
+    """统一的“无工作区”错误文案：先给恢复路径，再给手动兜底。"""
+    last = _last_workspace_path()
+    if last:
+        return (f"当前没有打开的工作区。调用 open_workspace()（或 open_workspace 工具）"
+                f"可重新打开最近的工作区: {last}")
+    return ("当前没有打开的工作区。可用 open_workspace(路径) 打开已有工作区目录"
+            "（含 lib.defs），或在 ADS 中手动打开 Workspace")
+
+
 def _require_workspace():
     de = _de()
     if not de.workspace_is_open():
-        raise RuntimeError("当前没有打开的工作区，请先在 ADS 中打开或新建一个 Workspace")
-    return de.active_workspace()
+        raise PreconditionError(_no_workspace_hint())
+    ws = de.active_workspace()
+    _remember_workspace(getattr(ws, "path", ""))
+    return ws
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +168,7 @@ def get_workspace_info(args: dict, ctx=None) -> dict:
         pass
     if de.workspace_is_open():
         ws = de.active_workspace()
+        _remember_workspace(getattr(ws, "path", ""))
         info.update(
             {
                 "workspace_open": True,
@@ -95,6 +178,48 @@ def get_workspace_info(args: dict, ctx=None) -> dict:
             }
         )
     return info
+
+
+def open_workspace(args: dict, ctx=None) -> dict:
+    """把一个已存在的工作区挂回当前 ADS 会话（ADS 重启后恢复现场的第一步）。
+
+    path 省略时用最近一次成功使用的工作区（<数据根>/last_workspace.txt）。
+    本工具只调 de.open_workspace 挂载会话，不创建、不修改任何磁盘内容；
+    路径无效时把最近记录一并报出来 —— 模型不需要也不应该去全盘扫描猜路径。
+    """
+    de = _de()
+    if not callable(getattr(de, "open_workspace", None)):
+        raise RuntimeError(
+            "当前 ADS 的 keysight.ads.de 没有 open_workspace 接口，请在 ADS 中手动打开工作区"
+        )
+    raw = str(args.get("path") or "").strip().strip('"')
+    if not raw:
+        raw = _last_workspace_path()
+        if not raw:
+            raise PreconditionError(
+                "没有可用的最近工作区记录。请显式传 path（含 lib.defs 的工作区目录），"
+                "或在 ADS 中手动打开 Workspace"
+            )
+    if not os.path.isdir(raw):
+        last = _last_workspace_path()
+        note = f"（最近一次使用的记录是 {last}，也已失效）" if last else ""
+        raise PreconditionError(f"工作区目录不存在: {raw}{note}")
+    if not os.path.isfile(os.path.join(raw, "lib.defs")):
+        raise PreconditionError(
+            f"{raw} 不是工作区目录（缺少 lib.defs）。工作区是包含 lib.defs 的目录")
+    if de.workspace_is_open():
+        cur = de.active_workspace()
+        cur_path = os.path.normpath(str(getattr(cur, "path", "") or ""))
+        if cur_path == os.path.normpath(raw):
+            return {**get_workspace_info({}, ctx), "already_open": True}
+    opened = de.open_workspace(raw)
+    _remember_workspace(getattr(opened, "path", raw))
+    return get_workspace_info({}, ctx)
+
+
+# run_python 环境里有个同名助手（见 install_env_helpers）；它通过这个别名
+# 调到模块级工具，免得读者把「助手自身」与「工具实现」混为一谈。
+_module_open_workspace = open_workspace
 
 
 def list_designs(args: dict, ctx=None) -> dict:
@@ -408,7 +533,8 @@ def _gate_problems(audit: dict, name: str) -> list:
 
     if not audit.get("controllers"):
         lib, cell = library_cell(name)
-        problems.append(
+        problems.append(schematic_rules.format_violation(
+            "R-25",
             f"设计 {name} 里没有仿真控制器，hpeesofsim 会报 "
             f"\"No Simulation Component specified\"。\n"
             f"请先在写模式下放一个控制器，例如：\n"
@@ -420,38 +546,41 @@ def _gate_problems(audit: dict, name: str) -> list:
             f"可用的控制器主控名（ads_simulation 库）："
             f"S_Param / AC / DC / HarmonicBalance / LSSP / Tran / ParamSweep。\n"
             f"{_audit_hint(audit, name)}"
-        )
+        ))
 
     broken = audit.get("broken_substrate_refs") or []
     if broken:
         lines = [f"  - {b['instance']}({b['master']}) 的 Subst 指向不存在的实例 "
                  f"{b['ref']!r}" for b in broken]
-        problems.append(
+        problems.append(schematic_rules.format_violation(
+            "R-26",
             "基板引用缺失，hpeesofsim 会报 \"Expected a substrate model for "
             "parameter `Subst'\"：\n" + "\n".join(lines) +
             "\n请放置基板（ads_tlines:MSUB，如 MSUB1）并把传输线的 Subst 参数指到它：\n"
             "    msub = put(d, 'ads_tlines:MSUB', 0, 10, name='MSUB1')\n"
             "    setp(mlin, 'Subst', 'MSUB1')"
-        )
+        ))
 
     shorted = audit.get("shorted_ports") or []
     if shorted:
         ports = ", ".join(f"{p['instance']}({p['net']})" for p in shorted)
-        problems.append(
+        problems.append(schematic_rules.format_violation(
+            "R-27",
             f"Term 信号脚与地脚接在同一网络：{ports}。"
             "默认朝向下 2 号脚是信号、1 号脚是地；请用 pins() 核对并修正。"
-        )
+        ))
 
     no_ground = audit.get("port_ground_issues") or []
     if no_ground:
         rows = ", ".join(f"{p['instance']}(地脚网络 {p['net']})" for p in no_ground)
-        problems.append(
+        problems.append(schematic_rules.format_violation(
+            "R-28",
             f"端口地脚没有接地参考：{rows}。\n"
             "网表里这些端口的第二个节点是只挂在端口上的孤立网络 —— 仿真虽能跑完，"
             "但端口参考开路，S 参数结果不可信。\n"
             "二选一：给每个 Term 的 1 号脚接 ads_rflib:GROUND；"
             "或直接用单脚自带地参考的 ads_simulation:TermG（推荐，无需接 GND）。"
-        )
+        ))
 
     needs = [c for c in (audit.get("controllers") or []) if _needs_port(c["master"])]
     if needs and not audit.get("ports"):
@@ -479,10 +608,11 @@ def _gate_warnings(audit: dict) -> list:
         rows = [f"  - {f['instance']}({f['master']}) 引脚 {f['pin']}"
                 for f in floating[:12]]
         more = f"\n  …共 {len(floating)} 个" if len(floating) > 12 else ""
-        warnings.append(
+        warnings.append(schematic_rules.format_violation(
+            "R-29",
             "以下引脚没有连接任何网络（悬空）。若是疏漏请补线；确认是故意悬空可忽略：\n"
             + "\n".join(rows) + more
-        )
+        ))
     return warnings
 
 
@@ -826,7 +956,13 @@ def _bind_pins(design, pa, pb):
     画的线自动做连通提取。pin.net 可赋值，显式绑定后网表才真正共享节点。
     """
     old_net = getattr(pa, "net", None)
-    net = getattr(pb, "net", None) or old_net
+    other_net = getattr(pb, "net", None)
+    # Ground must survive either endpoint order; choosing pb unconditionally
+    # disconnects a ground symbol when it is supplied as endpoint a.
+    if old_net is not None and getattr(old_net, "is_global_ground", False):
+        net = old_net
+    else:
+        net = other_net or old_net
     if net is None:
         try:
             net = design.add_scalar_net()
@@ -835,12 +971,13 @@ def _bind_pins(design, pa, pb):
     try:
         # 两端已有各自的网络时，要把旧网络上的全部引脚一起迁移。
         # 只修改 pa/pb 会拆断旧网络中先前连好的其它元件。
-        if old_net is not None and _net_label(old_net) != _net_label(net):
-            old_name = _net_label(old_net)
+        displaced = other_net if net is old_net else old_net
+        if displaced is not None and _net_label(displaced) != _net_label(net):
+            old_name = _net_label(displaced)
             for inst in list(design.instances):
                 for pin in list(inst.inst_pins):
                     current = getattr(pin, "net", None)
-                    if current is old_net or (old_name and _net_label(current) == old_name):
+                    if current is displaced or (old_name and _net_label(current) == old_name):
                         pin.net = net
         pa.net = net
         pb.net = net
@@ -864,7 +1001,12 @@ def _ortho_points(x1, y1, x2, y2):
 
 
 def _symbol_boxes(design):
-    """只取符号外框；缺少 bbox 的离线替身不参与避障。"""
+    """符号外框 + 该实例的**真实引脚坐标**；缺少 bbox 的离线替身不参与避障。
+
+    带引脚坐标是必须的（2026-10-14）：端点符号豁免只能按"段端点落在真实
+    引脚上"判定，靠 bbox 猜会把"穿过自己符号体"的线放行 —— J310 那根
+    (6.25,-0.3)->(6.25,0.5) 就是这样溜过几何门禁的。
+    """
     boxes = []
     for inst in list(design.instances):
         try:
@@ -872,112 +1014,144 @@ def _symbol_boxes(design):
             lo, hi = box.lower_left, box.upper_right
             rect = (float(lo.x), float(lo.y), float(hi.x), float(hi.y))
             if rect[2] > rect[0] and rect[3] > rect[1]:
-                boxes.append((_inst_name(inst), rect))
+                boxes.append((_inst_name(inst), rect, _inst_pin_points(inst)))
         except Exception:  # noqa: BLE001
             continue
     return boxes
 
 
-def _segment_hits_box(a, b, box, strict=False):
-    """边界可触及（引脚常在边界）；strict=True 时只判内部穿越。
+def _inst_pin_points(inst):
+    """实例全部引脚的绝对坐标（在线版，读真实 snap_point）。"""
+    out = []
+    for pin in list(getattr(inst, "inst_pins", []) or []):
+        snap = getattr(pin, "snap_point", None)
+        if snap is None:
+            continue
+        try:
+            x, y = _xy_point(snap)
+        except Exception:  # noqa: BLE001
+            continue
+        out.append((round(float(x), 6), round(float(y), 6)))
+    return tuple(out)
 
-    strict 用于"引脚所属符号"：从引脚出发/进入的导线允许贴自己符号的
-    边界（实测 MLIN bbox 宽 1.0、引脚就在 bbox 边缘上，垂直 T 下拉必然
-    擦边 —— 误拒会让任何 T 结都无法布线），但穿过内部仍算违规。
-    例外：段的一端在符号体**内部**时整段豁免 —— BJT 这类符号的引脚
-    snap 点画在符号 bbox 内部（CB_FM_Amp 实测 BFR106 c 脚 (0.5,0.5) 而
-    bbox 顶 0.65），引脚伸出段是物理必须,不豁免任何接入线都被拒。
+
+def _escape_allowance(a, b, lower: float, upper: float, along: bool) -> float:
+    """端点符号豁免：允许段**从引脚进入并贴着符号体走到另一侧**，
+    但不允许它停在符号体深处。
+
+    实测两类都必须放行（否则任何 R/L/FET 接线都布不出来）：
+      * 引脚在符号体**边界**上：MLIN (1,0)、R 的引脚落在 ±0.06875 体内；
+      * 段沿符号轴从一侧引脚走到另一侧引脚：R 的 1→2、FET 的 gate→drain。
+
+    必须拒绝的是"停在体���"：J310 实测 FET 那根 (6.25,-0.3)->(6.25,0.5)，
+    从封装 L 的引脚进来就停在器件核心中间，没有接到任何引脚。
+
+    判据：段在符号纵向（沿轴）上的覆盖必须**贯穿或贴到某个引脚**，
+    即段的另一端落在符号体内/边界上时才算引脚连线；否则只是插入。
     """
-    left, bottom, right, top = box
-    eps = 1e-8
-    # 贴边骑行（2026-09-30 R13 修正判定范围）：段与**非引脚符号**的
-    # 边线共线、且沿边线滑行长度 > 0.25 → 违规（渲染上导线与无关符号
-    # 轮廓重叠）。引脚所属符号（strict=True）不判贴边 —— 从边界引脚
-    # 出发的直线沿符号边缘滑行是 T 下拉/正交直通的必然形态（五路
-    # 直通臂 x=出脚列 直线被旧判定误杀实测）。
-    if not strict:
-        if abs(a[0] - b[0]) < eps and                 (abs(a[0] - left) < 1e-6 or abs(a[0] - right) < 1e-6):
-            if min(max(a[1], b[1]), top) -                     max(min(a[1], b[1]), bottom) > 0.25:
-                return True
-        if abs(a[1] - b[1]) < eps and                 (abs(a[1] - bottom) < 1e-6 or abs(a[1] - top) < 1e-6):
-            if min(max(a[0], b[0]), right) -                     max(min(a[0], b[0]), left) > 0.25:
-                return True
-    if strict:
-        for px, py in (a, b):
-            if left - eps <= px <= right + eps and                     bottom - eps <= py <= top + eps and                     not (abs(px - left) < eps or abs(px - right) < eps
-                         or abs(py - bottom) < eps or abs(py - top) < eps):
-                return False   # 端点在体内:引脚伸出段
-    if abs(a[1] - b[1]) < eps:                      # 水平段：看 y 在不在(严格)内部
-        inside = (bottom + eps < a[1] < top - eps) if strict \
-            else (bottom - eps <= a[1] <= top + eps)
-        return inside and \
-            max(min(a[0], b[0]), left) < min(max(a[0], b[0]), right) - eps
-    inside = (left + eps < a[0] < right - eps) if strict \
-        else (left - eps <= a[0] <= right + eps)
-    return inside and \
-        max(min(a[1], b[1]), bottom) < min(max(a[1], b[1]), top) - eps
+    lo, hi = sorted((a[1], b[1])) if not along else sorted((a[0], b[0]))
+    # 段的两端沿轴向分别在哪
+    e0, e1 = (a[1], b[1]) if not along else (a[0], b[0])
+    # "引脚带" = 符号外框沿轴向再放宽 PIN_ESCAPE_LEN（引脚点画在边界上，
+    # 或像 R/FET 那样落在体内一点，都在这个带里）。
+    band_lo, band_hi = lower - PIN_ESCAPE_LEN, upper + PIN_ESCAPE_LEN
+    inside_endpoints = [e for e in (e0, e1)
+                        if band_lo - 1e-9 <= e <= band_hi + 1e-9]
+    if not inside_endpoints:
+        # 两端都在引脚带外 = 段只是插进符号体深处，不该豁免。
+        # 额度退化成"最浅的那点插入深度"，插入越深越拒。
+        return -1.0 if lo > upper + PIN_ESCAPE_LEN or hi < lower - PIN_ESCAPE_LEN \
+            else 0.0
+    # 两端都在引脚带内 = 沿轴从一侧引脚接到另一侧引脚（合法），
+    # 额度给满整个符号跨度。
+    if len(inside_endpoints) == 2:
+        return (upper - lower) + 2 * PIN_ESCAPE_LEN
+    # 只有一端在带内：从该引脚出发，允许走出符号体外一小段。
+    anchor = inside_endpoints[0]
+    return abs(anchor - (lower if abs(anchor - lower) < abs(anchor - upper)
+                         else upper)) + PIN_ESCAPE_LEN
 
 
-def _segment_hits_route(a, b, old_a, old_b, endpoints, old_endpoints):
-    """不同连接的线段不能交叉或重合；共同端点可以接成 T 形。"""
-    eps = 1e-8
-    horizontal = abs(a[1] - b[1]) < eps
-    old_horizontal = abs(old_a[1] - old_b[1]) < eps
-    if horizontal == old_horizontal:
-        axis = 1 if horizontal else 0
-        along = 0 if horizontal else 1
-        if abs(a[axis] - old_a[axis]) > eps:
-            return False
-        lo = max(min(a[along], b[along]), min(old_a[along], old_b[along]))
-        hi = min(max(a[along], b[along]), max(old_a[along], old_b[along]))
-        if hi - lo > eps:
-            return True
-        if hi < lo - eps:
-            return False
-        point = (lo, a[1]) if horizontal else (a[0], lo)
-    else:
-        h1, h2 = (a, b) if horizontal else (old_a, old_b)
-        v1, v2 = (old_a, old_b) if horizontal else (a, b)
-        point = (v1[0], h1[1])
-        if not (min(h1[0], h2[0]) - eps <= point[0] <= max(h1[0], h2[0]) + eps
-                and min(v1[1], v2[1]) - eps <= point[1] <= max(v1[1], v2[1]) + eps):
-            return False
-    return not (point in endpoints and point in old_endpoints)
+def _nearest_edge_dist(lo: float, hi: float, lower: float, upper: float) -> float:
+    """区间 [lo,hi] 落在 [lower,upper] 内时，最近那条边到区间的距离。
 
-
-def _box_owning_pin(pt, boxes):
-    """引脚点压在哪个符号边界上（用于该符号的严格内部豁免）。
-
-    多个符号共享同一引脚点时（对称一分三的直通臂引脚与分叉引脚同点），
-    返回**全部**归属符号 —— 只回第一个会把其余符号留在非豁免表里，
-    出线擦边被误拒，直通臂的任何走线都找不到路。
+    用于把"引脚逃逸豁免"限定在引脚附近：贴着符号边界的那一小段合法，
+    越往符号深处走越不合法。
     """
-    eps = 1e-6
-    x, y = pt
-    owners = []
-    for name, (left, bottom, right, top) in boxes:
-        on_edge = ((abs(x - left) <= eps or abs(x - right) <= eps)
-                   and bottom - eps <= y <= top + eps) or \
-                  ((abs(y - bottom) <= eps or abs(y - top) <= eps)
-                   and left - eps <= x <= right + eps)
-        if on_edge:
-            owners.append(name)
-    return owners[0] if owners else None
+    return min(abs(lo - lower), abs(lo - upper),
+               abs(hi - lower), abs(hi - upper))
+
+
+def _escape_from_pin(a, b, lower: float, upper: float, along: bool) -> float:
+    """端点符号里、从**引脚**出发合法的那一段有多长。
+
+    段的两端里有一端是这个符号的引脚（`_segment_hits_box` 已用引脚带确认过）。
+    从那个引脚沿段方向走到符号外框的距离，就是合法逃逸长度；再多就是穿体。
+
+    这样三种真实形态都判对（2026-10-14 ADS 实测）：
+      * R/L 沿轴 1→2、FET gate→drain：引脚在外框上，逃逸长 0 → 整段都在
+        框内，但另一端也是引脚，由调用方整段放行；
+      * MLIN 边界引脚的 T 结、BFR106 c 脚向外出线：引脚在框上或体内一点，
+        逃逸长 = 引脚到框边 + PIN_ESCAPE_LEN；
+      * J310 那根 (6.25,-0.3)->(6.25,0.5)：从封装 L 引脚进来，穿过 FET
+        框内 0.55 格仍没接到 FET 任何引脚 → 0.55 > 逃逸长 → 判穿体。
+    """
+    e0, e1 = (a[1], b[1]) if along else (a[0], b[0])
+    # 候选引脚端：落在框外或框边上的那一端
+    best = 0.0
+    for e, other in ((e0, e1), (e1, e0)):
+        if e < lower - PIN_ESCAPE_LEN or e > upper + PIN_ESCAPE_LEN:
+            # 明显在框外 → 引脚就在框外，逃逸长度为 0（整段都要在框外）
+            return 0.0
+        depth = min(abs(e - lower), abs(e - upper))
+        # 引脚到框边的距离 + 允许再走一小段离开框
+        best = max(best, depth + PIN_ESCAPE_LEN)
+    return best
+
+
+def _segment_hits_box(a, b, box, strict=False, pins=None, eps=_GEOM_EPS_WRITE):
+    """线段是否撞到符号占位盒 —— 转发到 ``geometry_policy.segment_hits_box``。
+
+    **规划 / 写入 / 保存后复核三处共用同一份实现**（R-02 穿符号体、
+    R-04 贴边骑行）。这个薄封装保留下来只为两件事：一是数十个历史调用点
+    与测试用的是这个私有名，二是把本阶段的容差写死在默认参数里 ——
+    规划/写入用 1e-8（贴边即算命中，宁可规划期就拒，避免在线 add_wire
+    之后被复核判违规）。
+
+    豁免语义见 ``geometry_policy.segment_hits_box`` 的 docstring（端点
+    必须落在该符号**真实引脚**上才整段豁免；J310 那根从封装 L 引脚进来
+    停在 FET 核心中间的线因此判穿体）。
+    """
+    return geometry_policy.segment_hits_box(a, b, box, strict=strict,
+                                            pins=pins, eps=eps)
+
+
+def _segment_hits_route(a, b, old_a, old_b, endpoints, old_endpoints,
+                        eps=_GEOM_EPS_WRITE):
+    """线段与已有导线的交叉/重叠/搭接 —— 转发到 ``geometry_policy``。
+
+    R-05/R-06/R-07（异网）与 R-08/R-09/R-10（同网）都建立在这个原语
+    之上；分级由 ``schematic_rules.classify_wire_relation`` 统一决定。
+    """
+    return geometry_policy.segment_hits_route(a, b, old_a, old_b,
+                                              endpoints, old_endpoints, eps=eps)
 
 
 def _box_owning_pins(pt, boxes):
-    """同上，返回全部归属符号名列表。"""
-    eps = 1e-6
-    x, y = pt
-    owners = []
-    for name, (left, bottom, right, top) in boxes:
-        on_edge = ((abs(x - left) <= eps or abs(x - right) <= eps)
-                   and bottom - eps <= y <= top + eps) or \
-                  ((abs(y - bottom) <= eps or abs(y - top) <= eps)
-                   and left - eps <= x <= right + eps)
-        if on_edge:
-            owners.append(name)
-    return owners
+    """引脚点压在哪些符号的**边界**上 → 归属符号名列表。
+
+    多个符号共享同一引脚点时（对称一分三的直通臂引脚与分叉引脚同点），
+    必须返回**全部** —— 只回第一个会把其余符号留在非豁免表里，出线擦边
+    被误拒，直通臂的任何走线都找不到路。实现转发到
+    ``geometry_policy.boxes_owning_pin``（R-02 豁免判据的边界定义只此一份）。
+    """
+    return geometry_policy.boxes_owning_pin(pt, boxes)
+
+
+def _box_owning_pin(pt, boxes):
+    """同上，只回第一个（历史调用点的口径：单符号豁免）。"""
+    owners = _box_owning_pins(pt, boxes)
+    return owners[0] if owners else None
 
 
 def _route_clear(points, boxes, routes, endpoints=None, pin_boxes=(), net=None,
@@ -1009,8 +1183,12 @@ def _route_clear(points, boxes, routes, endpoints=None, pin_boxes=(), net=None,
             continue
         if abs(a[0] - b[0]) > 1e-8 and abs(a[1] - b[1]) > 1e-8:
             return False
-        for name, box in boxes:
-            if _segment_hits_box(a, b, box, strict=name in exempt):
+        for entry in boxes:
+            name, box = entry[0], entry[1]
+            # boxes 元素可为 (name, box) 或 (name, box, pins)；带 pins 时
+            # 端点豁免按**真实引脚**判定（2026-10-14，见 _segment_hits_box）
+            pins = entry[2] if len(entry) > 2 else None
+            if _segment_hits_box(a, b, box, strict=name in exempt, pins=pins):
                 if _through_tap_pin(a, b):
                     continue
                 return False
@@ -1050,7 +1228,8 @@ def _route_around(start, end, boxes, routes, pin_boxes=(), net=None,
     margin = 0.25
     xs = {start[0], end[0]}
     ys = {start[1], end[1]}
-    for _, (left, bottom, right, top) in boxes:
+    for _be in boxes:
+        left, bottom, right, top = _be[1]
         xs.update((left - margin, right + margin))
         ys.update((bottom - margin, top + margin))
     for old_route in routes:
@@ -1058,46 +1237,67 @@ def _route_around(start, end, boxes, routes, pin_boxes=(), net=None,
         for x, y in points:
             xs.update((x - margin, x, x + margin))
             ys.update((y - margin, y, y + margin))
-    xs, ys = sorted(xs), sorted(ys)
-    grid = {(x, y) for x in xs for y in ys
-            if not any(left < x < right and bottom < y < top
-                       for _, (left, bottom, right, top) in boxes)}
-    queue = [(0.0, 0, start, None, (start,))]
-    best = {}
-    while queue:
-        cost, bends, point, direction, path = heapq.heappop(queue)
-        state = (point, direction)
-        if cost > best.get(state, float("inf")) + 1e-8:
-            continue
-        if point == end:
-            turns = [path[0]]
-            for a, b, c in zip(path, path[1:], path[2:]):
-                if (a[0] == b[0]) != (b[0] == c[0]):
-                    turns.append(b)
-            return turns + [end]
-        x, y = point
-        neighbors = []
-        ix, iy = xs.index(x), ys.index(y)
-        for nx in (ix - 1, ix + 1):
-            if 0 <= nx < len(xs):
-                neighbors.append(((xs[nx], y), "h"))
-        for ny in (iy - 1, iy + 1):
-            if 0 <= ny < len(ys):
-                neighbors.append(((x, ys[ny]), "v"))
-        for neighbor, new_dir in neighbors:
-            if neighbor not in grid or not _route_clear((point, neighbor), boxes, routes,
-                                                        {start, end},
-                                                        pin_boxes=pin_boxes,
-                                                        net=net):
+
+    def _search(grid_xs, grid_ys):
+        grid_xs, grid_ys = sorted(grid_xs), sorted(grid_ys)
+        grid = {(x, y) for x in grid_xs for y in grid_ys
+                if not any(left < x < right and bottom < y < top
+                           for _be in boxes
+                           for left, bottom, right, top in (_be[1],))}
+        queue = [(0.0, 0, start, None, (start,))]
+        best = {}
+        while queue:
+            cost, bends, point, direction, path = heapq.heappop(queue)
+            state = (point, direction)
+            if cost > best.get(state, float("inf")) + 1e-8:
                 continue
-            turn = direction is not None and direction != new_dir
-            next_cost = cost + abs(neighbor[0] - x) + abs(neighbor[1] - y) + (0.2 if turn else 0)
-            next_state = (neighbor, new_dir)
-            if next_cost + 1e-8 < best.get(next_state, float("inf")):
-                best[next_state] = next_cost
-                heapq.heappush(queue, (next_cost, bends + int(turn), neighbor,
-                                       new_dir, path + (neighbor,)))
-    raise RuntimeError(f"无法找到不穿元件、不交叉的正交走线：{start} -> {end}")
+            if point == end:
+                turns = [path[0]]
+                for a, b, c in zip(path, path[1:], path[2:]):
+                    if (a[0] == b[0]) != (b[0] == c[0]):
+                        turns.append(b)
+                return turns + [end]
+            x, y = point
+            neighbors = []
+            ix, iy = grid_xs.index(x), grid_ys.index(y)
+            for nx in (ix - 1, ix + 1):
+                if 0 <= nx < len(grid_xs):
+                    neighbors.append(((grid_xs[nx], y), "h"))
+            for ny in (iy - 1, iy + 1):
+                if 0 <= ny < len(grid_ys):
+                    neighbors.append(((x, grid_ys[ny]), "v"))
+            for neighbor, new_dir in neighbors:
+                if neighbor not in grid or not _route_clear(
+                        (point, neighbor), boxes, routes, {start, end},
+                        pin_boxes=pin_boxes, net=net):
+                    continue
+                turn = direction is not None and direction != new_dir
+                next_cost = cost + abs(neighbor[0] - x) + abs(neighbor[1] - y) + (0.2 if turn else 0)
+                next_state = (neighbor, new_dir)
+                if next_cost + 1e-8 < best.get(next_state, float("inf")):
+                    best[next_state] = next_cost
+                    heapq.heappush(queue, (next_cost, bends + int(turn), neighbor,
+                                           new_dir, path + (neighbor,)))
+        return None
+
+    path = _search(xs, ys)
+    if path is None:
+        # 细化重试（2026-10-12 FM_MURATA 实测）：网格列只有 障碍±margin
+        # 与已有线±margin 两族。两条相邻平行线相距恰好 0.25（如发射极
+        # 竖线 x=12.4 与绕行竖线 x=12.65）时，缝隙里没有任何可达列 ——
+        # 而它正是唯一出口，粗网格整片搜死。补插相邻网格线的中点再搜。
+        fine_xs, fine_ys = set(xs), set(ys)
+        ordered_xs, ordered_ys = sorted(xs), sorted(ys)
+        for a, b in zip(ordered_xs, ordered_xs[1:]):
+            fine_xs.add((a + b) / 2.0)
+        for a, b in zip(ordered_ys, ordered_ys[1:]):
+            fine_ys.add((a + b) / 2.0)
+        path = _search(fine_xs, fine_ys)
+    if path is not None:
+        return path
+    raise RuntimeError(schematic_rules.format_stage_violation(
+        schematic_rules.STAGE_WRITE,
+        f"无法找到不穿元件、不交叉的正交走线：{start} -> {end}"))
 
 
 def _wire_connection(design, conn, routes=None) -> None:
@@ -1152,7 +1352,9 @@ def _wire_connection(design, conn, routes=None) -> None:
                             for w in conn["waypoints"]] + [(x2, y2)]
         if not _route_clear(pts, boxes, existing, pin_boxes=pin_boxes,
                             net=net, tap_pins=tap_pins):
-            raise RuntimeError(f"指定折点使导线穿过元件或与已有导线交叉/重叠：{conn}")
+            raise RuntimeError(schematic_rules.format_stage_violation(
+                schematic_rules.STAGE_WRITE,
+                f"指定折点使导线穿过元件或与已有导线交叉/重叠：{conn}"))
     else:
         pts = _route_around((x1, y1), (x2, y2), boxes, existing,
                             pin_boxes=pin_boxes, net=net, tap_pins=tap_pins)
@@ -1163,12 +1365,48 @@ def _wire_connection(design, conn, routes=None) -> None:
     skip = set(conn.get("_skip_segs") or [])
     for k, (a, b) in enumerate(zip(pts, pts[1:])):
         if abs(a[0] - b[0]) > 1e-8 and abs(a[1] - b[1]) > 1e-8:
-            raise RuntimeError(f"走线包含斜段: {a} -> {b}")
+            raise RuntimeError(schematic_rules.format_violation(
+                "R-01", f"走线包含斜段: {a} -> {b}"))
         if a != b and k not in skip:
             design.add_wire([a, b])
     _bind_pins(design, pa, pb)
     if routes is not None:
         routes.append((pts, net))
+
+
+def _wire_all_connections(design, connections, routed) -> None:
+    """按给定顺序走完全部连接；折点被拒的连接延后到其余连接画完再重寻。
+
+    为什么延后（2026-10-12 FM_MURATA 实测）：走线计划的折点是用保守
+    估算的符号盒算出来的，真实 bbox 更大时会被在线复核拒绝；如果被拒
+    连接**立即**改走在线寻路，兜底绕行线可能横封关键走廊，让后面本可
+    直连的连接彻底无路（R1->CB 折点被拒 → 立即兜底绕行 → Q1->LC 随后
+    找不到任何正交路径，整图构建失败）。延后后其余连接先占位，被拒
+    连接在剩余空位上重寻，实测全图可通。
+    """
+    deferred = []
+    for conn in connections:
+        try:
+            _wire_connection(design, conn, routed)
+        except RuntimeError as wire_err:
+            if "指定折点" not in str(wire_err):
+                raise
+            import sys as _sys2, os as _os2
+            if _os2.environ.get("WIRE_FALLBACK_DEBUG"):
+                print(f"[wire-fallback] {conn.get('a')}->{conn.get('b')} "
+                      f"折点被拒，延后重寻: {wire_err}", file=_sys2.stderr)
+            # 折点与 _skip_segs 都按计划路径的段下标计算，对重寻出的新路径
+            # 不成立 —— 一并剥掉，避免跳过错误的段
+            deferred.append({k: v for k, v in conn.items()
+                             if k not in ("waypoints", "_skip_segs")})
+    for conn in deferred:
+        try:
+            _wire_connection(design, conn, routed)
+        except RuntimeError as retry_err:
+            raise RuntimeError(schematic_rules.format_stage_violation(
+                schematic_rules.STAGE_WRITE,
+                f"连接 {conn.get('a')} -> {conn.get('b')} 的走线失败"
+                f"（折点被拒后延后重寻仍未通过）：{retry_err}")) from retry_err
 
 
 # ---------------------------------------------------------------------------
@@ -1228,43 +1466,18 @@ def _design_wire_routes(design):
 
 
 def _seg_violation(a, b, c, d):
-    """两段的关系。返回 None（无接触/仅端点相接）或 (kind, point)。
+    """两段的关系 —— 转发到 ``geometry_policy.segment_relation``。
 
-    kind: "overlap" 共线重叠；"t" 一段端点搭在另一段中部；"cross" 内部交叉。
-    端点对端点相接（拐弯、链式相接）不算违规 —— 由调用方按网络归属分级。
+    返回 None（无接触/仅端点相接）或 (kind, point)：kind 为 "overlap"
+    共线重叠 / "t" 一段端点搭在另一段中部 / "cross" 内部交叉。端点对
+    端点相接（拐弯、链式相接）不算违规。**分级**（按网络归属判成
+    R-05/R-06/R-07 阻断还是 R-08/R-09/R-10 警告）不在这里，由
+    ``schematic_rules.classify_wire_relation`` 统一决定。
+
+    复核期容差 ``_GEOM_EPS``=1e-6：坐标从磁盘读回只有约 6 位有效，
+    用规划期的 1e-8 会把"本该相接的两段"判成不相接。
     """
-    eps = _GEOM_EPS
-    h1, h2 = abs(a[1] - b[1]) < eps, abs(c[1] - d[1]) < eps
-    if h1 and h2:
-        if abs(a[1] - c[1]) > eps:
-            return None
-        lo = max(min(a[0], b[0]), min(c[0], d[0]))
-        hi = min(max(a[0], b[0]), max(c[0], d[0]))
-        return ("overlap", None) if hi - lo > eps else None
-    if not h1 and not h2:
-        if abs(a[0] - c[0]) > eps:
-            return None
-        lo = max(min(a[1], b[1]), min(c[1], d[1]))
-        hi = min(max(a[1], b[1]), max(c[1], d[1]))
-        return ("overlap", None) if hi - lo > eps else None
-    ha, hb, va, vb = (a, b, c, d) if h1 else (c, d, a, b)
-    pt = (va[0], ha[1])
-    on_h = (min(ha[0], hb[0]) - eps <= pt[0] <= max(ha[0], hb[0]) + eps
-            and min(ha[1], hb[1]) - eps <= pt[1] <= max(ha[1], hb[1]) + eps)
-    on_v = (min(va[0], vb[0]) - eps <= pt[0] <= max(va[0], vb[0]) + eps
-            and min(va[1], vb[1]) - eps <= pt[1] <= max(va[1], vb[1]) + eps)
-    if not (on_h and on_v):
-        return None
-    ends_h = {ha, hb}
-    ends_v = {va, vb}
-    pt_r = (round(pt[0], 6), round(pt[1], 6))
-    is_end_h = any((round(p[0], 6), round(p[1], 6)) == pt_r for p in ends_h)
-    is_end_v = any((round(p[0], 6), round(p[1], 6)) == pt_r for p in ends_v)
-    if is_end_h and is_end_v:
-        return None                      # 端点对端点：链式相接/拐弯
-    if is_end_h or is_end_v:
-        return ("t", pt)                 # 一段端点搭在另一段中部
-    return ("cross", pt)
+    return geometry_policy.segment_relation(a, b, c, d, eps=_GEOM_EPS)
 
 
 def _annotation_issues(design, by_name: dict) -> list:
@@ -1306,15 +1519,18 @@ def _annotation_issues(design, by_name: dict) -> list:
             continue
         g = _gap(ab, syms[name])
         if g > 1.2:
-            issues.append(f"{name} 的标注文字距符号 {g:.2f} 格（>1.2），"
-                          "读图无法判定归属")
+            issues.append(schematic_rules.format_violation(
+                "R-17",
+                f"{name} 的标注文字距符号 {g:.2f} 格（>1.2），"
+                "读图无法判定归属"))
     names = sorted(boxes)
     for i, na in enumerate(names):
         for nb in names[i + 1:]:
             a, b = boxes[na], boxes[nb]
             if not (a[2] < b[0] - 0.02 or b[2] < a[0] - 0.02
                     or a[3] < b[1] - 0.02 or b[3] < a[1] - 0.02):
-                issues.append(f"{na} 与 {nb} 的标注文字互压")
+                issues.append(schematic_rules.format_violation(
+                    "R-18", f"{na} 与 {nb} 的标注文字互压"))
     return issues
 
 
@@ -1358,12 +1574,13 @@ def _geometry_report(design) -> dict:
             segments.append((a, b))
     report["n_segments"] = len(segments)
 
-    # 1) 斜段：硬错误（用户要求：每一段导线严格沿 X 或 Y）
+    # 1) 斜段：硬错误（用户要求：每一段导线严格沿 X 或 Y）→ R-01
     for i, (a, b) in enumerate(segments):
         if abs(a[0] - b[0]) > _GEOM_EPS and abs(a[1] - b[1]) > _GEOM_EPS:
-            report["problems"].append(
+            report["problems"].append(schematic_rules.format_violation(
+                "R-01",
                 f"第 {i + 1} 段导线是斜线: ({a[0]:.4g},{a[1]:.4g}) -> "
-                f"({b[0]:.4g},{b[1]:.4g})")
+                f"({b[0]:.4g},{b[1]:.4g})"))
 
     # 2) 引脚点表（网络归属 + 结点判定）
     pin_pts = {}
@@ -1425,7 +1642,8 @@ def _geometry_report(design) -> dict:
         for pt in (a, b):
             key = (round(pt[0], 6), round(pt[1], 6))
             for entry in pin_pts.get(key, ()):
-                for nm, bx in boxes:
+                for _be in boxes:
+                    nm, bx = _be[0], _be[1]
                     if nm == entry[0] and _box_owning_pin(pt, [(nm, bx)]) == nm:
                         exempt.add(nm)
         return exempt
@@ -1475,13 +1693,16 @@ def _geometry_report(design) -> dict:
         if abs(a[0] - b[0]) > _GEOM_EPS and abs(a[1] - b[1]) > _GEOM_EPS:
             continue                       # 斜段已在上面单独报过
         exempt = _seg_exempt(a, b)
-        for name, box in boxes:
-            if _segment_hits_box(a, b, box, strict=name in exempt):
+        for entry in boxes:
+            name, box = entry[0], entry[1]
+            pins = entry[2] if len(entry) > 2 else None
+            if _segment_hits_box(a, b, box, strict=name in exempt, pins=pins):
                 if _through_sym_pin(a, b, name, box):
                     continue
-                report["problems"].append(
+                report["problems"].append(schematic_rules.format_violation(
+                    "R-02",
                     f"导线 ({a[0]:.4g},{a[1]:.4g})->({b[0]:.4g},{b[1]:.4g}) "
-                    f"穿过元件 {name} 的符号内部")
+                    f"穿过元件 {name} 的符号内部"))
 
     # 4.5) 导线穿文字：读真实标注 bbox（bbox_annotation_only，设计坐标）。
     #      文字避让由 auto_layout 的 7.5 步在规划级完成；这里是保存后
@@ -1504,14 +1725,22 @@ def _geometry_report(design) -> dict:
             name = _inst_name(inst)
             for i, (a, b) in enumerate(segments):
                 if _segment_hits_box(a, b, box, strict=False):
-                    report["warnings"].append(
-                        f"导线 ({a[0]:.4g},{a[1]:.4g})->({b[0]:.4g},{b[1]:.4g}) "
-                        f"穿过 {name} 的文字区（bbox {box[0]:.3g},{box[1]:.3g}"
-                        f"~{box[2]:.3g},{box[3]:.3g}）")
+                    report["warnings"].append(schematic_rules.format_violation(
+                        "R-16",
+                        f"导线 ({a[0]:.4g},{a[1]:.4g})->"
+                        f"({b[0]:.4g},{b[1]:.4g}) "
+                        f"穿过 {name} 的文字区（bbox {box[0]:.3g},"
+                        f"{box[1]:.3g}~{box[2]:.3g},{box[3]:.3g}）"))
         except Exception:  # noqa: BLE001 — 标注读不出就不查，不臆测
             continue
 
     # 5) 导线两两关系：T 形搭接 / 内部交叉 / 共线重叠，按网络归属分级
+    #    分级本身**不在本函数里** —— 交给
+    #    ``schematic_rules.classify_wire_relation``，它把
+    #    (关系类型, 网络归属, 是否落在引脚上) 映射成唯一规则号 R-05..R-12；
+    #    本函数只负责把规则号渲染成文案、按规则表的严重级投入
+    #    problems/warnings。规划期、写入期查的是同一张表，三处不会再出现
+    #    「规划放过、复核拦下」的口径漂移。
     for i in range(n):
         for j in range(i + 1, n):
             v = _seg_violation(segments[i][0], segments[i][1],
@@ -1520,46 +1749,45 @@ def _geometry_report(design) -> dict:
                 continue
             kind, pt = v
             ni, nj = comp_net.get(find(i)), comp_net.get(find(j))
-            same = ni is not None and ni == nj
             at_pin = pt is not None and (round(pt[0], 6), round(pt[1], 6)) in pin_pts
+            rid = schematic_rules.classify_wire_relation(kind, ni, nj, at_pin)
+            if rid is None:
+                # 端点搭在引脚上 = 明确结点（引脚网络由 _bind_pins 保证）
+                continue
             where = (f"于 ({pt[0]:.4g},{pt[1]:.4g})" if pt is not None else "")
-            if kind == "t":
-                # 端点搭在中部：搭在引脚上 = 明确结点（引脚网络由 _bind_pins
-                # 保证）；同网络的 T 形搭接 = 清晰 T 分支（2026-09-29 用户
-                # 规则 2 的目标形态,两线引脚已被显式绑到同一标量网络,
-                # 电气连通有保证）→ 警告级；无引脚且网络不明/异网才是问题
-                if at_pin:
-                    continue
-                if same:
-                    report["warnings"].append(
-                        f"同一网络的导线 T 形分支{where}（电气已显式绑定,图面正常）")
-                elif ni is None or nj is None:
-                    report["problems"].append(
-                        f"导线端点搭在另一根导线中部{where}，且该点没有元件引脚 —— "
-                        "网络归属不明；请改为引脚到引脚连线")
+            if rid == "R-07":
+                detail = (f"网络 {ni} 与 {nj} 的导线 T 形搭接{where}"
+                          "（短路风险）")
+            elif rid == "R-10":
+                detail = (f"同一网络的导线 T 形分支{where}"
+                          "（电气已显式绑定,图面正常）")
+            elif rid == "R-12":
+                detail = (f"导线端点搭在另一根导线中部{where}，且该点没有元件"
+                          "引脚 —— 网络归属不明；请改为引脚到引脚连线")
+            elif rid == "R-05":
+                detail = f"网络 {ni} 与 {nj} 的导线交叉{where}（短路）"
+            elif rid == "R-08":
+                detail = (f"同一网络的两根导线交叉{where}"
+                          "（电学无影响，图面可疑）")
+            elif rid == "R-06":
+                detail = f"网络 {ni} 与 {nj} 的导线共线重叠{where}"
+            elif rid == "R-09":
+                detail = f"同一网络的两根导线共线重叠{where}"
+            elif rid == "R-11":
+                # 交叉与共线重叠共用 R-11（网络归属不明），措辞按关系分
+                if kind == "cross":
+                    detail = (f"两根导线交叉{where}且网络归属不明 —— "
+                              "电学影响未验证")
                 else:
-                    report["problems"].append(
-                        f"网络 {ni} 与 {nj} 的导线 T 形搭接{where}（短路风险）")
-            elif kind == "cross":
-                if same:
-                    report["warnings"].append(
-                        f"同一网络的两根导线交叉{where}（电学无影响，图面可疑）")
-                elif ni is None or nj is None:
-                    report["warnings"].append(
-                        f"两根导线交叉{where}且网络归属不明 —— 电学影响未验证")
-                else:
-                    report["problems"].append(
-                        f"网络 {ni} 与 {nj} 的导线交叉{where}（短路）")
-            else:  # overlap
-                if same:
-                    report["warnings"].append(
-                        f"同一网络的两根导线共线重叠{where}")
-                elif ni is None or nj is None:
-                    report["warnings"].append(
-                        f"两根导线共线重叠{where}且网络归属不明 —— 未验证")
-                else:
-                    report["problems"].append(
-                        f"网络 {ni} 与 {nj} 的导线共线重叠{where}")
+                    detail = (f"两根导线共线重叠{where}且网络归属不明 —— "
+                              "未验证")
+            else:                       # pragma: no cover - 规则表新增时的兜底
+                detail = f"{kind} 关系{where}"
+            msg = schematic_rules.format_violation(rid, detail)
+            if schematic_rules.severity_of(rid) == schematic_rules.BLOCK:
+                report["problems"].append(msg)
+            else:
+                report["warnings"].append(msg)
 
     # 6) 图面质量指标（2026-09-29 用户验收清单）：
     #    重复重合线段 / 拐弯数（按连通折线合并）/ 平行出线 / 同轴折返 /
@@ -1572,10 +1800,11 @@ def _geometry_report(design) -> dict:
                             (round(b[0], 6), round(b[1], 6))]))
         if key in seen_seg:
             dup += 1
-            report["problems"].append(
+            report["problems"].append(schematic_rules.format_violation(
+                "R-13",
                 f"重复重合线段：第 {seen_seg[key] + 1} 段与第 {i + 1} 段 "
                 f"({a[0]:.4g},{a[1]:.4g})->({b[0]:.4g},{b[1]:.4g}) 完全重合"
-                " —— 同一段走廊被画了两次")
+                " —— 同一段走廊被画了两次"))
         else:
             seen_seg[key] = i
     # 折线合并：分量内按端点接成链，数拐弯
@@ -1623,9 +1852,10 @@ def _geometry_report(design) -> dict:
         # 同轴折返：折线里出现方向完全相反的连续段（S 形首段）
         for d1, d2 in zip(dirs, dirs[1:]):
             if d1[0] == -d2[0] and d1[1] == -d2[1]:
-                report["warnings"].append(
+                report["warnings"].append(schematic_rules.format_violation(
+                    "R-15",
                     f"导线折线存在同轴折返（方向反转）——可能是不必要的 "
-                    f"S 形绕行，共 {len(chain) - 1} 段、{bcnt} 个拐弯")
+                    f"S 形绕行，共 {len(chain) - 1} 段、{bcnt} 个拐弯"))
                 break
     # 平行出线：同一引脚点出发的两条同网水平/竖直段方向相同
     par_cnt = 0
@@ -1661,11 +1891,14 @@ def _geometry_report(design) -> dict:
                             continue
                         par_cnt += 1
                         report["problems"].append(
-                            f"同一节点 ({pt[0]:.4g},{pt[1]:.4g}) 引出两条"
-                            f"平行同向线段：({p1[0]:.4g},{p1[1]:.4g})->"
-                            f"({q1[0]:.4g},{q1[1]:.4g}) 与 "
-                            f"({p2[0]:.4g},{p2[1]:.4g})->({q2[0]:.4g},"
-                            f"{q2[1]:.4g}) —— 同一分流关系不应画两条平行线")
+                            schematic_rules.format_violation(
+                                "R-14",
+                                f"同一节点 ({pt[0]:.4g},{pt[1]:.4g}) 引出两条"
+                                f"平行同向线段：({p1[0]:.4g},{p1[1]:.4g})->"
+                                f"({q1[0]:.4g},{q1[1]:.4g}) 与 "
+                                f"({p2[0]:.4g},{p2[1]:.4g})->"
+                                f"({q2[0]:.4g},{q2[1]:.4g})"
+                                " —— 同一分流关系不应画两条平行线"))
     # 绕行系数：曼哈顿下界 = Σ 每分量端点对的最短曼哈顿距离（近似取
     # 分量引脚点的最小生成树长度下界）；分量实际长度 = Σ 段长
     total_len = sum(abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in segments)
@@ -1774,7 +2007,8 @@ def connect_impl(design, inst_a, pin_a, inst_b, pin_b):
                         tap_pins=_tap)
     for a, b in zip(pts, pts[1:]):
         if abs(a[0] - b[0]) > 1e-8 and abs(a[1] - b[1]) > 1e-8:
-            raise RuntimeError(f"走线包含斜段: {a} -> {b}")
+            raise RuntimeError(schematic_rules.format_violation(
+                "R-01", f"走线包含斜段: {a} -> {b}"))
         if a != b:
             design.add_wire([a, b])
     _bind_pins(design, pa, pb)
@@ -1795,24 +2029,27 @@ def wire_impl(design, points):
     ends = {pts[0], pts[-1]}
     for a, b in zip(pts, pts[1:]):
         if abs(a[0] - b[0]) > 1e-8 and abs(a[1] - b[1]) > 1e-8:
-            raise RuntimeError(
+            raise RuntimeError(schematic_rules.format_violation(
+                "R-01",
                 f"wire 折点含斜段: ({a[0]:.4g},{a[1]:.4g})->({b[0]:.4g},{b[1]:.4g})。"
-                "导线必须严格沿 X 或 Y；要自动正交连线请用 connect()")
+                "导线必须严格沿 X 或 Y；要自动正交连线请用 connect()"))
     for a, b in zip(pts, pts[1:]):
         if a == b:
             continue
-        if any(_segment_hits_box(a, b, box) for _, box in boxes):
-            raise RuntimeError(
+        if any(_segment_hits_box(a, b, _e[1]) for _e in boxes):
+            raise RuntimeError(schematic_rules.format_violation(
+                "R-02",
                 f"wire 段 ({a[0]:.4g},{a[1]:.4g})->({b[0]:.4g},{b[1]:.4g}) "
-                "穿过元件符号内部")
+                "穿过元件符号内部"))
         for old_route in routes:
             old = old_route[0] if isinstance(old_route, tuple) else old_route
             old_ends = {old[0], old[-1]}
             if any(_segment_hits_route(a, b, c, d, ends, old_ends)
                    for c, d in zip(old, old[1:])):
-                raise RuntimeError(
-                    f"wire 段 ({a[0]:.4g},{a[1]:.4g})->({b[0]:.4g},{b[1]:.4g}) "
-                    "与已有导线交叉或重叠")
+                raise RuntimeError(schematic_rules.format_stage_violation(
+                    schematic_rules.STAGE_WRITE,
+                    f"wire 段 ({a[0]:.4g},{a[1]:.4g})->"
+                    f"({b[0]:.4g},{b[1]:.4g}) 与已有导线交叉或重叠"))
     for a, b in zip(pts, pts[1:]):
         if a != b:
             design.add_wire([a, b])
@@ -1827,11 +2064,12 @@ def save_impl(design):
     """
     geo = _geometry_report(design)
     if geo["problems"]:
-        raise RuntimeError(
+        raise RuntimeError(schematic_rules.format_stage_violation(
+            schematic_rules.STAGE_VERIFY,
             "保存前导线几何检查未通过（未保存，原设计不受影响）：\n- "
             + "\n- ".join(geo["problems"])
             + "\n修复方式：删掉违规导线（shape.delete_object()），"
-              "引脚连线改用 connect() —— 它自动走正交并避障。")
+              "引脚连线改用 connect() —— 它自动走正交并避障。"))
     for w in geo["warnings"]:
         print("[geometry] 疑点:", w)
     for u in geo["unverified"]:
@@ -1998,6 +2236,8 @@ _AUTO_ANNOT_MASTERS = {
 # 无引脚、不参与信号连接的模型包含/选项件（如 Infineon_Include_RF，
 # CB_FM_Amp 实测 2026-09-29）——按 master 名包含 INCLUDE 识别为注释件
 _AUTO_INCLUDE_RE = re.compile(r"INCLUDE", re.IGNORECASE)
+#: ADS 技术名称（库/cell/view）：字母开头，字母数字下划线，≤64 字符
+_TECH_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 # angle=0 时标准符号的引脚偏移（实测：MLIN/R/Term 两端引脚在 origin 和
 # origin+(1,0)；MTEE 第 3 脚（分支）在 origin+(0.5,-0.5)；TermG 单脚在
 # origin 上、符号体在 origin 右侧（bbox 0~0.875），所以输入口要放 180°）
@@ -2016,7 +2256,41 @@ _AUTO_PIN_OFFS = {
     # 不要从已有设计反推偏移:原设计的 angle 属性若读不到会显示成 0,
     # 旋转过的实例会被误认成 angle=0 几何(2026-09-29 实测踩过)。
     "BFR106": {"1": (0.5, 0.5), "2": (0.0, 0.0), "3": (0.5, -0.5)},
+    # ADS 2027 native linear FET, measured in automation on 2026-10-13:
+    # pin1=gate at origin, pin2=drain above, pin3=source below.
+    "FET": {"1": (0.0, 0.0), "2": (0.5, 0.5), "3": (0.5, -0.5)},
 }
+
+#: 符号体真实外框（相对 origin，angle=0）。2026-10-14 实测（tools/probe_symbol_bbox.py
+#: 在 ADS 2027 上逐个 add_instance 读 inst.bbox，见 output/symbol_bbox.json）。
+#:
+#: 为什么必须与 `_AUTO_PIN_OFFS` **分开**：引脚位置只说明"导线端点在哪"，
+#: 符号体说明"哪里不能穿"。此前只有引脚档案，避障盒由引脚包围盒推算
+#: （`_rough_box_public`），于是 FET 的避障盒只到 x=0.5，而**真实符号体到
+#: x=0.575** —— 规划在 x=6.25 画了一根竖线（在 0.5..0.575 这条差里），
+#: 规划自认为合法，保存后用真实 bbox 复核却判"穿过 DEVICE_CORE"
+#: （J310_verify_20261014_wrk 实测失败）。差 0.075 就足以让"规划合法 ⇒
+#: 保存后合法"这个等式不成立。
+#:
+#: 值格式：(left, bottom, right, top)，None 表示该侧由引脚档案推导（未实测）。
+_SYMBOL_BBOX = {
+    "FET": (0.0, -0.5, 0.575, 0.5),
+    "R": (0.0, -0.06875, 1.0, 0.06875),
+    "L": (0.0, -0.0375, 1.0, 0.0875),
+    "GROUND": (0.0, -0.125, 0.25, 0.125),
+    "TERMG": (0.0, -0.1875, 0.875, 0.1875),
+    "S_PARAM": (0.0, -0.46875, 2.575, 0.0),
+}
+
+#: 实测符号盒之外的安全余量（单位：格）。规划期避障盒 = 实测 bbox + 该余量，
+#: 保证它是真实符号体的超集。
+_SYMBOL_KEEPOUT_PAD = 0.05
+
+#: 引脚逃逸段长度：端点符号豁免**只**允许引脚处这一小段（2026-10-14）。
+#: 取值依据：ADS 实测符号最小半宽（GROUND 0.125、R 半高 0.06875），
+#: 0.12 足以让引脚出线离开符号体，又远小于最短符号的宽度（0.25），
+#: 不会让"整段穿体"蒙混过关。
+PIN_ESCAPE_LEN = 0.12
 
 # 直流源 master（电源母线网络的判据之一；短名，大小写不敏感由 _master_short 保证）
 _AUTO_DC_SRC_MASTERS = {"V_DC", "I_DC"}
@@ -2070,6 +2344,12 @@ def _pin_text_overhang(master, angle, lbl, side):
 
 
 def _master_short(master) -> str:
+    """master 名归一化（`lib:MLIN` → `MLIN`）。
+
+    2026-10-30 试过在这里加 dict 记忆化（cProfile 显示大图上被调 71 万次），
+    实测是负优化：A/B 交替测量（chain13/19/31）加缓存后反而慢 1.4~1.9 倍 ——
+    每次调用的实际成本低于"字典查找 + 缓存未命中时的 key 构造"。保持无状态。
+    """
     return str(master).replace("/", ":").split(":")[-1].upper()
 
 
@@ -2202,6 +2482,50 @@ def _fallback_chain(rf, adj):
     return best
 
 
+def _localize_shared_grounds(instances, connections):
+    """Give each grounded pin a local symbol; ADS GROUND is global net 0.
+
+    Only used by automatic layout. A shared drawing symbol otherwise forces
+    distant return branches to connect with a wire across the entire circuit.
+    """
+    specs = {str(s["name"]): s for s in instances}
+    names = set(specs)
+    result = list(instances)
+    conns = []
+    targets = {}
+    for conn in connections:
+        c = dict(conn)
+        for side, other in (("a", "b"), ("b", "a")):
+            endpoint, mate = c.get(side), c.get(other)
+            if not (isinstance(endpoint, (list, tuple)) and len(endpoint) >= 2
+                    and isinstance(mate, (list, tuple)) and len(mate) >= 2):
+                continue
+            name = str(endpoint[0])
+            spec = specs.get(name)
+            if spec is None or _master_short(spec["master"]) not in _AUTO_GND_MASTERS:
+                continue
+            mate_spec = specs.get(str(mate[0]))
+            if mate_spec is None or _master_short(mate_spec["master"]) in _AUTO_GND_MASTERS:
+                continue
+            by_pin = targets.setdefault(name, {})
+            key = (str(mate[0]), str(mate[1]))
+            if key not in by_pin:
+                local = name
+                if by_pin:
+                    index = len(by_pin) + 1
+                    local = f"{name}_local{index}"
+                    while local in names:
+                        index += 1
+                        local = f"{name}_local{index}"
+                    names.add(local)
+                    result.append({k: v for k, v in dict(spec, name=local).items()
+                                   if k not in ("x", "y", "angle", "mirror", "annot")})
+                by_pin[key] = local
+            c[side] = [by_pin[key], endpoint[1]]
+        conns.append(c)
+    return result, conns
+
+
 def auto_layout_positions(instances, connections, var_spec=None):
     """按信号流算坐标：主干链一行、分支向下成行、跨链件竖放在行间。
 
@@ -2230,6 +2554,10 @@ def auto_layout_positions(instances, connections, var_spec=None):
 
     specs = {str(s["name"]): s for s in instances}
 
+    # 2026-10-30 备注：这里的 kind/offs/_multi_pin 与下方 _rough_box 都试过按
+    # 实例名（或 (n,x,y,angle)）做 dict 记忆化，实测在大图上是负优化（A/B 交替
+    # 测量 chain13/19/31 慢 1.4~1.9 倍）——这些闭包单次成本低于缓存查找本身。
+    # 真正的规模问题在算法复杂度（≥50 级时 0.4~1.9 s），不在常数项。
     def kind(n):
         m = _master_short(specs[n]["master"])
         if m in _AUTO_GND_MASTERS:
@@ -2865,7 +3193,12 @@ def auto_layout_positions(instances, connections, var_spec=None):
 
         def _rough_box(n):
             """已放件的保守占位矩形（布局阶段近似，含引脚伸出与 pad）。
-            竖放件窄高、横放件扁宽、多端件按符号圈;用于支路挂靠的净空判定。"""
+            竖放件窄高、横放件扁宽、多端件按符号圈;用于支路挂靠的净空判定。
+
+            2026-10-30 试过按 (n, x, y, angle) 记忆化（cProfile 显示被调 17.7
+            万次），实测负优化：key 里含浮点坐标，命中率低而构造/哈希开销固定，
+            A/B 交替测量在大图上慢 1.4~1.9 倍。保持无状态纯计算。
+            """
             p = placed[n]
             x, y = p["x"], p["y"]
             if kind(n) == "gnd":
@@ -3763,6 +4096,51 @@ def auto_layout_positions(instances, connections, var_spec=None):
                     row_of[n] = row_of.get(anchor[0], 0)
             except Exception:  # noqa: BLE001 — 单件失败不影响其余
                 continue
+        # Series return branches (source/emitter -> R/L/... -> ground) are
+        # terminal chains, not bridges. Walk from the already placed anchor
+        # through distinct pins and keep the whole chain in a local column.
+        # The generic branch walker only extends across the same net and used
+        # to strand the last component at x=0 (C-shaped return wiring).
+        for anchor in sorted(assigned):
+            if not _multi_pin(anchor):
+                continue
+            for head in sorted(adj_all[anchor]):
+                if head in assigned or _multi_pin(head):
+                    continue
+                tail = []
+                prev, cur = anchor, head
+                while cur not in assigned and cur not in tail and not _multi_pin(cur):
+                    if specs[cur].get("angle") is not None or len(offs(cur)) != 2:
+                        break
+                    entry = str(pin_of.get((cur, prev), "1"))
+                    exit_ = next(l for l in offs(cur) if str(l) != entry)
+                    tail.append((cur, entry, str(exit_)))
+                    neighbors = adj_all[cur] - {prev}
+                    if gnd_mates.get(cur):
+                        if neighbors:
+                            break
+                        if len(tail) < 2:
+                            break  # single shunts already have placement rules
+                        jxy = pin_abs(anchor, pin_of[(anchor, head)])
+                        col = jxy[0] + 0.55
+                        y = jxy[1] - 0.8
+                        for n, en, ex in tail:
+                            ang = _axis_angle(n, en, ex, 1)
+                            resolved_angle[n] = (ang + 270) % 360
+                            eo = _rot_off(*offs(n)[en], resolved_angle[n])
+                            xo = _rot_off(*offs(n)[ex], resolved_angle[n])
+                            placed[n] = {"x": col - eo[0], "y": y - eo[1]}
+                            y = placed[n]["y"] + xo[1] - 0.8
+                            assigned.add(n)
+                            row_of[n] = row_of.get(anchor, 0)
+                        break
+                    if len(neighbors) != 1:
+                        break
+                    nxt = next(iter(neighbors))
+                    if str(pin_of.get((cur, nxt))) != str(exit_):
+                        break
+                    prev, cur = cur, nxt
+
         pending = [n for n in ports if n not in assigned] + \
                   [n for n in rf if n not in assigned and n not in ports]
         for _round in range(2):   # 第二轮:自由脚对端已放齐后再放偏置类链
@@ -4561,6 +4939,28 @@ def auto_layout_positions(instances, connections, var_spec=None):
     return placed
 
 
+def _pin_points(name, specs, p, placed):
+    """该实例全部引脚的绝对坐标（端点符号豁免的唯一判据，2026-10-14）。
+
+    端点豁免不能靠 bbox 猜引脚位置：R/L 的引脚画在体内（±0.06875），
+    FET 的 gate 在原点、drain/source 在 (0.5,±0.5)，而真实符号体到 0.575。
+    必须用引脚档案 + 实例角度算出来。
+    """
+    if name not in specs:
+        return ()
+    spec = specs[str(name)]
+    ang = p.get("angle")
+    if ang is None:
+        ang = int(spec.get("angle") or 0)
+    offs = _AUTO_PIN_OFFS.get(_master_short(spec["master"]),
+                              _AUTO_PIN_OFFS_DEFAULT)
+    out = []
+    for _lbl, (dx, dy) in offs.items():
+        rx, ry = _rot_off(dx, dy, int(ang or 0))
+        out.append((round(p["x"] + rx, 6), round(p["y"] + ry, 6)))
+    return tuple(out)
+
+
 def plan_wire_routes(instances, connections, placed):
     """网络级走线计划（2026-09-29 用户规则 2）:返回 {连接索引: 折点列表}。
 
@@ -4628,9 +5028,11 @@ def plan_wire_routes(instances, connections, placed):
         m = _master_short(specs[str(n)]["master"])
         if m in _AUTO_GND_MASTERS:
             boxes.append((str(n), (p["x"] - 0.2, p["y"] - 0.5,
-                                   p["x"] + 0.5, p["y"] + 0.2)))
+                                   p["x"] + 0.5, p["y"] + 0.2),
+                          _pin_points(n, specs, p, placed)))
             continue
-        boxes.append((str(n), _rough_box_public(specs[str(n)], p)))
+        boxes.append((str(n), _symbol_keepout(specs[str(n)], p),
+                      _pin_points(n, specs, p, placed)))
 
     hy = {}   # net tag -> 共享水平走廊 y 集合
     vx = {}   # net tag -> 共享竖直走廊 x 集合
@@ -4639,9 +5041,11 @@ def plan_wire_routes(instances, connections, placed):
 
     def seg_hits_sym(seg, endpoints_syms):
         a, b = seg
-        for n, box in boxes:
+        for entry in boxes:
+            n, box = entry[0], entry[1]
+            pins = entry[2] if len(entry) > 2 else None
             strict = n in endpoints_syms
-            if not _segment_hits_box(a, b, box, strict=strict):
+            if not _segment_hits_box(a, b, box, strict=strict, pins=pins):
                 continue
             # 线段恰好穿过该符号自身引脚点（同网络）= 合法引脚搭接
             #（T 结打在引脚上）—— 五路直通臂的直线穿过 A2.1 引脚
@@ -4743,11 +5147,13 @@ def plan_wire_routes(instances, connections, placed):
         # 挡死时,从障碍外侧下探再横进是唯一无交叉路径)
         xs_try = [pa[0] + off for off in (1.0, -1.0, 2.0, -2.0, 3.0, -3.0)]
         y0, y1 = sorted((pa[1], pb[1]))
-        for _n, box in boxes:
+        for _entry in boxes:
+            box = _entry[1]
             if box[1] < y1 and box[3] > y0:
                 xs_try.extend((box[0] - 0.25, box[2] + 0.25))
         ys_try = [pa[1] + off for off in (1.0, -1.0, 2.0, -2.0, 3.0, -3.0)]
-        for _n, box in boxes:
+        for _entry in boxes:
+            box = _entry[1]
             if box[0] < max(pa[0], pb[0]) and box[2] > min(pa[0], pb[0]):
                 ys_try.extend((box[1] - 0.25, box[3] + 0.25))
         for c in ([(pa[0], yk), (pb[0], yk)] for yk in ys_try):
@@ -4774,10 +5180,22 @@ def plan_wire_routes(instances, connections, placed):
                     elif abs(s1[0] - s2[0]) < 1e-9:
                         if abs(px - s1[0]) < 1e-9 and                                 min(s1[1], s2[1]) - 1e-9 <= py <=                                 max(s1[1], s2[1]) + 1e-9:
                             pen += 10
-                for n2, box in boxes:
+                for n2, box, *rest in boxes:
+                    pins2 = rest[0] if rest else None
                     strict = n2 in {ka[0], kb[0]}
-                    if _segment_hits_box(s1, s2, box, strict=strict):
+                    if _segment_hits_box(s1, s2, box, strict=strict, pins=pins2):
                         pen += 5 if not strict else 2
+                # 跨网规划线交叉（上方注释承诺的第三项，2026-10-12 补实现）：
+                # 已规划折线是后续在线布线的硬约束，罚分若不统计它，会把
+                # "必然被在线 _route_clear 拒绝"的候选选出来（FM_MURATA 里
+                # R1->CB 的折点因此交叉发射极走廊，触发整图失败链）。
+                for otag, opts in planned:
+                    if otag == tag:
+                        continue
+                    o_ends = {opts[0], opts[-1]}
+                    if any(_segment_hits_route(s1, s2, c, e2, {pa, pb}, o_ends)
+                           for c, e2 in zip(opts, opts[1:])):
+                        pen += 8
             pen += sum(abs(s1[0] - s2[0]) + abs(s1[1] - s2[1])
                        for s1, s2 in zip(pts_all, pts_all[1:])) * 0.01
             return pen
@@ -4914,6 +5332,37 @@ def plan_wire_routes(instances, connections, placed):
     return out
 
 
+def _symbol_keepout(spec, p):
+    """规划期的符号占位盒（与保存后真实 bbox 同源）。
+
+    2026-10-14：`_rough_box_public` 过去只按**引脚包围盒**推算，于是避障盒
+    比真实符号体小 —— FET 引脚只到 x=0.5、真实体到 x=0.575（实测见
+    `_SYMBOL_BBOX`）。规划在 x=6.25 画竖线时落在 0.5..0.575 这条差里，
+    规划判合法、保存后 `_geometry_report` 用真实 bbox 判"穿过 DEVICE_CORE"。
+    **两套判据不同源是这次真实失败的根因。**
+
+    现在优先用实测的 `_SYMBOL_BBOX`（按 master 短名 + 实例角度旋转），
+    未实测的 master 退回引脚包围盒 + 保守余量 —— 保证是真实符号体的**超集**，
+    宁可规划时多让一点，也不能让"规划合法、保存后非法"再发生。
+    """
+    x, y = float(p["x"]), float(p["y"])
+    ang = int(p.get("angle") or spec.get("angle") or 0)
+    m = _master_short(str(spec["master"]))
+    measured = _SYMBOL_BBOX.get(m)
+    if measured is not None:
+        xs, ys = [], []
+        for cx, cy in ((measured[0], measured[1]), (measured[2], measured[1]),
+                       (measured[2], measured[3]), (measured[0], measured[3])):
+            rx, ry = _rot_off(cx, cy, ang)
+            xs.append(x + rx)
+            ys.append(y + ry)
+        # 再外扩一点余量：实测 bbox 只到符号**可见轮廓**，导线的粗细与
+        # 标注可能还会外溢。留出 wire_clearance 量级的安全带。
+        pad = _SYMBOL_KEEPOUT_PAD
+        return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+    return _rough_box_public(spec, p)
+
+
 def _rough_box_public(spec, p):
     """placed 实例的保守占位矩形(布局/走线计划共用的符号 box 近似)。
 
@@ -4975,14 +5424,132 @@ def _ensure_cell_view(ws, library: str, cell: str, view: str) -> dict:
     return {"created": True}
 
 
+def create_component_symbol(args: dict, ctx=None) -> dict:
+    """从**已建好的子电路原理图**生成真实 ADS symbol 视图（可放置元件）。
+
+    数据来源必须是 ADS 自己读到的原理图端子（不是调用方声明）：
+    先用 db_uu 打开 schematic 只读，读回 numbered Terms；再用官方
+    ``db_uu.create_symbol`` + ``keysight.ads.de.experimental.generate_symbol``
+    按端子生成符号体与引脚，保存后只读复核 symbol 的引脚编号与名字。
+
+    返回体如实区分：
+    * ``symbol_created``：本次是否新建了 symbol 视图；
+    * ``pins``：symbol 里真实读到的引脚（编号/名字）；
+    * ``problems``：任何一步失败都进这里并整体判失败 —— 不把"生成了文件"
+      当作"元件可用"。
+    """
+    import ads_ops  # noqa: F401 — 保持与同模块其它工具相同的延迟导入习惯
+
+    library = str(args.get("library") or "").strip()
+    cell = str(args.get("cell") or "").strip()
+    if not library or not cell:
+        raise RuntimeError("必须给出 library 与 cell")
+    if not _TECH_NAME_RE.fullmatch(library) or not _TECH_NAME_RE.fullmatch(cell):
+        raise RuntimeError("library/cell 必须是合法 ADS 名称（字母开头，字母数字下划线）")
+    symbol_view = str(args.get("symbol_view") or "symbol").strip() or "symbol"
+    replace = bool(args.get("replace"))
+
+    ws = _require_workspace()
+    db_uu = _db_uu()
+
+    # ---- 1) 读原理图端子（只读）----------------------------------------
+    schematic = _open_design(library, cell, "schematic", write=False)
+    try:
+        terms = list(getattr(schematic, "terms", None) or [])
+        pins = []
+        for term in terms:
+            number = int(getattr(term, "number", 0) or 0)
+            name = str(getattr(term, "name", "") or "")
+            if number <= 0:
+                continue
+            pins.append({"num": number, "terminal": name, "role": name})
+        pins.sort(key=lambda p: p["num"])
+        if not pins:
+            raise RuntimeError(
+                f"{library}:{cell}:schematic 没有任何编号端子（Term）；"
+                "不能生成 symbol —— 元件引脚必须先在原理图里定义为 Term")
+    finally:
+        _close_design(schematic)
+
+    # ---- 2) 创建/复用 symbol 视图 ---------------------------------------
+    symbol_name = f"{library}:{cell}:{symbol_view}"
+    symbol_created = False
+    view_exists = True
+    try:
+        probe = db_uu.open_design(symbol_name, mode=_design_mode(False))
+        _close_design(probe)
+    except Exception:  # noqa: BLE001 — 打不开即视为不存在（与 _ensure_cell_view 同口径）
+        view_exists = False
+    if view_exists and not replace:
+        raise RuntimeError(
+            f"{symbol_name} 已存在；为避免覆盖已有符号，请显式 replace=True")
+    if not view_exists:
+        db_uu.create_symbol((library, cell, symbol_view))
+        symbol_created = True
+
+    # ---- 3) 用官发生成器按原理图端子生成符号 -----------------------------
+    try:
+        from keysight.ads.de.experimental.generate_symbol import SymbolGenerator
+    except Exception as exc:  # noqa: BLE001 — 旧版/裁剪安装可能没有该实验模块
+        raise RuntimeError(
+            "当前 ADS 安装没有 keysight.ads.de.experimental.generate_symbol，"
+            "无法程序化生成 symbol 视图；可手工在 ADS 里从原理图创建 symbol，"
+            f"或升级到提供该模块的版本（{type(exc).__name__}: {exc}）") from exc
+
+    source = _open_design(library, cell, "schematic", write=False)
+    symbol = db_uu.open_design(symbol_name, mode=_design_mode(True))
+    try:
+        generator = SymbolGenerator(symbol, source, float(args.get("lead_len") or 0.1),
+                                    float(args.get("lead_spacing") or 0.1))
+        generator.should_replace = bool(replace)
+        generator.is_dual_symbol_type = False
+        generator.generate_symbol()
+        symbol.save_design()
+    finally:
+        _close_design(symbol)
+        _close_design(source)
+
+    # ==== 5) 只读复核：真实 symbol 引脚 ----------------------------------
+    problems = []
+    read_back = []
+    check = db_uu.open_design(symbol_name, mode=_design_mode(False))
+    try:
+        # symbol 视图的引脚挂在 Term 上，必须用 PinIter(term) 枚举 ——
+        # 实测 Design 没有 pins/get_pin_iter；term 无 pin 时 PinIter 为空。
+        for term in list(getattr(check, "terms", None) or []):
+            number = int(getattr(term, "number", 0) or 0)
+            if number <= 0:
+                continue
+            try:
+                n_pins = len(list(db_uu.PinIter(term)))
+            except Exception:  # noqa: BLE001
+                n_pins = 0
+            read_back.append({"num": number,
+                              "terminal": str(getattr(term, "name", "") or ""),
+                              "pin_figures": n_pins})
+        read_back.sort(key=lambda p: p["num"])
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"symbol 只读复核失败：{type(exc).__name__}: {exc}")
+    finally:
+        _close_design(check)
+    expected_nums = [p["num"] for p in pins]
+    actual_nums = [p["num"] for p in read_back]
+    if expected_nums != actual_nums:
+        problems.append(f"symbol 引脚编号与原理图端子不一致："
+                        f"原理图 {expected_nums} vs symbol {actual_nums}")
+    no_fig = [p["num"] for p in read_back if not p.get("pin_figures")]
+    if no_fig:
+        problems.append(f"symbol 引脚缺少 pin 图形（无法放置连线）：{no_fig}")
+    return {"ok": not problems, "design": symbol_name,
+            "library": library, "cell": cell, "symbol_view": symbol_view,
+            "symbol_created": symbol_created, "replaced": view_exists and replace,
+            "pins": read_back, "schematic_terms": pins,
+            "problems": problems, "workspace": str(getattr(ws, "path", "") or ""),
+            "note": ("symbol 视图已生成并读回核对。" if not problems else
+                     "symbol 生成或复核未通过，不能当作可放置元件。")}
+
+
 def _gnd_normalized_angles(instances, connections):
-    """GND 朝向规范化表 {gnd_name: angle}：地的符号体必须沿所连导线的
-    延伸方向展开 —— GND 在对端引脚下方 → 270（正置接地，横线在下）；
-    上方 → 90（倒置接地，横线在上）；右侧 → 0；左侧 → 180。
-    GROUND 角度实测建档（2026-09-29 渲染 gnd4.pdf 逐角度提取几何）：
-    0° 接入线水平向右、90° 符号体在 origin 上方、180° 向左、270° 在
-    origin 下方。模型乱给 angle 会画出横着的侧面地挂在垂直导线末端
-    （用户三轮截图反馈）。无连线信息的 GND 取 270（最常见正置形）。"""
     specs = {str(s["name"]): s for s in instances}
     out = {}
     gnd_names = {n for n, s in specs.items()
@@ -5018,8 +5585,77 @@ def _gnd_normalized_angles(instances, connections):
     return out
 
 
+def _add_term_anchors(design, anchors: list) -> list:
+    """把指定实例引脚提升为命名编号端子（子电路对外引脚）。
+
+    ``anchors`` 每项：``{name, number, instance, pin}``。实现要点：
+
+    * 端子挂在**该引脚已有的网络**上（不新建网络、不改连通性）；
+    * 同一设计里必须统一"按编号连接"（ADS 实测约束：一个按名连接就全部
+      要按名连接），这里一律用 add_numbered_term；
+    * 读回实际端子编号/名称并如实返回，失败直接抛错由调用方整体回滚。
+    """
+    by_name = {}
+    for inst in list(design.instances or []):
+        by_name.setdefault(_inst_name(inst), inst)
+    db_uu = _db_uu()   # 模块级名是 _db_uu()，不是 db_uu
+    created = []
+    for spec in anchors:
+        name = str(spec.get("name") or "").strip()
+        number = int(spec.get("number") or 0)
+        inst_name = str(spec.get("instance") or "").strip()
+        pin_no = int(spec.get("pin") or 0)
+        if not name or number <= 0 or not inst_name or pin_no <= 0:
+            raise RuntimeError(f"term_anchors 项不完整: {spec!r}")
+        inst = by_name.get(inst_name)
+        if inst is None:
+            raise RuntimeError(f"term_anchor 指定的实例不存在: {inst_name}")
+        # 引脚编号要读 InstPin.inst_term.term_number（_pin_label 已封装这一步）。
+        # 实测（ADS 2027）：InstPin 本身没有 term_number/pin_number 属性 ——
+        # 直接 getattr(pin, "term_number") 恒为 None，会永远找不到引脚。
+        try:
+            pin = _find_pin_on(inst, pin_no)
+        except KeyError as exc:
+            raise RuntimeError(f"term_anchor {name}: {exc}") from exc
+        net = getattr(pin, "net", None)
+        if net is None:
+            raise RuntimeError(f"{inst_name}.{pin_no} 没有网络，无法建端子 {name}")
+        term = design.add_numbered_term(net, name, number)
+        # **逻辑端子必须带 pin 图形**：实测（ADS 2027）add_numbered_term 只建
+        # 端子，PinIter(term) 为空；而 Generate Symbol 依赖 term 的 pin 才能
+        # 生成符号引脚（否则 symbol 只有图形、没有引脚，无法放置连线）。
+        # 引脚图形放在原实例引脚位置，方向取该引脚方向。
+        try:
+            loc = getattr(pin, "snap_point", None)
+            if loc is None:
+                loc_xy = (0.0, 0.0)
+            elif hasattr(loc, "x") and hasattr(loc, "y"):
+                # 实测返回 PointF：只有 x/y 属性，不可下标（getattr 的默认参数
+                # 会被立即求值，loc[0] 会先抛 TypeError —— 必须分成两个分支）。
+                loc_xy = (float(loc.x), float(loc.y))
+            else:
+                loc_xy = (float(loc[0]), float(loc[1]))
+            angle = float(getattr(pin, "angle", 0.0) or 0.0)
+            # 用 add_dot_for_pin 生成 **pin 图层上的点形状**：它也是合法
+            # PinFig，但不会像 add_pin_fig_for_term_type 那样创建一个
+            # 带 bbox 的实例（实测那种实例会压在元件符号上，让保存后的
+            # 几何门禁把正常导线判成"穿过符号"）。
+            fig = design.add_dot_for_pin(loc_xy)
+            design.add_pin(term, fig, angle=angle)
+        except Exception as exc:  # noqa: BLE001 — 建不出 pin 就必须整体失败
+            raise RuntimeError(
+                f"端子 {name} 的 pin 图形创建失败（symbol 生成依赖它）："
+                f"{type(exc).__name__}: {exc}") from exc
+        created.append({"name": name, "number": number,
+                        "instance": inst_name, "pin": pin_no,
+                        "pin_figure": True,
+                        "read_back_name": str(getattr(term, "name", "") or name)})
+    return created
+
+
 def _netlist_gate(netlist_text: str, instances: list, connections: list,
-                  design_ref: str, backup: dict, gen_error: str = ""):
+                  design_ref: str, backup: dict, gen_error: str = "",
+                  ignore_names=()):
     """保存后网表逐引脚等价核对。返回 (problems, netlist_equiv)。
 
     三种情形都必须拦下、不得当成功（2026-09-30 建图验收可信度轮）：
@@ -5039,7 +5675,7 @@ def _netlist_gate(netlist_text: str, instances: list, connections: list,
     import netlist_check as _nc
     try:
         _ok, _diffs, _parsed = _nc.check_netlist_equivalence(
-            netlist_text, instances, connections)
+            netlist_text, instances, connections, ignore_names=ignore_names)
         _cdiffs = _nc.check_components(netlist_text, instances)
     except Exception as e:  # noqa: BLE001 — 核对崩溃必须拦，不能静默当通过
         equiv = {"ok": None,
@@ -5051,11 +5687,13 @@ def _netlist_gate(netlist_text: str, instances: list, connections: list,
              "component_diffs": _cdiffs, "n_components": len(_parsed)}
     problems = []
     if _diffs:
-        problems.append("网表级电气等价失败（引脚划分比对）：\n- "
-                        + "\n- ".join(_diffs[:12]) + f"（{ctx}）")
+        problems.append(schematic_rules.format_violation(
+            "R-23", "网表级电气等价失败（引脚划分比对）：\n- "
+                        + "\n- ".join(_diffs[:12]) + f"（{ctx}）"))
     if _cdiffs:
-        problems.append("网表元件/参数核对失败：\n- "
-                        + "\n- ".join(_cdiffs[:12]) + f"（{ctx}）")
+        problems.append(schematic_rules.format_violation(
+            "R-23", "网表元件/参数核对失败：\n- "
+                        + "\n- ".join(_cdiffs[:12]) + f"（{ctx}）"))
     return problems, equiv
 
 
@@ -5102,13 +5740,26 @@ def build_schematic(args: dict, ctx=None) -> dict:
         # 位置之外（实测 rotate-then-flip）——图形规范化剥离（电气不变）
         instances = [{k: v for k, v in s.items() if k != "mirror"}
                      for s in instances]
+        instances, connections = _localize_shared_grounds(instances, connections)
+        # 布局/走线规划是纯计算，但仍在 ADS 主线程跑（见 layout_report 里的
+        # 实测耗时与 docs/ADS未响应修复实施报告_2026-10-30.md 的"剩余限制"：
+        # 把它搬出主线程需要把 build_schematic 拆成"规划/应用"两阶段，属
+        # 架构改动，本次不做）。这里至少把耗时如实报出来，让"卡了多久、
+        # 卡在哪一步"可查，而不是靠用户感觉。
+        _layout_t0 = time.monotonic()
         positions = auto_layout_positions(instances, connections, var_spec)
-        layout_report = {"method": "auto（信号流布局）"}
+        _layout_ms = (time.monotonic() - _layout_t0) * 1000.0
+        layout_report = {"method": "auto（信号流布局）",
+                         "n_instances": len(instances),
+                         "layout_ms": round(_layout_ms, 1)}
         # 网络级走线计划（2026-09-29 用户规则 2）:先按电气网络规划共享
         # 线段再绘制 —— 同一节点左右出线共线、T 形分支、同 net 走廊豁免
+        _wire_t0 = time.monotonic()
         try:
             wire_plan = plan_wire_routes(instances, connections, positions)
+            layout_report["wire_ms"] = round((time.monotonic() - _wire_t0) * 1000.0, 1)
         except Exception as plan_err:  # noqa: BLE001 — 计划失败回退在线寻路
+            layout_report["wire_ms"] = round((time.monotonic() - _wire_t0) * 1000.0, 1)
             wire_plan = {}
             layout_report["fallback_reason"] = (
                 f"网络级走线计划失败，已回退逐条在线寻路: "
@@ -5219,10 +5870,11 @@ def build_schematic(args: dict, ctx=None) -> dict:
         # 的实例，增量追加时新元件会被排到与旧元件重叠的位置。已有内容
         # 且非 recreate 时明确拒绝，指明两条安全路径。
         if layout_mode in ("auto", "flow") and n_before > 0 and not recreate:
-            raise RuntimeError(
+            raise RuntimeError(schematic_rules.format_violation(
+                "R-20",
                 f"设计里已有 {n_before} 个实例，layout=\"auto\" 只支持全新铺图"
                 f"（recreate=True，会先备份覆盖）或空设计；增量修改请显式给"
-                f"每个实例 x/y 坐标（追加模式），或改用 recreate 重建整图")
+                f"每个实例 x/y 坐标（追加模式），或改用 recreate 重建整图"))
 
         def _apply():
             out = []
@@ -5254,26 +5906,12 @@ def build_schematic(args: dict, ctx=None) -> dict:
                 out.append(vname)
             scale_issue = _layout_scale_issue(design, connections)
             if scale_issue and not args.get("allow_large_geometry"):
-                raise RuntimeError("建图坐标尺度异常，已阻止保存：" + scale_issue)
-            # 追加模式：设计里已有旧导线，新布线必须避让 —— 从设计里现读
+                raise RuntimeError(schematic_rules.format_violation(
+                    "R-19", "建图坐标尺度异常，已阻止保存：" + scale_issue))
+            # 追加模式：设计里已有旧导线，新布线必须避让 —— 从设计里现读；
+            # 折点被在线复核拒绝的连接由 _wire_all_connections 延后重寻
             routed = _design_wire_routes(design)
-            for conn in connections:
-                try:
-                    _wire_connection(design, conn, routed)
-                except RuntimeError as wire_err:
-                    # 走线计划的折点被在线真 bbox 拒(保守估计与实测符号
-                    # 尺寸有出入) —— 舍弃折点、保留同 net 豁免标签,让
-                    # _route_around 用真实几何在线重寻。仍失败才整体失败。
-                    if "指定折点" not in str(wire_err):
-                        raise
-                    import sys as _sys2, os as _os2
-                    if _os2.environ.get("WIRE_FALLBACK_DEBUG"):
-                        print(f"[wire-fallback] {conn.get('a')}->{conn.get('b')} "
-                              f"拒绝原因: {wire_err}", file=_sys2.stderr)
-                    _wire_connection(
-                        design,
-                        {k: v for k, v in conn.items() if k != "waypoints"},
-                        routed)
+            _wire_all_connections(design, connections, routed)
             return out
 
         # 注意：**不能用 db_uu.Transaction 包裹 add_instance** ——
@@ -5282,6 +5920,12 @@ def build_schematic(args: dict, ctx=None) -> dict:
         # 会话里看得到、落盘后再打开就丢了，表面上每一步都"成功"。
         # 保存前的放置失败不会落盘；保存后仍须只读复核，失败时查看备份。
         placed = _apply()
+        # 层次引脚：把 term_anchors 指定的实例引脚提升为命名的 numbered Term，
+        # 供上层原理图按编号连接（子电路封装用）。电气上等价于"该引脚所在的
+        # 网络对外暴露一个端子"，不新增任何元件或网络合并。
+        anchors = args.get("term_anchors") or []
+        if anchors:
+            _add_term_anchors(design, anchors)
         vendor_dependencies = model_ops.prepare_design_dependencies(
             design, str(ws.path), place_includes=True)
         placed.extend(vendor_dependencies["include_instances"])
@@ -5316,7 +5960,8 @@ def build_schematic(args: dict, ctx=None) -> dict:
 
     problems = []
     if audit.get("error"):
-        problems.append(f"保存后审计失败: {audit['error']}")
+        problems.append(schematic_rules.format_violation(
+            "R-23", f"保存后审计失败: {audit['error']}"))
     if missing:
         problems.append(
             "保存后重开只读看不到这些实例: "
@@ -5332,11 +5977,13 @@ def build_schematic(args: dict, ctx=None) -> dict:
     if params_bad:
         rows = [f"  - {p['instance']}.{p['param']}: 请求 {p['requested']!r}，"
                 f"磁盘 {p['on_disk']!r}" for p in params_bad]
-        problems.append("参数复核失败：\n" + "\n".join(rows))
+        problems.append(schematic_rules.format_violation(
+            "R-22", "参数复核失败：\n" + "\n".join(rows)))
     conn_fail = [c for c in conn_results if c.get("status") == "failed"]
     if conn_fail:
         rows = [f"  - {c['a']} <-> {c['b']}: {c.get('reason', '')}" for c in conn_fail]
-        problems.append("连线复核失败（引脚不在同一网络）：\n" + "\n".join(rows))
+        problems.append(schematic_rules.format_violation(
+            "R-24", "连线复核失败（引脚不在同一网络）：\n" + "\n".join(rows)))
     # 网表级电气等价（2026-09-29 用户规则）：按"每个网络包含哪些元件
     # 引脚"的划分比对磁盘网表 vs 请求连接清单 —— 引脚级，能抓到
     # "网络数量相同但成员划错"与"元件参数值漂移"。网表没拿到或核对
@@ -5344,7 +5991,9 @@ def build_schematic(args: dict, ctx=None) -> dict:
     # （generate_netlist 在上面 try 内执行 —— 句柄关闭后调用会报
     #   invalid Design）
     nl_problems, netlist_equiv = _netlist_gate(
-        _nl, netlist_instances, connections, name, backup, gen_error=_nl_err)
+        _nl, netlist_instances, connections, name, backup, gen_error=_nl_err,
+        ignore_names=[str(a.get("name")) for a in (args.get("term_anchors") or [])
+                      if a.get("name")])
     problems.extend(nl_problems)
     if geo["problems"]:
         problems.append("保存后导线几何复核失败（以下以磁盘上读到的真实几何为准）：\n- "
@@ -5503,8 +6152,305 @@ def unique_sim_dir(workspace_path: str, cell: str, now=None, tries: int = UNIQUE
     )
 
 
+# ---- 仿真子进程的取消与回收 ------------------------------------------------
+#
+# hpeesofsim 是本插件自己起的独立子进程，但 keysight.edatoolbox 的
+# ``CircuitSimulator.run_netlist`` 内部走 ``subprocess.check_call``（见
+# site-packages/keysight/edatoolbox/util.py:159） —— **它没有任何 timeout
+# 或 cancel 参数**。所以"能取消仿真"这件事不能声称是 SDK 的能力：SDK 侧
+# 根本没有这个入口，是本插件改成自己 spawn 才拿得到 pid。
+#
+# 做法：``_simulate`` 里的 WorkspaceSimulator 覆写 ``_execute``，用自己
+# 的 Popen 复刻 ``util.execute`` 的语义（路径→文件句柄、隐藏窗口、失败抛
+# 同样形态的 ExecutionError），期间把 pid 登记进 ``_SIM_PROCS``，让
+# ``cancel_sim_process`` 能针对**自己起的那个 pid** 做宽限→终止→回收。
+#
+# 边界（必须如实告知用户，不要包装）：
+#   * 只能杀自己 spawn 的 pid，绝不按进程名批量结束 ADS 相关程序；
+#   * hpeesofsim 可能已经写出部分 .ds，取消后结果是**部分结果**；
+#   * 本次取消不阻断 hpeesofsim 自身的清理，宽限期后强制 terminate。
+_CREATE_NO_WINDOW = 0x08000000
+_SIM_DEFAULT_CANCEL_GRACE_S = 3.0
+_SIM_POLL_INTERVAL_S = 0.2
+_SIM_PROCS: dict = {}          # job_key -> {"proc": Popen, "job_id": ..., "started": ...}
+_SIM_PROCS_LOCK = threading.Lock()
+
+
+class _SimStopped(RuntimeError):
+    """仿真被本插件自己终止（取消 / 超出执行预算）。
+
+    刻意不继承 ``ExecutionError``：那是"hpeesofsim 自己失败"的语义，
+    混用会让上层把"我们终止的"误报成"仿真崩了"。这个异常一路
+    传到 _simulate，由它如实标成 cancelled / timed_out。
+    """
+
+    def __init__(self, cancel_requested: bool = False, timed_out: bool = False,
+                 outcome: str = "", returncode=None):
+        self.cancel_requested = bool(cancel_requested)
+        self.timed_out = bool(timed_out)
+        self.outcome = outcome or ""
+        self.returncode = returncode
+        if self.timed_out:
+            msg = (f"仿真超出执行预算已被终止（{self.outcome or 'terminated'}，"
+                   f"rc={returncode}）")
+        else:
+            msg = f"仿真已按取消请求停止（{self.outcome or 'terminated'}，rc={returncode}）"
+        super().__init__(msg)
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否还活着（Windows 用 OpenProcess+GetExitCodeProcess）。
+
+    **绝不用 os.kill(pid, 0)**：Windows 上 os.kill 的第二个参数是退出码
+    而不是信号 —— 它会真的 TerminateProcess 掉目标进程（compute 层已经
+    踩过这个坑，会直接杀掉被测对象）。
+    """
+    if not pid:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _terminate_sim_tree(proc, grace_s: float = _SIM_DEFAULT_CANCEL_GRACE_S) -> str:
+    """先礼后兵地终止仿真进程树；返回结局（graceful/terminated/already_exited）。
+
+    ``taskkill /T /F /PID <pid>`` 只针对本插件自己 spawn 的那个 pid，
+    **不按进程名批量杀** —— 用户的 ADS 宿主与其它仿真不能受牵连。
+    """
+    if proc is None:
+        return "already_exited"
+    if proc.poll() is not None:
+        return "already_exited"
+    try:
+        proc.terminate()
+    except Exception:  # noqa: BLE001 — 已退出/句柄失效都当已结束
+        pass
+    deadline = time.monotonic() + max(0.0, float(grace_s))
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return "graceful"
+        time.sleep(_SIM_POLL_INTERVAL_S)
+    if proc.poll() is not None:
+        return "graceful"
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=_CREATE_NO_WINDOW, timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
+    return "terminated"
+
+
+def cancel_sim_process(ctx, job_key: str = "", grace_s: float = _SIM_DEFAULT_CANCEL_GRACE_S) -> dict:
+    """取消正在跑的仿真子进程（供 _simulate 的等待循环调用）。
+
+    与"请求取消"分开表达：返回 ``{"requested": True, "outcome": ...}``，
+    outcome ∈ graceful（自己退了）/ terminated（被强制终止）/ already_exited
+    （调用时已经结束，没赶上）。
+    """
+    with _SIM_PROCS_LOCK:
+        entry = _SIM_PROCS.get(job_key) if job_key else None
+        if entry is None and len(_SIM_PROCS) == 1:
+            entry = next(iter(_SIM_PROCS.values()))
+    if entry is None:
+        return {"requested": True, "outcome": "not_running", "pid": None}
+    proc = entry.get("proc")
+    pid = getattr(proc, "pid", None)
+    if ctx is not None:
+        _ctx_phase(ctx, "sim:cancel_requested")
+    outcome = _terminate_sim_tree(proc, grace_s=grace_s)
+    return {"requested": True, "outcome": outcome, "pid": pid}
+
+
+def _sim_env_grace_s() -> float:
+    """取消宽限期（config.ini [agent] sim_cancel_grace_s，默认 3s）。"""
+    try:
+        import toolserver as _ts
+        return float(_ts._setting("agent", "sim_cancel_grace_s", _SIM_DEFAULT_CANCEL_GRACE_S))
+    except Exception:  # noqa: BLE001 — 没有 toolserver（离线脚本）就用默认
+        return _SIM_DEFAULT_CANCEL_GRACE_S
+
+
+def _sim_budget_s() -> float:
+    """仿真执行预算（秒）：0 或非法表示不限。
+
+    与 HTTP 层超时是两件事：HTTP 超时只结束调用方的等待，仿真子进程照样
+    跑到底；这里的预算到了由本插件**终止**子进程并如实标 timed_out。
+    """
+    try:
+        import toolserver as _ts
+        value = float(_ts._setting("agent", "sim_timeout", 900))
+        return value if value > 0 else 0.0
+    except Exception:  # noqa: BLE001 — 离线脚本没有 toolserver：退回默认预算
+        return 900.0
+
+
+def _spawn_sim_child(cmd, output_file, error_file=None, working_directory=None,
+                     extra_env=None, job_key="", ctx=None, outcome=None, **kwargs):
+    """复刻 keysight.edatoolbox.util.execute 的语义，但自己 Popen 拿 pid。
+
+    与 SDK 版的差异只有一处：能中途取消。行为必须逐条对齐，否则
+    ``run_netlist`` 上层的 LicenseError / 输出解析分支会失效：
+      * 输出/错误输出都是**路径**时，用自己的文件句柄写（不是管道 →
+        不会因写满而死锁）；
+      * 隐藏控制台窗口（Windows）；
+      * 非零退出抛 ``ExecutionError(rc, cmd, output, stderr)``，
+        与 SDK 完全同形，上层 ``except ExecutionError`` 照旧生效。
+    """
+    # 刻意不 import keysight.edatoolbox.util：本函数只依赖 subprocess，
+    # 离线环境/打桩环境下也必须能跑（测试里 CircuitSimulator 就是假的）。
+    kwargs.setdefault("universal_newlines", True)
+    env = dict(extra_env or {})
+    creationflags = 0
+    startupinfo = None
+    if os.name == "nt":
+        creationflags = _CREATE_NO_WINDOW
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+
+    def _stream(spec, mode):
+        if isinstance(spec, str):
+            return io.open(spec, mode, encoding="utf-8", errors="replace"), True
+        return spec, False
+
+    stdout_handle, own_out = _stream(output_file, "w")
+    stderr_handle, own_err = _stream(error_file if error_file is not None else output_file, "w")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            stdin=subprocess.DEVNULL,
+            cwd=working_directory,
+            env=env or None,
+            creationflags=creationflags,
+            startupinfo=startupinfo,
+        )
+    except FileNotFoundError:
+        if own_out:
+            stdout_handle.close()
+        if own_err and stderr_handle is not stdout_handle:
+            stderr_handle.close()
+        raise RuntimeError(f"File to execute '{cmd[0]}' is not found.") from None
+
+    with _SIM_PROCS_LOCK:
+        _SIM_PROCS[job_key] = {"proc": proc, "job_id": job_key,
+                              "started": time.time(), "output_file": output_file}
+    if ctx is not None:
+        _ctx_phase(ctx, "sim:running")
+    rc = None
+    # 执行预算与取消都在**这里**的等待循环里生效 —— 不依赖 HTTP 层的
+    # socket 超时（那个只结束调用方的等待，仿真子进程照样跑到底）。
+    budget_s = _sim_budget_s()
+    grace_s = _sim_env_grace_s()
+    deadline = (time.monotonic() + budget_s) if budget_s > 0 else None
+    cancel_requested = False
+    timed_out = False
+    terminate_outcome = ""
+    try:
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                if ctx is not None:
+                    _ctx_phase(ctx, "sim:budget_expired")
+                terminate_outcome = _terminate_sim_tree(proc, grace_s=grace_s)
+                rc = proc.wait()
+                break
+            if ctx is not None and not cancel_requested and _ctx_cancelled(ctx):
+                cancel_requested = True
+                terminate_outcome = _terminate_sim_tree(proc, grace_s=grace_s)
+                rc = proc.wait()
+                break
+            time.sleep(_SIM_POLL_INTERVAL_S)
+    finally:
+        with _SIM_PROCS_LOCK:
+            _SIM_PROCS.pop(job_key, None)
+        if own_out:
+            try:
+                stdout_handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if own_err and stderr_handle is not stdout_handle:
+            try:
+                stderr_handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+    if isinstance(outcome, dict):
+        outcome.update({"cancel_requested": cancel_requested,
+                        "timed_out": timed_out,
+                        "terminate_outcome": terminate_outcome,
+                        "budget_s": budget_s,
+                        "pid": getattr(proc, "pid", None),
+                        "returncode": rc})
+    if timed_out or cancel_requested:
+        # 由管理器自己终止的：不抛 ExecutionError 让上层当成"仿真失败"，
+        # 而是抛一个能区分的信号，让 _simulate 标成 timed_out / cancelled。
+        raise _SimStopped(cancel_requested=cancel_requested, timed_out=timed_out,
+                          outcome=terminate_outcome, returncode=rc)
+    if rc != 0:
+        out_text = None
+        if isinstance(output_file, str):
+            try:
+                with io.open(output_file, "r", encoding="utf-8", errors="replace") as fp:
+                    out_text = fp.read()
+            except OSError:
+                out_text = None
+        err_text = None
+        if isinstance(error_file, str) and error_file != output_file:
+            try:
+                with io.open(error_file, "r", encoding="utf-8", errors="replace") as fp:
+                    err_text = fp.read()
+            except OSError:
+                err_text = None
+        # SDK 的 ExecutionError 是 CalledProcessError 子类，run_netlist 靠
+        # except ExecutionError 分辨 license 报错与解析错误。能 import 就用
+        # 它；离线/打桩环境没有 SDK 时退化成同形的本地类，语义不丢。
+        try:
+            from keysight.edatoolbox.errors import ExecutionError
+        except Exception:  # noqa: BLE001 — 没有 SDK 也要能把真实输出带出去
+            raise RuntimeError(
+                f"hpeesofsim 退出码 {rc}\n--- 输出 ---\n{(out_text or '').strip()}"
+            ) from None
+        raise ExecutionError(rc, cmd, out_text, err_text if err_text is not None else out_text)
+    return rc
+
+
 def _simulate(netlist: str, output_dir: str, dataset_name: str, netlist_path: str,
-              audit: dict, note=None) -> dict:
+              audit: dict, note=None, ctx=None) -> dict:
     """耗时的仿真阶段。
 
     这一阶段**不接触任何 keysight.ads.de 对象**（设计在调用前已经关闭），
@@ -5518,6 +6464,11 @@ def _simulate(netlist: str, output_dir: str, dataset_name: str, netlist_path: st
             note(msg)
         except Exception:  # noqa: BLE001 — 记进度失败不影响仿真
             pass
+
+    # ctx 只按鸭子类型使用（cancelled / set_phase），不 import toolserver：
+    # ads_ops 在离线脚本里也要能单独 import。ctx_ref 供内层类闭包引用。
+    ctx_ref = ctx
+    _ctx_phase(ctx_ref, "sim:prepare")
 
     _note(f"仿真开始（网表 {len(netlist)} 字符，输出 {output_dir}）")
     _t0 = time.perf_counter()
@@ -5543,17 +6494,68 @@ def _simulate(netlist: str, output_dir: str, dataset_name: str, netlist_path: st
     # pdk_dirs in the bundled SDK changes process-wide os.environ. Inject its
     # documented ADSlibconfig search directory only into this simulator child,
     # so simultaneous workspace simulations cannot redirect each other.
+    #
+    # _execute 从"转发 super()"改成自己 Popen：SDK 的 util.execute 用的是
+    # subprocess.check_call —— 同步阻塞、没有 timeout、没有 cancel 参数。
+    # 自己 spawn 之后才拿得到 hpeesofsim 的 pid，取消与执行预算才有可能。
+    sim_outcome: dict = {}
+    job_key = str(getattr(ctx_ref, "job_id", "") or "") if ctx_ref is not None else ""
+
     class WorkspaceSimulator(eda.CircuitSimulator):
         def _execute(self, *args, extra_env=None, **kwargs):
-            child_env = dict(extra_env or {})
+            # Overriding _execute bypasses ADSEnvironment._execute: the SDK
+            # calls this method with extra_env only. Preserve its prepared
+            # PATH/HPEESOF_DIR and Python/Qt cleanup before applying overrides.
+            base_env = getattr(self, "_env", None)
+            child_env = dict(base_env if base_env is not None else os.environ)
+            child_env.update(kwargs.pop("env", None) or {})
+            child_env.update(extra_env or {})
             if config_path:
                 child_env["ADSLIBCONFIG_PATH"] = output_dir.replace("\\", "/")
                 child_env["ADSlibconfig_PATH"] = output_dir.replace("\\", "/")
-            return super()._execute(*args, extra_env=child_env, **kwargs)
+            cmd = args[0] if args else kwargs.get("command")
+            if cmd is None:
+                # 拿不到命令行（打桩/未来 SDK 换了调用形态）：交回父类。
+                # 不能在这里自作聪明地 spawn 一个 None —— 那只会把
+                # "我们不认识的调用"变成崩溃。
+                return super()._execute(*args, extra_env=child_env, **kwargs)
+            spawn_kwargs = dict(kwargs)
+            output_file = spawn_kwargs.pop("output_file", None)
+            error_file = spawn_kwargs.pop("error_file", None)
+            working_directory = spawn_kwargs.pop(
+                "working_directory", spawn_kwargs.pop("cwd", None))
+            for k in ("stdin", "stdout", "stderr", "creationflags", "startupinfo"):
+                spawn_kwargs.pop(k, None)
+            return _spawn_sim_child(
+                cmd, output_file, error_file=error_file,
+                working_directory=working_directory, extra_env=child_env,
+                job_key=job_key, ctx=ctx_ref, outcome=sim_outcome,
+            )
 
     simulator = WorkspaceSimulator()
     try:
         simulator.run_netlist(netlist, output_dir=output_dir, dataset_name=dataset_name)
+    except _SimStopped as stopped:
+        # 自己终止的：如实标 cancelled / timed_out，不谎报成"仿真失败"
+        _note(f"仿真被终止（取消={stopped.cancel_requested} "
+              f"预算超时={stopped.timed_out}），用时 {time.perf_counter() - _t0:.1f}s")
+        return {
+            "dataset_path": "",
+            "output_dir": output_dir,
+            "netlist_path": netlist_path,
+            "status": "cancelled" if stopped.cancel_requested else "timed_out",
+            "stopped": {
+                "cancel_requested": stopped.cancel_requested,
+                "timed_out": stopped.timed_out,
+                "outcome": stopped.outcome,
+                "returncode": stopped.returncode,
+                "pid": sim_outcome.get("pid"),
+                "budget_s": sim_outcome.get("budget_s"),
+            },
+            "partial": True,
+            "note": str(stopped),
+            "elapsed_s": round(time.perf_counter() - _t0, 1),
+        }
     except Exception as e:  # noqa: BLE001
         detail = str(e)
         # ExecutionError 里才有 hpeesofsim 的真实输出，不带上就等于瞎猜
@@ -5637,10 +6639,13 @@ def _deferred_sim(ctx, netlist, output_dir, dataset_name, netlist_path, audit) -
 
     无论成功失败都必须回填 —— 否则 HTTP 线程会一直等到超时，
     用户看到的是"超时"而不是真正的报错原因。
+
+    取消/预算到期的结果也照原样回填（带 ``status`` = cancelled / timed_out
+    与 ``partial`` = True）：调用方拿到的就是真实结局，不会被美化成"完成"。
     """
     try:
         ctx.finish(_simulate(netlist, output_dir, dataset_name, netlist_path,
-                             audit, note=ctx.note))
+                             audit, note=ctx.note, ctx=ctx))
     except Exception as e:  # noqa: BLE001
         ctx.fail(str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}")
 
@@ -5738,9 +6743,11 @@ def run_simulation(args: dict, ctx=None) -> dict:
         ctx.note("已转入后台线程执行（ADS 主线程已释放）")
         return {"status": "running", "note": "仿真已转后台执行"}
 
-    # 直接调用（探测脚本 / 关闭了后台仿真）：主线程串行执行
+    # 直接调用（探测脚本 / 关闭了后台仿真）：主线程串行执行。
+    # 仍然把 ctx 传进去 —— 即使不 defer，取消与执行预算也必须生效，
+    # 否则"关掉后台仿真"就等于"再也停不下来"。
     return _simulate(netlist, output_dir, dataset_name, netlist_path, audit,
-                     note=getattr(ctx, "note", None))
+                     note=getattr(ctx, "note", None), ctx=ctx)
 
 
 def read_dataset(args: dict, ctx=None) -> dict:
@@ -5761,12 +6768,21 @@ def read_dataset(args: dict, ctx=None) -> dict:
 
     out = {"path": path, "expressions": {}}
     csv_dir = os.path.dirname(path)
+    # 同一表达式被重复列出、或同一数据块被多个表达式命中时，to_dataframe()
+    # 会把整个块重新物化成 DataFrame —— 那是这条路径上最贵的一步（read_traces
+    # 早已按块缓存，这里此前没有）。按"块名"缓存，块内复用同一份表。
+    _df_cache: dict[str, object] = {}
     for expr in expressions:
         entry = {}
         try:
             block = data[expr]
+            _block_key = str(expr)
             try:
-                df = block.to_dataframe().reset_index()
+                if _block_key in _df_cache:
+                    df = _df_cache[_block_key]
+                else:
+                    df = block.to_dataframe().reset_index()
+                    _df_cache[_block_key] = df
             except Exception:
                 df = None
 
@@ -6053,6 +7069,11 @@ def read_traces(args: dict, ctx=None) -> dict:
         all_names = []
 
     out = {"path": path, "variables": all_names, "traces": {}}
+    # 同一数据块常被多个表达式命中（S21/S11/S22 都来自同一个 SP 块）。
+    # to_dataframe() 要把整个块物化成 pandas DataFrame，是这条路径上最贵的
+    # 一步 —— 每个表达式重转一次会在多曲线场景里成倍放大主线程占用。
+    # 这里按块名缓存，块内复用同一份 DataFrame。
+    _df_cache: dict[str, object] = {}
     for expr in expressions:
         entry = {"source": path, "expr": expr}
         try:
@@ -6068,7 +7089,10 @@ def read_traces(args: dict, ctx=None) -> dict:
             continue
 
         try:
-            df = block.to_dataframe().reset_index()
+            df = _df_cache.get(block_name)
+            if df is None:
+                df = block.to_dataframe().reset_index()
+                _df_cache[block_name] = df
         except Exception as e:  # noqa: BLE001
             entry["error"] = (f"该变量无法转成表格（to_dataframe 失败）: "
                               f"{type(e).__name__}: {e}")
@@ -6186,7 +7210,7 @@ def install_env_helpers(env: dict) -> None:
         env.setdefault("db_uu", None)
 
     def ws():
-        """当前工作区对象（未打开则返回 None）。"""
+        """当前工作区对象（未打开则返回 None；恢复用 open_workspace()）。"""
         de = env.get("de")
         if de is None:
             return None
@@ -6194,12 +7218,26 @@ def install_env_helpers(env: dict) -> None:
             return None
         return de.active_workspace()
 
+    def open_workspace(path=None):
+        """恢复现场第一步：打开（或重新打开）工作区。
+
+        path 省略时用最近一次成功使用的工作区；成功后返回工作区对象并
+        print 挂载结果。这就是“ADS 重启后没有工作区”的标准出路，不要
+        全盘扫描文件系统去找 lib.defs。
+        """
+        res = _module_open_workspace({"path": path} if path else {})
+        print(f"[workspace] path: {res.get('path')}")
+        print(f"[workspace] libraries: {res.get('libraries')}")
+        if res.get("already_open"):
+            print("[workspace] 该工作区原本就处于打开状态")
+        return ws()
+
     def ls(obj=None, only_callable: bool = False, limit: int = 80):
         """不传参 -> 环境速览（工作区/库）；传对象 -> 列出成员名。"""
         if obj is None:
             w = ws()
             if w is None:
-                return {"error": "当前没有打开的工作区"}
+                return {"error": _no_workspace_hint()}
             try:
                 return {
                     "workspace": str(w.path),
@@ -6232,6 +7270,12 @@ def install_env_helpers(env: dict) -> None:
         <workspace>/ads_agent_backups/ —— 备份路径会 print 出来。
         如果要「从零重建」一个已有设计，显式传 recreate(lib, cell)。
         """
+        # 无工作区时先给统一指引再退出：直接透传 open_design 会得到
+        # "The library is not open" 这类底层英文错，模型看不出根因是没开工作区
+        # （2026-10-12 实机日志：它因此花了十几轮探索 + 全盘扫描才自救）。
+        de_mod = env.get("de")
+        if de_mod is None or not de_mod.workspace_is_open():
+            raise RuntimeError(_no_workspace_hint())
         if write:
             w = ws()
             if w is not None:
@@ -6414,13 +7458,13 @@ def install_env_helpers(env: dict) -> None:
     def libs():
         w = ws()
         if w is None:
-            return {"error": "当前没有打开的工作区"}
+            return {"error": _no_workspace_hint()}
         return {str(l.name): len(list(l.cells or [])) for l in (w.libraries or [])}
 
     def cells(lib, contains=None):
         w = ws()
         if w is None:
-            return {"error": "当前没有打开的工作区"}
+            return {"error": _no_workspace_hint()}
         for l in w.libraries or []:
             if str(l.name) == str(lib):
                 names = [str(c.name) for c in (l.cells or [])]
@@ -6439,7 +7483,8 @@ def install_env_helpers(env: dict) -> None:
     except Exception:  # noqa: BLE001
         pass
 
-    env.update({"ws": ws, "ls": ls, "sig": sig, "dm": dm, "odesign": odesign,
+    env.update({"ws": ws, "open_workspace": open_workspace, "ls": ls, "sig": sig, "dm": dm,
+                "odesign": odesign,
                 "put": put, "wire": wire, "save": save, "pins": pins,
                 "connect": connect, "libs": libs, "cells": cells,
                 "audit": audit, "mkcell": mkcell, "setp": setp,
@@ -6493,7 +7538,53 @@ def _python_env() -> dict:
     return env
 
 
+# run_python 在主线程执行超过这个秒数时，在结果里如实提示"界面被占用"。
+# 这是**告知**不是拦截：真正拦截不了（exec 已进去，跨线程注入异常会留下
+# 半写的 ADS design，见 run_python 的取消边界说明）。
+_RUN_PYTHON_SLOW_HINT_S = 5.0
+
+
+def _ctx_cancelled(ctx) -> bool:
+    """安全地询问作业是否已被请求取消（ctx 可能是 None 或旧实现）。"""
+    if ctx is None:
+        return False
+    fn = getattr(ctx, "cancelled", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn())
+    except Exception:  # noqa: BLE001 — 取消状态的查询失败不能影响工具本身
+        return False
+
+
+def _ctx_phase(ctx, phase: str) -> None:
+    """安全地上报作业阶段（/health jobs[].phase 可见）。"""
+    if ctx is None:
+        return
+    fn = getattr(ctx, "set_phase", None)
+    if not callable(fn):
+        return
+    try:
+        fn(phase)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run_python(args: dict, ctx=None) -> dict:
+    """在 ADS 主线程里执行短 Python 脚本（**无法中途安全中断**）。
+
+    取消边界（如实说明，不做假承诺）：
+      1. 还没开始执行时收到取消请求 —— 一行用户代码都不跑，直接返回
+         ``cancel_boundary="before_exec"``。
+      2. 已经进入 ``exec`` 之后**无法安全停止**：脚本可能正握着 ADS 数据库
+         的写句柄，跨线程强制注入异常会留下半写的 design/网表。所以这里
+         绝不强杀，只在安全边界上如实标注：结果里回 ``cancelled=True`` 且
+         ``cancel_boundary="after_exec"``，告诉调用方"取消请求已到，但脚本
+         是跑完之后才停的"。
+      3. 因此长计算（数值优化、拟合、大规模搜索）必须走 run_compute ——
+         那是独立子进程，可以按预算回收。本函数执行超过
+         ``_RUN_PYTHON_SLOW_HINT_S`` 秒会在结果里提示本次占用主线程多久。
+    """
     import io
     import traceback as _tb
     from contextlib import redirect_stdout
@@ -6501,9 +7592,23 @@ def run_python(args: dict, ctx=None) -> dict:
     code = args.get("code") or ""
     if not code.strip():
         raise RuntimeError("code 为空")
+
+    if _ctx_cancelled(ctx):
+        # 排队/派发窗口里已经收到取消：绝不动 ADS 数据库。
+        return {"stdout": "(未执行：本轮已请求停止，脚本未开始运行)\n",
+                "ok": False, "cancelled": True, "cancel_boundary": "before_exec",
+                "error": "本轮已请求停止，脚本未开始执行（未触碰 ADS 数据库）。"}
+
     buf = io.StringIO()
     env = _python_env()
+    # Scripts share globals, so a local result such as `cells = [...]` can
+    # shadow a helper for every later request. Helpers are reserved names;
+    # restore them while retaining the script's other variables and imports.
+    install_env_helpers(env)
     env["print"] = _make_print(buf)  # 每次指向新的缓冲
+    _ctx_phase(ctx, "run_python:exec")
+    started_at = time.monotonic()
+    failure = None
     try:
         with redirect_stdout(buf):
             exec(compile(code, "<ads_agent>", "exec"), env)  # noqa: S102 — by design
@@ -6512,11 +7617,31 @@ def run_python(args: dict, ctx=None) -> dict:
         # 只能换写法重试；现在把用户代码的调用栈一起给它。
         buf.write(f"\n[异常] {type(e).__name__}: {e}\n")
         buf.write(_trim_traceback(_tb.format_exc()))
-        return {"stdout": buf.getvalue(), "ok": False}
+        failure = True
+    elapsed_s = time.monotonic() - started_at
+    _ctx_phase(ctx, "run_python:done")
+
+    cancelled_during = _ctx_cancelled(ctx)
     out = buf.getvalue()
-    if not out.strip():
-        out = "(无输出；若需查看结果请 print 出来)"
-    return {"stdout": out, "ok": True}
+    if cancelled_during:
+        # 如实告知边界：脚本已经跑完/跑挂了才看到取消请求。
+        out += ("\n[取消边界] 收到停止请求时脚本已在 ADS 主线程执行中；"
+                f"无法中断，直到本次调用结束（{elapsed_s:.1f}s）才停止。"
+                "此前的写入已发生，请以设计实际状态为准。\n")
+    if elapsed_s >= _RUN_PYTHON_SLOW_HINT_S:
+        out += (f"[主线程占用] 本次 run_python 在 ADS 主线程执行了 {elapsed_s:.1f}s，"
+                "界面在此期间无法响应。数值优化/拟合/大规模搜索/大数据处理请改用 "
+                "run_compute（独立计算进程，可取消、可超时回收）。\n")
+    result = {"stdout": out, "ok": False if failure else True,
+              "elapsed_s": round(elapsed_s, 3)}
+    if cancelled_during:
+        result["cancelled"] = True
+        result["cancel_boundary"] = "after_exec"
+    if failure:
+        return result
+    if not result["stdout"].strip():
+        result["stdout"] = "(无输出；若需查看结果请 print 出来)"
+    return result
 
 
 def _make_print(buf):
@@ -6990,6 +8115,7 @@ def _model_dep_plan(design, netlist_text, ws, library: str) -> dict:
 
 DISPATCH = {
     "get_workspace_info": get_workspace_info,
+    "open_workspace": open_workspace,
     "list_designs": list_designs,
     "get_design_variables": get_design_variables,
     "set_design_variables": set_design_variables,
@@ -7002,6 +8128,8 @@ DISPATCH = {
     "run_python": run_python,
     "audit_rf": audit_rf,
     "design_fingerprint": design_fingerprint,
+    # 从子电路原理图的编号端子生成真实 symbol 视图（器件模型库导入用）
+    "create_component_symbol": create_component_symbol,
 }
 
 # 原厂模型包工具：实现全在 model_ops（同一套 attach / 只读浏览 / 验证逻辑），

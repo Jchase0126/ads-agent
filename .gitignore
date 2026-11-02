@@ -44,3 +44,16 @@ build/
 /task_plan.md
 /findings.md
 /progress.md
+
+# Generated datasheet curves, ADS sample workspaces, simulations and cleanup archives
+/output/
+
+# 本地开发临时文件 / 探针脚本 / 运行现场（不入库）
+.codegraph/
+.tmp_*
+tmp/
+downloads/
+probe_*.py
+*.bak_*
+/tests/de_sim.cfg
+/tests/hpeesofsim.cfg

@@ -152,10 +152,18 @@ class DependenciesTest(unittest.TestCase):
     def test_simulator_mapping_environment_is_child_only(self):
         calls = []
         class FakeSimulator:
-            def _execute(self, *args, extra_env=None, **kwargs):
-                calls.append(dict(extra_env))
+            @property
+            def _env(self):
+                # Match SDK preparation and cleanup; inheriting os.environ
+                # alone would keep Python variables and omit the ADS DLL path.
+                env = dict(os.environ)
+                env.update(PATH="sdk-dll-path", HPEESOF_DIR="sdk-root")
+                env.pop("PYTHONHOME", None)
+                return env
             def run_netlist(self, netlist, output_dir, dataset_name):
-                self._execute(extra_env={"KEEP": "yes"})
+                self._execute(["hpeesofsim", "netlist.log"],
+                              output_file="sim.log", working_directory=output_dir,
+                              extra_env={"KEEP": "yes"})
                 (Path(output_dir) / (dataset_name + ".ds")).write_bytes(b"dataset")
         keysight = types.ModuleType("keysight")
         toolbox = types.ModuleType("keysight.edatoolbox")
@@ -164,11 +172,20 @@ class DependenciesTest(unittest.TestCase):
         output.mkdir()
         before = dict(os.environ)
         audit = {"_vendor_dependencies": model_ops.simulation_dependency_plan(str(self.ws), ["Vendor"])}
-        with patch.dict(sys.modules, {"keysight": keysight, "keysight.edatoolbox": toolbox}):
+        def spawn(cmd, output_file, **kwargs):
+            self.assertEqual(cmd, ["hpeesofsim", "netlist.log"])
+            self.assertEqual(kwargs["working_directory"], str(output))
+            calls.append(dict(kwargs["extra_env"]))
+            return 0
+        with patch.dict(sys.modules, {"keysight": keysight, "keysight.edatoolbox": toolbox}), \
+                patch.object(ads_ops, "_spawn_sim_child", side_effect=spawn):
             result = ads_ops._simulate("netlist", str(output), "test", "", audit)
         self.assertEqual(before, dict(os.environ))
         self.assertEqual(calls[0]["ADSLIBCONFIG_PATH"], str(output).replace("\\", "/"))
         self.assertEqual(calls[0]["KEEP"], "yes")
+        self.assertEqual(calls[0]["PATH"], "sdk-dll-path")
+        self.assertEqual(calls[0]["HPEESOF_DIR"], "sdk-root")
+        self.assertNotIn("PYTHONHOME", calls[0])
         config = (output / "ADSlibconfig").read_text()
         expected_target = os.path.realpath(str(self.target)).replace("\\", "/")
         self.assertIn(expected_target, config)

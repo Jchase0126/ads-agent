@@ -105,7 +105,7 @@ class _FakeOps:
 
 
 def _install(dispatch) -> None:
-    toolserver._get_ads_ops = lambda: _FakeOps(dispatch)
+    toolserver._get_ads_ops = lambda **kwargs: _FakeOps(dispatch)
 
 
 def _reset() -> None:

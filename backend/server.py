@@ -43,6 +43,12 @@ Run:  python backend/server.py
 """
 
 import json
+import model_context
+import pdf_extract
+import datasheet_models
+import doc_assets
+import spice_schematic
+import spice_ads_plan
 import os
 import queue
 import sys
@@ -99,6 +105,8 @@ _IDEM_MAX = 500
 # Content-Length 校验，实际写入仍按流式分块，不一次性读进内存。
 _UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024
 _UPLOAD_CHUNK = 1024 * 1024
+_DATASHEET_MAX_BYTES = 32 * 1024 * 1024
+_SPICE_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _register_turn(turn) -> None:
@@ -113,6 +121,26 @@ def _register_turn(turn) -> None:
 def _unregister_turn(turn_id: str) -> None:
     with _TURNS_LOCK:
         _ACTIVE_TURNS.pop(turn_id, None)
+        _TURN_EVENTS.pop(turn_id, None)
+
+
+# turn_id -> SSE 事件队列（2026-10-30）：/chat/cancel 受理后立即向流里
+# 注入 {"type":"cancel_requested"}，让前端马上知道"停止已受理、执行中
+# 作业正在收尾"，而不是干等工具到达下一个取消检查点（长工具下最坏是
+# 它的 socket 超时）。轮次结束随 _unregister_turn 一并移除。
+_TURN_EVENTS: dict = {}
+
+
+def _set_turn_events(turn_id: str, events) -> None:
+    with _TURNS_LOCK:
+        _TURN_EVENTS[turn_id] = events
+
+
+def _push_turn_event(turn_id: str, ev: dict) -> None:
+    with _TURNS_LOCK:
+        q = _TURN_EVENTS.get(turn_id)
+    if q is not None:
+        q.put(ev)
 
 
 def _idem_lookup(request_id: str):
@@ -225,6 +253,9 @@ def _config_status() -> dict:
         "api_key_hint": config_mod.key_hint(CFG.get("llm_api_key", "")),
         "profile_labels": config_mod.profile_labels(CFG),
         "provider_groups": config_mod.provider_groups(CFG),
+        "model_contexts": model_context.capacities(CFG),
+        "context_budget_chars": int(120000 if CFG.get("context_budget_chars") is None
+                                    else CFG["context_budget_chars"]),
         # 面板用它在状态栏如实描述"仿真期间界面会不会卡"
         "sim_off_main_thread": CFG["sim_off_main_thread"],
         "sim_timeout": CFG["sim_timeout"],
@@ -670,6 +701,127 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def _handle_datasheet_parse(self) -> None:
+        """Extract readable text from an uploaded datasheet PDF for this chat turn."""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype not in ("application/pdf", "application/octet-stream"):
+            self._drain_body(limit=1_000_000)
+            self._send_json({"error": "数据手册上传只接受 PDF 文件"}, 415)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0 or length > _DATASHEET_MAX_BYTES:
+            self._drain_body(limit=1_000_000)
+            self._send_json({"error": f"PDF 大小必须在 1 字节至 {_DATASHEET_MAX_BYTES} 字节之间"},
+                            413 if length > _DATASHEET_MAX_BYTES else 400)
+            return
+        filename = _decode_upload_filename(self.headers)
+        if not filename.lower().endswith(".pdf"):
+            self._drain_body(limit=length)
+            self._send_json({"error": "文件名必须以 .pdf 结尾"}, 415)
+            return
+        data = self.rfile.read(length)
+        if len(data) != length:
+            self.close_connection = True
+            self._send_json({"error": "PDF 上传未完成"}, 400)
+            return
+        if not data.startswith(b"%PDF-"):
+            self._send_json({"error": "文件内容不是有效的 PDF 文件"}, 400)
+            return
+        import hashlib
+        digest = hashlib.sha256(data).hexdigest()
+        try:
+            # 原文件按内容 SHA-256 落盘（原子写 + 去重）——解析器升级、字体
+            # 修复、曲线提取都可以按 document_id 重新读取原始页面。
+            asset = doc_assets.store(data, expect_sha=digest)
+            parsed = pdf_extract.extract_document(
+                data, runtime_python=CFG.get("datasheet_runtime_python") or "",
+                pdf_path=asset["absolute_path"])
+            excerpt = pdf_extract.make_excerpt(parsed)
+            document = datasheet_models.save_document(
+                filename, digest, parsed, length,
+                session=(self.headers.get("X-Ads-Session") or "").strip())
+        except (ValueError, OSError) as exc:
+            self._send_json({"error": f"手册解析或记录保存失败：{exc}"}, 422)
+            return
+        real_pages = parsed.get("page_numbers_available", False)
+        self._send_json({
+            "ok": True, "filename": filename, "size_bytes": length,
+            "sha256": digest,
+            "document_id": document["document_id"],
+            # 旧字段名保留（面板卡片继续可读）；完整解析时值就是真实页数
+            "page_count_approx": parsed.get("page_count", 0),
+            "page_count_source": document.get("page_count_source"),
+            "page_numbers_available": real_pages,
+            "parse_engine": document.get("parse_engine"),
+            "has_original": document.get("has_original", False),
+            "unknown_glyph_lines": document.get("unknown_glyph_lines", 0),
+            "chars": parsed.get("chars", 0), "has_text_layer": parsed.get("has_text_layer", False),
+            "parameter_extraction_safe": parsed.get("parameter_extraction_safe", False),
+            "note": parsed.get("note", ""), "text": excerpt,
+            "truncated": len(parsed.get("text", "")) > pdf_extract.EXCERPT_LIMIT,
+        })
+
+    def _handle_spice_schematic_parse(self) -> None:
+        """Parse an exported SPICE netlist into a bounded, reviewable Circuit IR."""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0 or length > _SPICE_MAX_BYTES:
+            self._drain_body(limit=1_000_000)
+            self._send_json({"error": f"SPICE 网表大小必须在 1 字节至 {_SPICE_MAX_BYTES} 字节之间"},
+                            413 if length > _SPICE_MAX_BYTES else 400)
+            return
+        filename = _decode_upload_filename(self.headers)
+        if os.path.splitext(filename)[1].lower() not in {".cir", ".sp", ".net", ".spice"}:
+            self._drain_body(limit=length)
+            self._send_json({"error": "仅支持 .cir、.sp、.net、.spice 导出的 SPICE 网表"}, 415)
+            return
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            self.close_connection = True
+            self._send_json({"error": "SPICE 网表上传未完成"}, 400)
+            return
+        import hashlib
+        digest = hashlib.sha256(raw).hexdigest()
+        text = None
+        for encoding in ("utf-8-sig", "gb18030", "cp1252"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            self._send_json({"error": "网表编码无法识别；请另存为 UTF-8 文本"}, 422)
+            return
+        try:
+            parsed = spice_schematic.parse_spice_text(text, filename=filename)
+        except (ValueError, TypeError) as exc:
+            self._send_json({"error": f"SPICE 网表解析失败：{exc}"}, 422)
+            return
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("circuit_ir"), dict):
+            self._send_json({"error": "解析器未返回有效 Circuit IR"}, 422)
+            return
+        ir_text = json.dumps(parsed["circuit_ir"], ensure_ascii=False,
+                             separators=(",", ":"))
+        if len(ir_text) > 200_000:
+            self._send_json({"error": "解析结果超过聊天上下文安全上限；请仅导出目标电路或目标子电路"}, 413)
+            return
+        diagnostics = list(parsed.get("diagnostics") or [])
+        diagnostics_truncated = len(diagnostics) > 100
+        ads_plan = spice_ads_plan.compile_ads_build_plan(parsed)
+        self._send_json({"ok": True, "filename": filename, "size_bytes": length,
+                         "sha256": digest, "source_format": "SPICE",
+                         "parse_ok": bool(parsed.get("ok")),
+                         "summary": parsed.get("summary") or {},
+                         "ads_build_plan": ads_plan,
+                         "circuit": parsed["circuit_ir"],
+                         "diagnostics": diagnostics[:100],
+                         "diagnostics_truncated": diagnostics_truncated})
+
     def _handle_design(self, path: str) -> None:
         """设计闭环接口：跑仿真 / 重新评估 / 打开原理图。
 
@@ -834,6 +986,10 @@ class Handler(BaseHTTPRequestHandler):
                     # 身份：让探测方能确认"这是不是我那份安装的后端"，
                     # 而不是只看 200 就连上去（详见 backend/instance.py）
                     "identity": _identity(),
+                    # 计算作业：排队的 / 执行中的 / 已请求取消的。
+                    # 与 ADS 端 /health 的字段同义，但这里是**后端进程自己的**
+                    # 计算 worker（run_compute），不经过 ADS GUI。
+                    "compute": agent.compute_health(),
                 }
             )
         elif path == "/tools":
@@ -923,8 +1079,27 @@ class Handler(BaseHTTPRequestHandler):
                                  "message": "该轮次已结束或不存在，无需取消"})
                 return
             turn.cancel()
+            # 2026-10-30 取消链：除了置轮次取消事件，还要对**已派发**的
+            # 作业发出取消 —— ADS 端作业走 toolserver /cancel（排队作业被
+            # 跳过不执行，执行中作业打标记），后端计算作业由 compute_manager
+            # 按宽限期终止回收。回执里的状态是"已请求取消"，不是"已退出"。
+            try:
+                cancel_info = turn.propagate_cancel()
+            except Exception as e:  # noqa: BLE001 — 取消尽力而为，不回 500
+                log.warning("轮次 %s 取消传播失败: %s: %s",
+                            turn_id, type(e).__name__, e)
+                cancel_info = {"error": str(e)}
             log.info("轮次 %s 收到取消请求", turn_id)
-            self._send_json({"ok": True, "known": True})
+            # 立即向 SSE 流注入受理事件（上面的 propagate_cancel 已把取消
+            # 请求送达排队/执行中的作业）——前端不用等下一个取消检查点。
+            _push_turn_event(turn_id, {"type": "cancel_requested",
+                                       "turn_id": turn_id,
+                                       "jobs": cancel_info})
+            self._send_json({"ok": True, "known": True,
+                             "jobs": cancel_info,
+                             "message": "已请求取消：不再发起新请求；"
+                                        "执行中的作业会在各自安全边界收尾，"
+                                        "最终状态以查询为准。"})
             return
 
         if self.path == "/design/cancel":
@@ -982,6 +1157,8 @@ class Handler(BaseHTTPRequestHandler):
                     provider_models=body.get("provider_models"),
                     provider_model=body.get("provider_model"),
                     provider_enabled=body.get("provider_enabled"),
+                    context_model=body.get("context_model"),
+                    context_window_tokens=body.get("context_window_tokens"),
                 )
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": f"保存配置失败: {type(e).__name__}: {e}"}, 500)
@@ -1025,6 +1202,14 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_upload()
             return
 
+        if self.path == "/datasheets/parse":
+            self._handle_datasheet_parse()
+            return
+
+        if self.path == "/schematics/parse-spice":
+            self._handle_spice_schematic_parse()
+            return
+
         if self.path.startswith("/models/"):
             self._handle_models("POST", self.path)
             return
@@ -1058,6 +1243,7 @@ class Handler(BaseHTTPRequestHandler):
         turn = agent.Turn(CFG, messages, allow_python=allow_python, model=model,
                           turn_id=turn_id)
         _register_turn(turn)
+        _set_turn_events(turn_id, events)
         events.put({"type": "start", "turn_id": turn_id})
 
         def worker():

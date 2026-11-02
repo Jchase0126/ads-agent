@@ -34,6 +34,9 @@ with open(_CFG, "w", encoding="utf-8") as _f:
         f"token = {TOKEN}\n\n"
         "[agent]\nsim_off_main_thread = true\n"
         "tool_queue_capacity = 3\npump_max_jobs = 2\n"
+        # 本文件测的是"作业数上限"（pump_max_jobs=2）：把软时间预算放宽，
+        # 否则默认 8ms 预算会先截断，测到的是预算而不是作业数上限
+        "pump_time_budget_ms = 5000\n"
     )
 os.environ["ADS_AGENT_CONFIG"] = _CFG
 
@@ -108,7 +111,7 @@ class _FakeAdsOps:
     DISPATCH = {"echo": _echo, "slow": _slow}
 
 
-toolserver._get_ads_ops = lambda: _FakeAdsOps
+toolserver._get_ads_ops = lambda **kwargs: _FakeAdsOps
 
 
 def test_running_job_cancel_is_only_flagged():
@@ -153,12 +156,16 @@ def test_expired_job_is_skipped_as_queue_timeout():
 def test_queue_capacity_rejects_with_busy():
     _reset_toolserver()
     blocked = []
+    errors = []
 
     def _submit(n):
         try:
             toolserver.submit("echo", {"n": n}, timeout=5, client_id=f"q-{n}")
         except toolserver.BusyError as e:
             blocked.append(str(e))
+        except Exception as e:  # noqa: BLE001
+            # 后台线程异常必须显式收进本用例并断言，不能泄漏成"未捕获异常"
+            errors.append(f"{type(e).__name__}: {e}")
 
     threads = []
     for n in range(5):
@@ -166,11 +173,17 @@ def test_queue_capacity_rejects_with_busy():
         threads.append(t)
         t.start()
         time.sleep(0.15)                 # 逐个入队，避免 check-put 竞争拉平结果
+    # 容量 3：前 3 个入队成功后阻塞在 submit 的等待里，后 2 个 BusyError。
+    # 本用例不驱动 pump，因此这里自己把队列泵空，让 3 个提交正常返回；
+    # 否则它们会在 done.wait 超时后把 TimeoutError 抛进后台线程，
+    # 被 _harness 的 excepthook 记成整套的后台异常（rc 直接 FAIL）。
+    for _ in range(3):
+        toolserver.pump()
     for t in threads:
-        t.join(timeout=3)
-    # 容量 3：前 3 个入队，后 2 个 BusyError
+        t.join(timeout=5)
     eq(len(blocked), 2, f"容量 3 应拒绝 2 个请求，实际拒绝 {len(blocked)}")
     contains(blocked[0], "队列已满")
+    eq(errors, [], "已成功入队的提交应在泵空后正常返回，不得超时失败")
     _reset_toolserver()
 
 
@@ -282,10 +295,12 @@ def test_turn_cancelled_between_tools_skips_dispatch():
         AdsToolBusy = type("AdsToolBusy", (Exception,), {})
 
         @staticmethod
-        def call(cfg, name, args):
+        def call(cfg, name, args, job_id=""):
+            # 必须真实返回同步 dict：早期版本这里的 yield 让 call 变成生成器，
+            # agent 对它做 "error" in result 的成员测试时永远得不到结果，
+            # 于是"工具正常执行"根本没被模拟到（假通过）。
             executed.append(name)
             return {"ok": True}
-            yield  # pragma: no cover
 
         @staticmethod
         def is_local(name):

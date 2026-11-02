@@ -114,5 +114,73 @@ def test_changed_arguments_and_success_allow_further_calls():
     eq(turn._halt_reason, "")
 
 
+# ---------------------------------------------------------------------------
+# 预警分级（2026-10-12）：阈值随 max_tool_steps 比例缩放，两级各一次
+# ---------------------------------------------------------------------------
+
+def test_budget_warn_levels_scale_with_max_steps():
+    eq(agent.budget_warn_levels(30), (6, 3), "默认 30 步：软 6 / 强 3")
+    eq(agent.budget_warn_levels(60), (12, 6), "60 步：阈值翻倍，不再固定剩 4")
+    eq(agent.budget_warn_levels(100), (20, 10), "100 步")
+    eq(agent.budget_warn_levels(20), (4, 2), "20 步")
+    eq(agent.budget_warn_levels(8), (3, 1), "8 步：小预算也从轻启用")
+    ok(not (6 > 2 * agent.budget_warn_levels(6)[0]),
+       "预算 <= 2×软阈值时两级都不启用（第一轮就喊很奇怪）")
+    ok(not (5 > 2 * agent.budget_warn_levels(5)[0]), "5 步预算保持静默")
+
+
+def _run_tool_only_turn(max_steps):
+    """跑一轮「模型每步都发工具调用」的假对话，记录每次 LLM 请求现场。
+
+    返回 (每次请求时的提醒消息快照列表, 面板事件)。提醒一旦注入会留在
+    后续所有请求里 —— 断言看的是「首次出现」的请求序号，不是总数。
+    """
+    turn = agent.Turn({"max_tool_steps": max_steps}, [])
+    events, snapshots = [], []
+
+    def stream(cfg, messages, tools=None, **kw):
+        snapshots.append({
+            "soft": sum("开始收敛" in (m.get("content") or "")
+                        for m in messages if m.get("role") == "user"),
+            "hard": sum("立刻收敛" in (m.get("content") or "")
+                        for m in messages if m.get("role") == "user"),
+        })
+        if tools is not None:
+            return {"tool_calls": [{"id": "c", "function": {
+                "name": "get_workspace_info", "arguments": "{}"}}]}, None
+        return {"content": "总结收尾。"}, None
+
+    with patch.object(agent.llm, "chat_stream", stream), \
+         patch.object(agent.tools_mod, "call", return_value={"ok": True}), \
+         patch.object(agent.tools_mod, "is_local", return_value=False):
+        turn.run(events.append)
+    return snapshots, events
+
+
+def test_two_level_warns_fire_once_each_at_scaled_thresholds():
+    # 10 步预算：软=3（step=7 步初注入，第 7 次请求可见）、强=1（step=9 步初）
+    snapshots, events = _run_tool_only_turn(10)
+    eq(len(snapshots), 11, "10 次工具步 + 1 次收尾总结")
+    first_soft = next(i for i, s in enumerate(snapshots) if s["soft"])
+    first_hard = next(i for i, s in enumerate(snapshots) if s["hard"])
+    eq(first_soft, 6, "软提醒在 remaining=3 的步初注入，第 7 次请求即可见")
+    eq(first_hard, 8, "强提醒在 remaining=1 的步初注入，第 9 次请求即可见")
+    eq(snapshots[-1]["soft"], 1, "软提醒全程只注入一次")
+    eq(snapshots[-1]["hard"], 1, "强提醒全程只注入一次")
+    notices = [e for e in events if e["type"] == "notice" and "预算" in e.get("text", "")]
+    eq(len(notices), 2, "面板收到软/强两条提醒")
+    ok("还剩" in notices[0]["text"] and "仅剩" in notices[1]["text"],
+       f"两级文案有别: {notices}")
+    ok(events[-1]["type"] == "done", "步数用尽后正常走总结收尾")
+
+
+def test_tiny_budget_stays_silent():
+    snapshots, events = _run_tool_only_turn(5)
+    eq(snapshots[-1]["soft"], 0, "5 步预算：无软提醒")
+    eq(snapshots[-1]["hard"], 0, "5 步预算：无强提醒")
+    ok(not any("预算" in e.get("text", "") for e in events if e["type"] == "notice"),
+       "小预算不喊步数将尽")
+
+
 if __name__ == "__main__":
     sys.exit(run(globals(), "轮次预算与重复失败"))

@@ -15,6 +15,9 @@ import urllib.request
 import ads_auth
 import adslog
 import instance
+import datasheet_models
+import datasheet_curves
+import device_models
 from config import ads_base_url
 
 log = adslog.get("backend.tools")
@@ -90,6 +93,41 @@ def _verify_toolserver(cfg: dict) -> None:
 # OpenAI function-calling schemas (what the LLM sees)
 # ---------------------------------------------------------------------------
 
+# Single source for model/simulation calling behavior: system prompt + schemas.
+SIMULATION_CALL_RULES = {
+    "dependencies": (
+        "【按包验证模型依赖】挂库可见、DEFINE/ASSIGN、原生列表打开均不等于可仿真。"
+        "逐包核查原厂 Include、encode.net/models.net、#uselib/#load、ADSlibconfig、"
+        "编码 .library、AEL/Verilog-A 与数据文件；确认各路径属于当前工作区对应包且文件存在。"
+        "先读当前设计与实际生成网表，不能把历史失败记录当作当前状态。优先使用包内真实的原厂 Include，"
+        "已有有效入口不得重复添加；逐包递归核对 include 与编码名称映射，不能只验证其中一个包。"
+        "缺少 DESIGNKIT 注册本身不是失败根因的充分证据，按包要求和实际网表判断；"
+        "不要修改全局 Favorite/ADSlibconfig 或跨工作区借用映射来掩盖依赖问题。"
+    ),
+    "environment": (
+        "【仿真启动与错误分层】3221225781/0xC0000135 表示 DLL 加载失败，"
+        "先查启动环境与 DLL 搜索路径，不能直接归因于缺 include；undefined model/"
+        "编码库不可解析再查模型依赖。重写 SDK _execute 时必须继承 SDK self._env 的副本，"
+        "再合并显式 env、extra_env 与本次工作区映射，保留 SDK PATH/HPEESOF_DIR 等设置"
+        "及 Python/Qt 环境清理；extra_env 不是完整环境。仅对子进程注入映射，不污染宿主环境。"
+        "修复后经标准 run_simulation 重跑并读取本次日志，不用旧数据集宣称修复成功。"
+    ),
+    "api": (
+        "【参数按实际 API】先查元件参数定义、复合类型及方法签名，再赋值；TypeError 后"
+        "根据签名修正，不能反复猜参数。ads_simulation:NetlistInclude 的相关参数是"
+        "IncludePath、IncludeFiles、UsePreprocessor，不是 File；IncludePath 是复合类型，"
+        "需按实际 API 传字符串序列，不能当普通字符串赋值。已有原厂 Include 时优先复用"
+        "其真实入口，禁止为绕过错误偷偷换成通用 RLC/S 参数器件。"
+    ),
+    "evidence": (
+        "【结果证据】进程退出成功不等于仿真验证通过；必须确认本次 status、日志、"
+        "新生成的 .ds，并实际读取目标频段、频点数、曲线与有限数值，保存网表/日志/"
+        "数据集路径。缺模型、缺映射、无数据集、取消/超时或部分结果不能报完整成功。"
+        "仿真链路恢复与电路指标达标分别判断；ADS 仿真数据不得称为硬件实测。"
+        "依赖指纹 incomplete 需如实保留，并与仿真加载失败区分，不得改写成 complete。"
+    ),
+}
+
 TOOLS = [
     {
         "type": "function",
@@ -97,6 +135,26 @@ TOOLS = [
             "name": "get_workspace_info",
             "description": "获取当前 ADS 工作区状态：是否打开、工作区路径、已挂接的库（含可写库）。任何操作前先调用它了解环境。",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_workspace",
+            "description": (
+                "把已存在的工作区挂回当前会话（不创建、不修改磁盘）。ADS 重启后"
+                "报\"当前没有打开的工作区\"时的标准恢复手段：path 省略即打开最近"
+                "一次使用的工作区；不要全盘扫描文件系统去找 lib.defs。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "工作区目录（须含 lib.defs）；省略用最近一次使用的工作区",
+                    },
+                },
+            },
         },
     },
     {
@@ -166,23 +224,28 @@ TOOLS = [
                 "威尔金森/分配器类一分二~一分五自动对称；标注避让、GROUND 朝向、"
                 "变量/控制器排位、端口朝向全部自动。给任何实例写了坐标则按 explicit "
                 "尊重手工位置。电气拓扑不受布局影响。"
+                "\nlayout=auto 的硬边界（R-20）：只支持**空设计**或 recreate=true（先备份再清空重建）。设计里已有实例时再调 auto 会直接报错——增量追加必须给每个新实例显式写 x/y。另：auto 会剥掉 mirror、并把共享地拆成 GND_local2/3…，这些是自动结果，不要当成后续调用的输入。"
                 "\n端口首选 ads_simulation:TermG：单引脚、自带地参考（网表第二节点即全局地），"
                 "不需要接 GND。ads_simulation:Term 只用于确需独立参考端的场合，"
                 "且其 1 号脚（地）必须接 GROUND，否则仿真门禁会拦截。"
                 "手动布局时每个 instance 需要 master、name、x、y，"
                 "可选 angle/mirror/params（参数名->值）；连线 connections 每项 "
                 "{\"a\": [实例名, 引脚], \"b\": [实例名, 引脚]}；VAR 用 var 字段。"
+                "\n**手动坐标的尺度**：ADS 标准符号宽约 1 个坐标单位，相邻元件间距取 3~8；不要把物理尺寸（如 1000 mil）当坐标单位。尺度门禁 R-19 的判据是「任一连接距离 > 200 × 符号中位长边」即拒写。"
                 "\nlayout=auto 的返回体含 netlist_equivalence（磁盘网表与请求连接的"
-                "逐引脚等价核对，ok=false 即拓扑被改）、annotation_issues（保存后"
-                "按实测标注框做归属复核：文字距符号>1.2 格=悬空、文字互压，按实例"
+                "逐引脚等价核对，ok=false 即拓扑被改，R-23）、annotation_issues（保存后"
+                "按实测标注框做归属复核：文字距符号>1.2 格=悬空 R-17、文字互压 R-18，按实例"
                 "点名；空=全部贴符号）与 geometry.metrics（导线总长/绕行系数/拐弯/"
                 "重复段/平行出线，以及紧凑度：主电路与全图 bbox 面积/最长导线段/"
                 "超长连接数/接地支路总长——验收紧凑布局直接读这里，不要只看"
                 "detour_ratio≈1）。"
-                "\n所有导线（含手工 waypoints）逐段强制正交：出现斜段、穿符号、"
-                "无引脚 T 接、异网交叉/重叠时建图报错并保留备份，不会落盘斜线。"
+                "\n所有导线（含手工 waypoints）逐段强制正交，报错文案以 [R-xx 名称] 开头，"
+                "可直接对照 addon/ads_agent/schematic_rules.py 的规则表："
+                "R-01 斜段 / R-02 穿符号体 / R-03 经过异网引脚 / R-04 贴边骑行 / "
+                "R-05 异网交叉 / R-06 异网共线重叠 / R-07 异网 T 形搭接 —— 阻断；"
+                "R-08/R-09/R-10 同网交叉、重叠、T 形分支 —— 仅 warning。"
                 "\ncell 不存在会自动创建；recreate=true 表示清空重建（会先强制备份，"
-                "备份失败则拒绝执行）。返回里有 sim_readiness.problems：距「能仿真」还缺什么。"
+                "备份失败则拒绝执行，R-21）。返回里有 sim_readiness.problems：距「能仿真」还缺什么（R-25 缺控制器 / R-26 基板引用断裂 / R-27 端口自短路 / R-28 端口地脚无参考 / R-29 悬空引脚）。"
             ),
             "parameters": {
                 "type": "object",
@@ -197,7 +260,7 @@ TOOLS = [
                                "description": "auto = 按信号流自动布局（推荐；instances 全部"
                                               "不写坐标时缺省即 auto）；explicit = 用给定的 x/y"},
                     "allow_large_geometry": {"type": "boolean",
-                                             "description": "确需超长导线时设 true；默认会拦截导线远大于元件符号的布局"},
+                                             "description": "绕过 R-19 尺度门禁的应急开关：确需超长导线时才设 true。正常布局请改坐标，不要用它掩盖尺度错误"},
                     "instances": {
                         "type": "array",
                         "description": "要放置的实例清单（layout=auto 时 x/y 可省）",
@@ -206,8 +269,8 @@ TOOLS = [
                             "properties": {
                                 "master": {"type": "string", "description": "如 ads_tlines:MLIN、ads_simulation:TermG（推荐端口）、ads_tlines:MSUB"},
                                 "name": {"type": "string"},
-                                "x": {"type": "number"},
-                                "y": {"type": "number"},
+                                "x": {"type": "number", "description": "手工坐标（layout=explicit 时必填）。ADS 标准符号宽约 1 个坐标单位，相邻间距取 3~8；不要用物理尺寸当坐标（R-19）"},
+                                "y": {"type": "number", "description": "同 x"},
                                 "angle": {"type": "number", "description": "度；layout=auto 时端口角度自动规范，可省略"},
                                 "mirror": {"type": "string"},
                                 "params": {"type": "object",
@@ -364,6 +427,10 @@ TOOLS = [
                 "且保存后必须 close 写句柄并调用 save_verify 复核。"
                 "探索不熟悉的 API 时，务必用 ls/sig 一次看清（例如 "
                 "print(sig(cell, 'create_view'))），并把多个问题合并到这一次调用里一起 print。"
+                "【禁区·会被慢速检测】本工具在 ADS 主线程同步执行，**无法中途中断**："
+                "数值优化（scipy.optimize.minimize 等）、曲线拟合、大规模参数扫描/搜索、"
+                "大文件数据处理一律用 run_compute（独立计算进程，可取消、可超时回收），"
+                "否则界面会冻结到脚本跑完为止。本工具只用于 ADS 对象读写这类短操作。"
             ),
             "parameters": {
                 "type": "object",
@@ -713,6 +780,155 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_model_library",
+            "description": (
+                "统一模型库检索：同时查 器件模型（从 PDF 资料建模发布，含验证结论"
+                "与能力边界）和 原厂模型 ZIP 包 的静态型号目录。"
+                "用户说「找一下之前保存的某型号」「库里有没有支持这个频段的模型」"
+                "「查看这个器件有哪些版本」时调用。\n"
+                "返回体区分 source：pdf_modeled（用 import_device_revision 导入）/ "
+                "vendor_package（用 import_model_package 导入）。"
+                "band_start_hz/band_stop_hz 只命中**已验证频段覆盖**的模型 —— "
+                "检索不会为了凑数静默外推。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "型号/厂商/别名关键词，如 BFR106"},
+                    "part": {"type": "string", "description": "精确型号（归一化匹配）"},
+                    "vendor": {"type": "string"},
+                    "device_kind": {"type": "string",
+                                    "enum": ["jfet", "mosfet", "bjt", "passive_equivalent", "unknown"]},
+                    "model_kind": {"type": "string"},
+                    "configuration": {"type": "string",
+                                      "description": "如 common_source / common_gate"},
+                    "status": {"type": "string", "enum": ["candidate", "published"]},
+                    "verdict": {"type": "string",
+                                "description": "如 validated / validation_incomplete"},
+                    "capability": {"type": "string",
+                                   "description": "要求支持的能力名；模型明确不支持该能力时不命中"},
+                    "band_start_hz": {"type": "number"},
+                    "band_stop_hz": {"type": "number",
+                                     "description": "与 band_start_hz 一起：只返回已验证频段覆盖该区间的模型"},
+                    "max_items": {"type": "integer"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_model_revision",
+            "description": (
+                "查看器件模型库中指定修订的完整清单：端口映射（引脚角色表）、"
+                "能力边界（支持/明确不支持的分析）、偏置与频段条件、验证报告"
+                "（分项子结果）、证据引用与依赖指纹。"
+                "用户问「这个模型的引脚怎么对应」「它支持什么仿真」「验证报告是什么」时调用。"
+                "device_id + model_id 或 revision_id 二选一。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "device_id": {"type": "string"},
+                    "model_id": {"type": "string"},
+                    "revision_id": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "publish_device_model",
+            "description": (
+                "把已完成建模/验证的模型记录发布到独立器件模型库（原子发布、"
+                "内容指纹去重、不可变版本）。发布策略：verdict=validated 才能"
+                "成为 published；未达验证通过时必须显式 allow_unverified=true，"
+                "以 candidate 状态发布并明确标注 —— 不得把候选模型说成已验证。\n"
+                "发布产物：可放置元件（子电路 + 端口映射）+ 依赖 + 验证报告 + "
+                "来源证据引用，全部带指纹。同内容重复发布会自动复用既有版本。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_id": {"type": "string",
+                                 "description": "device_models 的模型记录 ID"},
+                    "vendor": {"type": "string",
+                               "description": "厂商名（建模任务未带时必填）"},
+                    "part_number": {"type": "string",
+                                    "description": "型号（默认取建模记录里的型号）"},
+                    "display_name": {"type": "string",
+                                     "description": "用户指定的显示名/别名"},
+                    "aliases": {"type": "array", "items": {"type": "string"}},
+                    "physical_package": {"type": "object",
+                                         "description": "物理封装信息（须有资料依据）"},
+                    "cell": {"type": "string",
+                             "description": "元件技术名（默认由型号派生合法名）"},
+                    "allow_unverified": {"type": "boolean",
+                                         "description": "true=以 candidate 状态发布未验证模型"},
+                },
+                "required": ["model_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "import_device_revision",
+            "description": (
+                "把器件模型库中的指定修订导入**当前工作区**：复制依赖文件、"
+                "建立可放置的元件 cell（子电路）。幂等 —— 同一修订重复导入直接"
+                "复用，不重复建 cell。返回实际 cell 名（原名被占用时会自动换名"
+                "并登记，绝不覆盖已有 cell）。\n"
+                "用 search_model_library 拿到 device_id/model_id/revision_id 后调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "device_id": {"type": "string"},
+                    "model_id": {"type": "string"},
+                    "revision_id": {"type": "string",
+                                    "description": "不传则自动选 published 优先的最新修订"},
+                    "library": {"type": "string",
+                                "description": "目标可写库；留空取工作区第一个可写库"},
+                    "cell": {"type": "string", "description": "元件 cell 名（默认按型号派生）"},
+                    "force_rebuild": {"type": "boolean"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_device_component",
+            "description": (
+                "把已导入的器件模型元件放进当前工作区的一张使用电路"
+                "（TermG 端口 + 被测元件 + S 参数控制器）。频段自动取模型"
+                "**已验证频段**；没有验证结论时退回曲线频段并在返回体标注未验证 —— "
+                "不得宣称未验证频段达标。\n"
+                "未导入时会自动先导入。放置工具**只建图不直接仿真**；"
+                "如需仿真，之后必须调用标准 run_simulation 工具（该路径会记录可信"
+                "simulation_id 与数据集指纹），不得从其它后端路径直接启动仿真。"
+                "用户说「把某型号放到原理图里」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "device_id": {"type": "string"},
+                    "model_id": {"type": "string"},
+                    "revision_id": {"type": "string"},
+                    "cell": {"type": "string", "description": "使用电路 cell 名"},
+                    "band_hz": {"type": "array", "items": {"type": "number"},
+                                "description": "显式频段 [start_hz, stop_hz]；默认用已验证频段"},
+                    "library": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "publish_design_result",
             "description": (
                 "把一次设计评估发布成对话里的「设计结果页」。后端会用真实 .ds 数据"
@@ -827,9 +1043,33 @@ TOOLS = [
     },
 ]
 
+# Keep every applicable entry point aligned with the system-level rules.
+_SIMULATION_RULE_BINDINGS = {
+    "dependencies": {
+        "build_schematic", "check_connections", "audit_rf", "run_simulation", "run_python",
+        "import_shared_model_package", "inspect_model_package", "import_model_package",
+        "list_vendor_models", "get_vendor_model_info", "validate_model_import",
+        "open_vendor_palette", "import_device_revision", "place_device_component",
+        "run_design_optimization",
+    },
+    "environment": {"run_simulation", "run_python", "validate_model_import", "run_design_optimization"},
+    "api": {"build_schematic", "run_python", "get_vendor_model_info", "place_device_component"},
+    "evidence": {
+        "run_simulation", "read_dataset", "read_traces", "validate_model_import",
+        "publish_device_model", "publish_design_result", "run_design_optimization",
+    },
+}
+for _tool in TOOLS:
+    _function = _tool["function"]
+    for _rule, _names in _SIMULATION_RULE_BINDINGS.items():
+        if _function["name"] in _names:
+            _function["description"] += "\n" + SIMULATION_CALL_RULES[_rule]
+
 # 工具名 -> 派发到 ADS 端的等待秒数（run_simulation 用 config.ini 的 sim_timeout）
 TIMEOUTS = {
     "get_workspace_info": 60,
+    # 大工作区挂载要读库清单，按 list_designs 同档给
+    "open_workspace": 120,
     "list_designs": 120,
     "get_design_variables": 120,
     "set_design_variables": 180,
@@ -871,12 +1111,67 @@ TIMEOUTS = {
     # 打开/定位原生元件列表：ADS 端要读 eesof_lib_cfg → boot.ael → palette.ael，
     # 首批加载大套件可能触发 aelcomp 重编，给足预算（>240）。
     "open_vendor_palette": 240,
+    # 从子电路原理图生成/复核 symbol 视图（读端子 → 生成 → 只读读回）
+    "create_component_symbol": 240,
 }
 
 # 这些工具**不**派发到 ADS 端，由后端自己处理（见 agent.py）。
 # 放进 TOOLS 是为了让模型能调用；放进这里是为了让 tools.call() 明确拒绝，
 # 避免误当成 ADS 工具发出去变成一句莫名其妙的"未知工具"。
-LOCAL_TOOLS = {"publish_design_result", "run_design_optimization"}
+TOOLS.extend(datasheet_models.TOOL_SCHEMAS)
+TOOLS.extend(datasheet_curves.TOOL_SCHEMAS)
+TOOLS.extend(device_models.TOOL_SCHEMAS)
+LOCAL_TOOLS = {"publish_design_result", "run_design_optimization",
+               "validate_device_model"} \
+    | set(datasheet_models.HANDLERS) | set(datasheet_curves.HANDLERS) \
+    | set(device_models.HANDLERS)
+
+# 独立计算工具（2026-10-30）：NumPy/SciPy 优化、拟合、大规模搜索/数据处理
+# 在后端的计算子进程里执行，绝不进入 ADS GUI 主线程（run_python 是主线程
+# 同步 exec，真实日志里 2976 次 minimize / 78.6 秒的脚本就是这么卡死界面的，
+# 见 docs/ADS未响应审查与优化方案_2026-10-30.md）。run_compute 由
+# agent._run_compute_tool 经 compute_manager 驱动，不派发到 ADS 端，
+# 因此归入 LOCAL_TOOLS。
+TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "run_compute",
+        "description": (
+            "在独立计算子进程中运行纯数值 Python 代码（NumPy/SciPy 优化、"
+            "最小化、拟合、大规模搜索/排序、纯文件数据处理）。代码运行在"
+            "独立进程里，不能访问 ADS 设计/工作区/GUI 对象；通过 inputs 显式"
+            "传入数据，把最终结果赋给变量 result（或调用 emit_result(obj)）。"
+            "任何预计超过几秒钟的计算必须用本工具而不是 run_python——"
+            "run_python 在 ADS 主线程同步执行，长计算会把整个界面卡死。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "纯计算 Python 代码；把结果赋给变量 result"
+                                   "（可 JSON 序列化的值），或调用 emit_result(obj)",
+                },
+                "inputs": {
+                    "type": "object",
+                    "description": "显式输入数据（JSON 值字典），代码里用"
+                                   " inputs[\"名字\"] 读取。run_python 的常驻变量"
+                                   "不会带进计算进程，需要的数据必须显式放进这里",
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "description": "执行预算秒数（默认 600，上限 7200）；到期后"
+                                   "进程被终止并标记 timed_out",
+                },
+            },
+            "required": ["code"],
+        },
+    },
+})
+LOCAL_TOOLS = LOCAL_TOOLS | {"run_compute"}
+# 后端侧等待上限（秒）：真正的硬预算在计算 worker 内部（timeout_s），
+# 这里只是 agent 侧 wait 的兜底，给足排队 + 宽限回收余量。
+TIMEOUTS["run_compute"] = 1800
 
 # 原厂模型包工具：由后端读取 Workspace 的模型清单来回答（纯读本地清单，
 # 不必把 ADS 叫起来），只有真正要动 ADS 库的导入/验证才派发到 ADS 端。
@@ -887,6 +1182,10 @@ MODEL_LOCAL_TOOLS = {
     "list_shared_model_packages",
     "search_shared_models",
     "inspect_model_package",
+    # 器件模型库：检索/详情/发布是本地清单操作；导入/放置要动 ADS 工作区
+    "search_model_library",
+    "get_model_revision",
+    "publish_device_model",
 }
 DEFAULT_SIM_TIMEOUT = 900
 # ADS 端比后端多等一会儿：让"超时"由后端统一报出，而不是 ADS 端先回 504

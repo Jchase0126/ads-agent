@@ -23,6 +23,8 @@
 import os
 
 import adslog
+import device_library
+import device_models
 import model_orchestration
 import model_store
 import model_validation
@@ -706,6 +708,229 @@ def open_vendor_palette(cfg: dict, args: dict, cancel_event=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 器件模型库（PDF 建模产物与原厂包统一检索/发布/导入/放置）
+# ---------------------------------------------------------------------------
+
+def _devices_root(cfg: dict) -> str:
+    """解析器件库根目录；配置未设时退回当前工作区推导（需要 ADS 可达）。"""
+    if str((cfg or {}).get("model_library_root") or "").strip() \
+            or os.environ.get("ADS_AGENT_LIBRARY_ROOT", "").strip():
+        return device_library.devices_root(cfg, "")
+    return device_library.devices_root(cfg, current_workspace(cfg))
+
+
+def _manifest_by_ids(root: str, args: dict) -> dict:
+    """按 device_id/model_id/revision_id 解析清单；只给 revision_id 时查索引反查。"""
+    revision_id = str(args.get("revision_id") or "").strip()
+    device_id = str(args.get("device_id") or "").strip()
+    model_id = str(args.get("model_id") or "").strip()
+    if device_id and model_id:
+        return device_library.resolve_revision(root, device_id, model_id, revision_id)
+    if not revision_id:
+        raise ModelToolError("需要 device_id + model_id（或 revision_id）定位修订")
+    index = device_library.load_index(root)
+    hits = [e for e in index.get("entries") or []
+            if e.get("revision_id") == revision_id]
+    if not hits:
+        raise ModelToolError(f"模型库索引中没有修订 {revision_id}；"
+                             "请先检索确认型号与版本")
+    entry = hits[0]
+    return device_library.load_manifest(root, entry["device_id"],
+                                        entry["model_id"], revision_id)
+
+
+def search_model_library(cfg: dict, args: dict) -> dict:
+    """统一模型检索：器件模型（PDF 建模）+ 原厂 ZIP 包静态目录一起查。
+
+    不带任何过滤条件时列出器件模型库全部条目（等价 list_device_models）。
+    返回体区分 source：pdf_modeled（本库建模发布）/ vendor_package（原厂包，
+    需要 import_model_package 导入后才可用）。
+    """
+    root = _devices_root(cfg)
+    registry = device_library.search_registry(root, args or {})
+    entries = []
+    for entry in registry.get("entries") or []:
+        entries.append({**entry, "source": "pdf_modeled",
+                        "requires_import": True,
+                        "import_tool": "import_device_revision"})
+    result = {"library_root": os.path.dirname(root),
+              "devices_root": root,
+              "total": registry.get("total", 0),
+              "returned": len(entries),
+              "models": entries,
+              "index_updated_at": registry.get("index_updated_at")}
+    # 原厂 ZIP 包静态目录并入同一份检索（关键词/型号命中时）
+    query = str((args or {}).get("query") or (args or {}).get("part") or "").strip()
+    if query or (args or {}).get("vendor"):
+        try:
+            workspace = current_workspace(cfg)
+            shared = shared_models.search_models(cfg, workspace, {
+                "query": query, "vendor": args.get("vendor"),
+                "max_items": args.get("max_items")})
+            vendor_hits = []
+            for hit in shared.get("models") or []:
+                vendor_hits.append({
+                    "source": "vendor_package",
+                    "part": hit.get("part"), "cell": hit.get("cell"),
+                    "library": hit.get("library"), "kind": hit.get("kind"),
+                    "member_path": hit.get("member_path"),
+                    "package_id": hit.get("package_id"),
+                    "vendor": hit.get("vendor"),
+                    "validated": bool(hit.get("validated")),
+                    "requires_import": True,
+                    "import_tool": "import_model_package",
+                    "note": "原厂 ZIP 包静态声明；需先导入并验证，"
+                            "静态索引不代表 ADS 仿真就绪。"})
+            result["vendor_package_models"] = vendor_hits
+            result["vendor_package_total"] = shared.get("total", 0)
+        except (ModelToolError, shared_models.SharedModelError) as exc:
+            result["vendor_package_error"] = str(exc)
+    result["note"] = ("检索含两类来源：pdf_modeled 为资料建模发布的器件模型"
+                     "（含验证结论与能力边界）；vendor_package 为原厂压缩包的"
+                     "静态声明。两者导入方式不同，见各自 import_tool 字段。")
+    return result
+
+
+def get_model_revision(cfg: dict, args: dict) -> dict:
+    """查看指定修订的完整清单：端口映射、能力边界、验证报告、证据引用。"""
+    root = _devices_root(cfg)
+    manifest = _manifest_by_ids(root, args)
+    problems = device_library.verify_revision_files(root, manifest)
+    archive_state = device_library.revision_archive_state(root, manifest)
+    view = {
+        "ok": True,
+        "identity": manifest.get("identity"),
+        "device": manifest.get("device"),
+        "model": {k: v for k, v in (manifest.get("model") or {}).items()
+                  if k != "parameters_source"},
+        "capabilities": manifest.get("capabilities"),
+        "ads_library": manifest.get("ads_library"),
+        "evidence": {k: v for k, v in (manifest.get("evidence") or {}).items()
+                     if k != "curve_ids"},
+        "validation": manifest.get("validation"),
+        "validation_reports": manifest.get("validation_reports"),
+        "status": manifest.get("status"),
+        "status_reasons": manifest.get("status_reasons"),
+        "dependencies": [{"relpath": d.get("relpath"), "sha256": d.get("sha256")}
+                         for d in manifest.get("dependencies") or []],
+        "archive": archive_state,
+        "files_integrity": {"ok": not problems, "problems": problems},
+        "published_at": manifest.get("published_at"),
+    }
+    return view
+
+
+def publish_device_model_tool(cfg: dict, args: dict) -> dict:
+    """把已完成建模/验证的模型记录发布到独立器件模型库。
+
+    发布策略（需求第七节）：verdict=validated 才能发布为 published；
+    未达验证通过的模型必须显式 allow_unverified=True，以 candidate 状态
+    发布并保留原因 —— 绝不冒充已验证版本。同内容重复发布自动去重复用。
+    """
+    model_id = str(args.get("model_id") or "").strip()
+    if not model_id:
+        raise ModelToolError("缺少 model_id")
+    record = device_models.get_model_record(model_id)
+    root = _devices_root(cfg)
+    vendor = str(args.get("vendor")
+                 or (record.get("task") or {}).get("vendor") or "").strip()
+    part_number = str(args.get("part_number") or record.get("part_number") or "").strip()
+    if not part_number:
+        raise ModelToolError("缺少型号（part_number），无法确定器件身份")
+    package = device_models.build_component_package(
+        record, cell_name=str(args.get("cell") or "").strip())
+    check = device_models.verify_component_plan(
+        package["component_plan"], record)
+    if not check.get("ok"):
+        raise ModelToolError("元件计划结构核对失败：" + "；".join(check.get("problems") or []))
+    result = device_library.publish_device_model(
+        record, vendor=vendor, part_number=part_number,
+        display_name=str(args.get("display_name") or "").strip(),
+        aliases=args.get("aliases") if isinstance(args.get("aliases"), list) else [],
+        physical_package=args.get("physical_package")
+        if isinstance(args.get("physical_package"), dict) else None,
+        component_plan=package["component_plan"],
+        deps=package["deps"],
+        validation_plan=(record.get("build") or {}).get("plan"),
+        allow_unverified=bool(args.get("allow_unverified")),
+        task_id=str((record.get("task") or {}).get("task_id") or ""),
+        library_root=root)
+    # 任务状态推进：模型记录里留发布回执（幂等：同 revision 重复发布不翻倍）
+    record["published"] = {"revision_id": result["revision_id"],
+                           "device_id": result["device_id"],
+                           "model_id": result["model_id"],
+                           "status": result["status"],
+                           "manifest_relpath": result["manifest_relpath"],
+                           "library_root": root,
+                           "published_at": model_store.utc_now()}
+    device_models._set_task(record, "published",
+                            note="revision=" + result["revision_id"])
+    device_models._save(record)
+    result["task_state"] = "published"
+    result["component_plan_check"] = check
+    result["tech_cell_name"] = package["tech_cell_name"]
+    return result
+
+
+def _ads_caller(cfg: dict):
+    def call_tool(name: str, tool_args: dict):
+        return tools_mod.call(cfg, name, tool_args)
+    return call_tool
+
+
+def import_device_revision(cfg: dict, args: dict, cancel_event=None) -> dict:
+    """把指定修订导入当前工作区：复制依赖、建立可放置元件 cell、登记。
+
+    幂等：同一修订重复导入且清单指纹一致 → 复用既有 cell，不重复建图。
+    中央库之后被移动/删除不影响已导入工程（依赖已复制进工作区）。
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        return {"cancelled": True, "message": "导入已取消。"}
+    root = _devices_root(cfg)
+    manifest = _manifest_by_ids(root, args)
+    workspace = current_workspace(cfg)
+    result = device_library.import_revision(
+        root, workspace, manifest, call_tool=_ads_caller(cfg),
+        library=str(args.get("library") or "").strip(),
+        cell=str(args.get("cell") or "").strip(),
+        force_rebuild=bool(args.get("force_rebuild")))
+    result["workspace"] = workspace
+    result["capabilities"] = manifest.get("capabilities")
+    result["model_conditions"] = (manifest.get("model") or {}).get("conditions")
+    return result
+
+
+def place_device_component(cfg: dict, args: dict, cancel_event=None) -> dict:
+    """把已导入的元件放进使用电路（TermG + S 参数控制器），可选立即仿真。
+
+    频段优先取模型已验证频段；没有验证结论时退回曲线频段并明确标注
+    未验证 —— 绝不静默外推，也不静默换成另一个模型。
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        return {"cancelled": True, "message": "放置已取消。"}
+    root = _devices_root(cfg)
+    manifest = _manifest_by_ids(root, args)
+    revision_id = (manifest.get("identity") or {}).get("revision_id")
+    workspace = current_workspace(cfg)
+    imports = device_library.load_imports(workspace)
+    import_record = imports["revisions"].get(revision_id)
+    if not import_record:
+        # 未导入时自动先导入（对话里常见"直接放"），再放置
+        import_record = device_library.import_revision(
+            root, workspace, manifest, call_tool=_ads_caller(cfg),
+            library=str(args.get("library") or "").strip(),
+            cell=str(args.get("cell") or "").strip())
+    band = args.get("band_hz") if isinstance(args.get("band_hz"), list) else None
+    result = device_library.place_component(
+        root, workspace, manifest, import_record, call_tool=_ads_caller(cfg),
+        cell=str(args.get("cell") or "").strip(), band_hz=band)
+    result["workspace"] = workspace
+    result["model_conditions"] = (manifest.get("model") or {}).get("conditions")
+    result["capabilities"] = manifest.get("capabilities")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 派发表（agent.py 按名字取）
 # ---------------------------------------------------------------------------
 
@@ -714,6 +939,9 @@ LOCAL_HANDLERS = {
     "list_shared_model_packages": list_shared_model_packages,
     "search_shared_models": search_shared_models,
     "inspect_model_package": inspect_model_package,
+    "search_model_library": search_model_library,
+    "get_model_revision": get_model_revision,
+    "publish_device_model": publish_device_model_tool,
 }
 ADS_HANDLERS = {
     "import_model_package": import_model_package,
@@ -722,6 +950,8 @@ ADS_HANDLERS = {
     "get_vendor_model_info": get_vendor_model_info,
     "validate_model_import": validate_model_import,
     "open_vendor_palette": open_vendor_palette,
+    "import_device_revision": import_device_revision,
+    "place_device_component": place_device_component,
 }
 
 

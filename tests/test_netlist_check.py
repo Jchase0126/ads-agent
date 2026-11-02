@@ -135,6 +135,29 @@ Port:P2  N__4 0 Num=2 Z=50 Ohm Noise=yes
        f"参数漂移被检出且仅 R1: {cd}")
 
 
+def test_hierarchical_terms_are_excluded_from_partition():
+    """层次 Term（子电路对外引脚）不是元件，不得把网络块比出差异。"""
+    inst = [
+        {"master": "ads_rflib:FET", "name": "DEVICE_CORE", "params": {}},
+        {"master": "ads_rflib:R", "name": "PKG_R_G", "params": {"R": "1 Ohm"}},
+    ]
+    conns = [{"a": ["PKG_R_G", "2"], "b": ["DEVICE_CORE", "1"]}]
+    nl = """
+FET:DEVICE_CORE  N__1 N__2 N__3
+R:PKG_R_G  GATE N__1 R=1 Ohm
+Term:g  1 GATE Num=1
+Term:d  2 N__2 Num=2
+Term:s  3 N__3 Num=3
+"""
+    ok_, diffs, parsed = nc.check_netlist_equivalence(
+        nl, inst, conns, ignore_names=["g", "d", "s"])
+    ok(ok_, f"层次端子不应参与引脚划分 (diffs={diffs[:3]})")
+    ok("g" not in parsed and "d" not in parsed, "端子行应被剔除")
+    # 不传 ignore_names 时端子会被当成元件 → 必有多出网络（旧行为证明差别真实）
+    ok2, diffs2, _ = nc.check_netlist_equivalence(nl, inst, conns)
+    ok(not ok2, "不忽略端子时必须报差异（说明该参数确有必要）")
+
+
 def test_compare_partitions_report():
     exp = {frozenset({("A", "1"), ("B", "1")})}
     act = {frozenset({("A", "1"), ("C", "1")})}
@@ -146,13 +169,25 @@ def test_compare_partitions_report():
 
 def main():
     for fn in (test_parse, test_partition_plan,
-               test_equivalence_and_sabotage, test_compare_partitions_report):
+               test_equivalence_and_sabotage,
+               test_hierarchical_terms_are_excluded_from_partition,
+               test_compare_partitions_report,
+               test_quoted_model_paths_and_instance_scope):
         print("==", fn.__name__)
         fn()
     n_fail = sum(1 for c, _ in _results if not c)
     print(f"结果: {'PASS' if n_fail == 0 else 'FAIL'} "
           f"({len(_results) - n_fail} 项通过 / {n_fail} 项失败)")
     return 0 if n_fail == 0 else 1
+
+
+def test_quoted_model_paths_and_instance_scope():
+    text = 'S2P:A n1 n2 0 File="D:\\RF Models\\device.s2p" Type="touchstone"\nR:B n3 n4 R=50 Ohm\n'
+    ok(nc._find_param(text, "A", "File", '"D:/RF Models/device.s2p"'), "Windows 模型路径含空格和反斜杠可核验")
+    ok(not nc._find_param(text, "A", "File", '"D:/RF Models/other.s2p"'), "错误文件不能通过")
+    ok(not nc._find_param(text, "OTHER", "File", '"D:/RF Models/device.s2p"'), "其他实例文件不能误配")
+    ok(not nc._find_param(text, "B", "R", "5"), "5 不能按前缀匹配 50")
+    ok(nc._find_param(text, "B", "R", "50"), "保留无单位数字兼容")
 
 
 if __name__ == "__main__":

@@ -168,18 +168,31 @@ def test_chinese_and_space_paths_round_trip():
 
 
 def test_backup_is_created_only_on_change():
+    """register 只在**真的要写**时备份；幂等安装不产生备份。
+
+    直接数备份文件不可靠：备份名精确到秒，同一秒内的两次备份会互相覆盖
+    （FakeAds.__enter__ 的 unregister 也会备份一次）。这里数 backup_file
+    的调用次数 —— 那正是被测行为，且与时间无关。
+    """
     with FakeAds() as ads:
         target = _target_init(r"D:\位置 A\ADSAgent")
         note: list = []
-        install_addon.register(ads.xml, target, note)
-        backups = [n for n in os.listdir(os.path.dirname(ads.xml))
-                   if install_addon.BACKUP_PREFIX in n]
-        eq(len(backups), 1, "写入前应留一份备份")
-        # 再次幂等安装不产生新备份
-        install_addon.register(ads.xml, target, note)
-        backups = [n for n in os.listdir(os.path.dirname(ads.xml))
-                   if install_addon.BACKUP_PREFIX in n]
-        eq(len(backups), 1, "没有实际改动时不应产生更多备份")
+        calls: list = []
+        real = install_addon.backup_file
+
+        def counting(path, note_arg=None):
+            calls.append(path)
+            return real(path, note_arg)
+
+        install_addon.backup_file = counting
+        try:
+            install_addon.register(ads.xml, target, note)
+            eq(len(calls), 1, "首次注册写入前应备份一次")
+            # 再次幂等安装：路径已正确 → 不写文件、不备份
+            install_addon.register(ads.xml, target, note)
+            eq(len(calls), 1, "没有实际改动时不应再备份")
+        finally:
+            install_addon.backup_file = real
 
 
 def test_write_failure_rolls_back():

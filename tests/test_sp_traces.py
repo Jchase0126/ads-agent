@@ -106,5 +106,179 @@ def test_read_traces_zero_limit_keeps_all_points():
                 sys.modules[name] = old
 
 
+def test_read_dataset_materializes_each_block_once():
+    """同一表达式重复出现时，只能物化一次 DataFrame。
+
+    2026-10-30 主线程优化：read_traces 早已按块缓存 to_dataframe()，
+    read_dataset 没有 —— 模型把同一变量列两次就会整块重新物化一遍，
+    数据块一大大就直接顶在主线程上。本用例用调用计数锁住"只转一次"。
+    """
+    calls = {"n": 0}
+
+    class Series:
+        attrs = {"unit": "GHz"}
+
+        def __init__(self, values):
+            self.values = values
+
+        def __len__(self):
+            return len(self.values)
+
+        def min(self):
+            return min(self.values)
+
+        def max(self):
+            return max(self.values)
+
+        @property
+        def iloc(self):
+            values = self.values
+
+            class _I:
+                def __getitem__(self, i):
+                    return values[i]
+            return _I()
+
+    class Frame:
+        columns = ["freq", "S[2,1]"]
+        _values = {"freq": [1.0, 2.0, 3.0], "S[2,1]": [1.0, 2.0, 3.0]}
+
+        def reset_index(self):
+            return self
+
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, key):
+            return Series([1.0, 2.0, 3.0])
+
+        def head(self, n):
+            return self
+
+        @property
+        def iloc(self):
+            frame = self
+
+            class _Row:
+                def __getitem__(self, col):
+                    return frame._values[col][frame._row]
+
+            class _ILoc:
+                def __getitem__(self, i):
+                    row = _Row()
+                    row._row = i
+                    return row
+            return _ILoc()
+
+        def to_csv(self, path, index=False):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("freq,S[2,1]\n")
+
+    class Block:
+        def to_dataframe(self):
+            calls["n"] += 1
+            return Frame()
+
+    class Dataset:
+        def keys(self):
+            return ["SP1.SP"]
+
+        def __getitem__(self, key):
+            return Block()
+
+    names = ("keysight", "keysight.ads", "keysight.ads.dataset")
+    previous = {name: sys.modules.get(name) for name in names}
+    pkg = types.ModuleType("keysight")
+    pkg.__path__ = []
+    ads = types.ModuleType("keysight.ads")
+    ads.__path__ = []
+    dataset = types.ModuleType("keysight.ads.dataset")
+    dataset.open = lambda path: Dataset()
+    pkg.ads = ads
+    ads.dataset = dataset
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="read_dataset_")
+    sys.modules.update(zip(names, (pkg, ads, dataset)))
+    try:
+        out = ads_ops.read_dataset({
+            "path": os.path.join(tmp, "dummy.ds"),
+            "expressions": ["S(2,1)", "S(2,1)"],
+            "max_rows": 1,
+        })
+        eq(calls["n"], 1,
+           "同一块被重复物化：read_dataset 未命中按块缓存（主线程会被成倍占用）")
+        eq(sorted(out["expressions"]), ["S(2,1)"])
+        eq(out["expressions"]["S(2,1)"]["n_rows"], 3)
+        eq(out["expressions"]["S(2,1)"]["stats"]["freq"]["min"], 1.0)
+    finally:
+        for name, old in previous.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_read_traces_materializes_each_block_once():
+    """read_traces 的按块缓存同样要锁住（2026-10-30 已修，防回退）。"""
+    calls = {"n": 0}
+
+    class Series:
+        attrs = {"unit": "GHz"}
+        dtype = None
+
+        def __init__(self, values):
+            self.values = values
+
+        def tolist(self):
+            return self.values
+
+    class Frame:
+        columns = ["freq", "S[2,1]", "S[1,1]"]
+
+        def reset_index(self):
+            return self
+
+        def __getitem__(self, key):
+            return Series([1.0, 2.0])
+
+    class Block:
+        def to_dataframe(self):
+            calls["n"] += 1
+            return Frame()
+
+    class Dataset:
+        def keys(self):
+            return ["SP1.SP"]
+
+        def __getitem__(self, key):
+            return Block()
+
+    names = ("keysight", "keysight.ads", "keysight.ads.dataset")
+    previous = {name: sys.modules.get(name) for name in names}
+    pkg = types.ModuleType("keysight")
+    pkg.__path__ = []
+    ads = types.ModuleType("keysight.ads")
+    ads.__path__ = []
+    dataset = types.ModuleType("keysight.ads.dataset")
+    dataset.open = lambda path: Dataset()
+    pkg.ads = ads
+    ads.dataset = dataset
+    sys.modules.update(zip(names, (pkg, ads, dataset)))
+    try:
+        out = ads_ops.read_traces({"path": "dummy.ds",
+                                   "expressions": ["S(2,1)", "S(1,1)"],
+                                   "max_points": 0})
+        eq(calls["n"], 1, "同一数据块的 S 参数应共用一次 to_dataframe()")
+        eq(sorted(out["traces"]), ["S(1,1)", "S(2,1)"])
+    finally:
+        for name, old in previous.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))

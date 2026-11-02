@@ -322,9 +322,13 @@ def expected_qt_binding(year) -> str | None:
 # 工具分类与门禁
 # ---------------------------------------------------------------------------
 
-#: 读工具：只读 ADS 数据库/数据集，不修改设计。
+#: 读工具：只读 ADS 数据库/数据集，不修改设计。open_workspace 只把一个
+#: 已存在的工作区挂回会话（等价于用户在 ADS 里手动打开），不落盘写入，
+#: 且正是环境受损（ADS 重启后工作区未开）时最需要可用的恢复入口 ——
+#: 所以归入读类，未知/实验版本也放行。
 READ_TOOLS = frozenset({
-    "get_workspace_info", "list_designs", "get_design_variables",
+    "get_workspace_info", "open_workspace", "list_designs",
+    "get_design_variables",
     "check_connections", "audit_rf", "read_dataset", "read_traces",
     "open_schematic", "design_fingerprint",
 })

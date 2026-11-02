@@ -699,5 +699,255 @@ def test_supplier_switch_hides_models_and_preserves_editor_credentials():
     widget.close()
 
 
+def test_context_usage_tracks_project_model_and_clear():
+    widget = make()
+    widget.projects_data = {'active': 'Alpha', 'projects': {
+        'Alpha': {'entries': [], 'history': []}, 'Beta': {'entries': [], 'history': []}}}
+    widget._active_model = 'model-a'
+    widget._apply_project('Alpha')
+    event = dict(type='context_usage', model='model-a', used=18720, max=120000,
+                 unit='chars', prompt_tokens=14000, completion_tokens=123)
+    widget._on_event(event, 'Alpha')
+    ok('15.6%' in widget.context_usage.toolTip())
+    ok('18,720 / 120,000' in widget.context_usage.toolTip())
+    ok('14,000 tokens' in widget.context_usage.accessibleDescription())
+    widget._on_event(dict(event, used=60000), 'Beta')
+    eq(widget.context_usage._usage['used'], 18720)
+    widget._active_model = 'model-b'
+    widget._sync_context_usage()
+    eq(widget.context_usage._usage['used'], 0)
+    ok(widget.context_usage._usage['estimated'])
+    widget._active_model = 'model-a'
+    widget._apply_project('Beta')
+    eq(widget.context_usage._usage['used'], 60000)
+    widget._on_clear()
+    eq(widget.context_usage._usage['used'], 0)
+    ok('本地估算' in widget.context_usage.toolTip())
+    widget._apply_project('Alpha')
+    eq(widget.context_usage._usage['used'], 18720)
+    widget._on_event(dict(event, max=None), 'Alpha')
+    eq(widget.context_usage._usage, None)
+    eq(widget.context_usage.toolTip(), '上下文字符预算未启用')
+    widget._on_event(dict(event, max=0), 'Alpha')
+    eq(widget.context_usage._usage, None)
+    widget._on_event(dict(event, used=True), 'Alpha')
+    eq(widget.context_usage._usage, None)
+    widget.close()
+
+
+def test_context_ring_and_attachment_fit_composer_at_supported_widths():
+    try:
+        for scale in (1, 1.35, 1.75):
+            panel.U._cache['scale'] = scale
+            widget = make(panel.U.px(330), panel.U.px(600))
+            for width in (330, 760, 1000):
+                widget.resize(panel.U.px(width), panel.U.px(600))
+                widget.reflow()
+                APP.processEvents()
+                controls = (widget.model_shortcut, widget.context_usage, widget.attach_btn,
+                            widget.clear_btn, widget.send)
+                for control in controls:
+                    ok(control.isVisible())
+                    ok(widget.input_frame.rect().contains(control.geometry()),
+                       f'{control.accessibleName()} overflows composer at {width}, scale {scale}')
+                for left, right in zip(controls, controls[1:]):
+                    ok(left.geometry().right() < right.geometry().left(),
+                       f'composer controls overlap at {width}, scale {scale}')
+                eq(widget.context_usage.size(), widget.clear_btn.size())
+                eq(widget.attach_btn.size(), widget.clear_btn.size())
+                eq(widget.attach_btn.iconSize(), widget.clear_btn.iconSize())
+                eq(widget.context_usage.geometry().center().y(), widget.clear_btn.geometry().center().y())
+            eq(widget.attach_btn.property('icon_name'), 'attach')
+            eq(widget.context_usage.accessibleName(), '上下文用量')
+            widget.close()
+    finally:
+        panel.U.refresh()
+
+
+def test_context_tooltip_updates_draft_stream_and_actual_event():
+    widget = make()
+    widget._context_budget_chars = 120000
+    project = widget.projects_data['active']
+    widget.history.clear()
+    widget._sync_context_usage()
+    eq(widget.context_usage._usage['used'], 0)
+    ok('0 / 120,000 字符' in widget.context_usage.toolTip())
+    widget.input.setPlainText('abcd')
+    eq(widget.context_usage._usage['used'], 28)
+    ok('28 / 120,000 字符' in widget.context_usage.toolTip())
+    widget.input.clear()
+    widget.history.append({'role': 'user', 'content': 'hello'})
+    widget._sync_context_usage()
+    before = widget.context_usage._usage['used']
+    widget._on_event(dict(type='content_delta', text='streamed reply', first=True), project)
+    eq(widget.context_usage._usage['used'], before + len('streamed reply'))
+    widget._on_event(dict(type='assistant', text='streamed reply'), project)
+    eq(widget.context_usage._usage['used'], before + len('streamed reply') + 24)
+    widget._on_event(dict(type='context_usage', model=widget._active_model,
+                         used=4000, max=120000, unit='chars'), project)
+    eq(widget.context_usage._usage['used'], 4000)
+    ok('本地估算' not in widget.context_usage.toolTip())
+    widget.input.setPlainText('next')
+    eq(widget.context_usage._usage['used'], 4028)
+    ok('本地估算' in widget.context_usage.toolTip())
+    widget.input.clear()
+    eq(widget.context_usage._usage['used'], 4000)
+    widget._on_clear()
+    eq(widget.context_usage._usage['used'], 0)
+    widget._context_budget_chars = 0
+    widget._sync_context_usage()
+    eq(widget.context_usage._usage, None)
+    eq(widget.context_usage.toolTip(), '上下文字符预算未启用')
+    widget._context_budget_chars = 120000
+    widget._on_event(dict(type='context_usage', model=widget._active_model,
+                         max=None, unit='chars'), 'deleted-project')
+    eq(widget._context_budget_chars, 120000)
+    widget.close()
+
+
+def test_dock_uses_native_main_window_with_editor_open():
+    from types import ModuleType, SimpleNamespace
+    from unittest.mock import patch
+    import toolserver
+
+    main = QMainWindow()
+    editor = QMainWindow()
+    main.setWindowTitle("ADS Main")
+    editor.setWindowTitle("FM_SC schematic")
+    module = ModuleType("keysight.ads.de.app.window")
+    module.main_window = lambda: SimpleNamespace(qwidget=main)
+    module.main_pyside_widget = lambda: editor
+    parents = {name: ModuleType(name) for name in
+               ("keysight", "keysight.ads", "keysight.ads.de", "keysight.ads.de.app")}
+    parents["keysight.ads.de.app"].window = module
+    parents[module.__name__] = module
+    old = panel._panel, panel._handle, panel._handle_tab
+    panel._panel = panel._handle = panel._handle_tab = None
+    try:
+        with patch.dict(sys.modules, parents), patch.object(toolserver, "ensure_started", lambda: None):
+            dock = panel.open_panel()
+            eq(dock.parentWidget(), main)
+            ok(dock.parentWidget() is not editor)
+    finally:
+        main.close()
+        editor.close()
+        main.deleteLater()
+        editor.deleteLater()
+        APP.processEvents()
+        panel._panel, panel._handle, panel._handle_tab = old
+
+
+def test_model_token_usage_is_isolated_and_unknown_capacity_has_no_percentage():
+    widget = make()
+    project = widget.projects_data["active"]
+    widget._active_model = "a"
+    widget._model_contexts = {
+        "a": dict(model="a", max=8192, source="configured", unit="tokens", connection="a"),
+        "b": dict(model="b", max=32768, source="configured", unit="tokens", connection="b"),
+        "unknown": dict(model="unknown", max=None, source="unknown", unit="tokens")}
+    event = dict(type="context_usage", model="a", model_context=dict(widget._model_contexts["a"],
+        used=4096, estimated=False, prompt_tokens=4000, completion_tokens=96))
+    widget._on_event(event, project)
+    eq(widget.context_usage._usage["used"], 4096)
+    ok("50.0%" in widget.context_usage.toolTip())
+    widget._active_model = "b"
+    widget._sync_context_usage()
+    eq(widget.context_usage._usage["max"], 32768)
+    eq(widget.context_usage._usage["used"], 0)
+    widget._active_model = "a"
+    widget.input.setPlainText("新草稿")
+    ok(widget.context_usage._usage["used"] > 4096)
+    ok(widget.context_usage._usage["estimated"])
+    widget.input.clear()
+    eq(widget.context_usage._usage["used"], 4096)
+    widget._active_model = "b"
+    widget._append_history(project, dict(role="assistant", content="来自模型 b 的新回复"))
+    widget._active_model = "a"
+    widget._sync_context_usage()
+    ok(widget.context_usage._usage["estimated"], "history changed under another model")
+    ok(widget.context_usage._usage["used"] != 4096, "do not reuse the old measured request")
+    widget._active_model = "unknown"
+    widget._context_budget_chars = 0
+    widget._sync_context_usage()
+    ok("容量未知" in widget.context_usage.toolTip())
+    ok("%" not in widget.context_usage.toolTip())
+    eq(widget._context_budget_chars, 0)
+    widget._active_model = "a"
+    widget._ingest_provider_groups(dict(model_contexts={
+        "a": dict(widget._model_contexts["a"], max=16384)}))
+    widget._sync_context_usage()
+    eq(widget.context_usage._usage["max"], 16384)
+    widget._on_event(event, project)  # stale event for previous limit
+    eq(widget.context_usage._usage["max"], 16384)
+    widget._on_event(event, "deleted-project")
+    ok(("deleted-project", "a") not in widget._context_usage)
+    widget.close()
+
+
+def test_chat_clipboard_shortcuts_override_host_and_keep_history_readonly():
+    from PySide6.QtGui import QKeySequence, QShortcut
+    for floating in (False, True):
+        host = QMainWindow()
+        dock = QDockWidget(host)
+        widget = make()
+        dock.setWidget(widget)
+        host.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        intercepted = []
+        shortcuts = []
+        for key in ("Ctrl+C", "Ctrl+V"):
+            shortcut = QShortcut(QKeySequence(key), dock if floating else host)
+            shortcut.activated.connect(lambda key=key: intercepted.append(key))
+            shortcuts.append(shortcut)
+        host.show()
+        dock.setFloating(floating)
+        (dock if floating else host).activateWindow()
+        widget._add_entry("assistant", "复制这段聊天内容")
+        APP.processEvents()
+        row = widget.chat.itemWidget(widget.chat.item(widget.chat.count() - 1))
+        label = row.label
+        label.setFocus()
+        label.setSelection(0, 4)
+        APP.processEvents()
+        QApplication.clipboard().setText("old")
+        try:
+            QTest.keyClick(label, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+            eq(QApplication.clipboard().text(), "复制这段")
+            QApplication.clipboard().setText("粘贴到输入框")
+            before = label.text()
+            QTest.keyClick(label, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+            eq(widget.input.toPlainText(), "粘贴到输入框")
+            eq(label.text(), before)
+            ok(widget.input.hasFocus())
+            widget.input.selectAll()
+            QTest.keyClick(widget.input, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+            eq(QApplication.clipboard().text(), "粘贴到输入框")
+            QApplication.clipboard().setText("再次粘贴")
+            QTest.keyClick(widget.input, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+            eq(widget.input.toPlainText(), "再次粘贴")
+            label.setFocus()
+            label.setSelection(0, 4)
+            widget._update_clipboard_buttons()
+            ok(widget.copy_btn.isEnabled())
+            ok(not widget.cut_btn.isEnabled())
+            widget.copy_btn.click()
+            eq(QApplication.clipboard().text(), "复制这段")
+            from PySide6.QtCore import QMimeData, QUrl
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(os.path.abspath("clipboard-model.zip"))])
+            files = []
+            widget.input._on_files = lambda paths: files.extend(paths)
+            QApplication.clipboard().setMimeData(mime)
+            label.setFocus()
+            QTest.keyClick(label, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+            eq(len(files), 1)
+            ok(files[0].endswith("clipboard-model.zip"))
+            eq(widget.input.toPlainText(), "再次粘贴")
+            eq(intercepted, [])
+        finally:
+            QApplication.clipboard().clear()
+            host.close()
+            APP.processEvents()
+
+
 if __name__ == "__main__":
     raise SystemExit(run(globals()))

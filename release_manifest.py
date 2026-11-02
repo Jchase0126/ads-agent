@@ -39,6 +39,8 @@ BACKEND_FILES = [
     "adslog.py",         # 结构化文件日志
     "agent.py",          # LLM 对话循环 + 工具编排
     "config.py",         # config.ini 读取
+    "compute_manager.py", # 独立计算作业管理（排队/取消/预算/进程树回收）
+    "compute_worker.py",  # 独立计算子进程运行时（run_compute 的执行体）
     "design_job.py",     # 设计任务状态机与持久化
     "design_metrics.py", # 确定性指标评估
     "design_service.py", # 仿真→读数→评估编排
@@ -49,9 +51,21 @@ BACKEND_FILES = [
     "model_tools.py",    # 模型库 LLM 工具编排
     "model_validation.py", # ADS 模型导入验证
     "llm.py",            # LLM 客户端
+    "model_context.py",  # 模型上下文容量与估算
+    "pdf_extract.py",    # 元器件数据手册 PDF 抽取（完整引擎 + 受限降级）
+    "pdf_worker.py",     # PDF 解析子进程运行时（后端缺 pymupdf 时按配置调用）
+    "doc_assets.py",     # PDF 原文件资产（SHA-256 内容寻址、原子写、去重）
+    "datasheet_models.py", # 手册参数证据、页级复核与 RLC 模板
+    "datasheet_curves.py", # 曲线数字化记录（轴校准/采样/条件）
+    "sample_adapters.py",  # SHA 锁定的已复核样本曲线映射（回归数据）
+    "device_models.py",  # 有源器件建模引擎（选择/拟合/建图计划/验证）
+    "device_library.py", # 器件模型身份/版本/发布/检索/跨工作区导入
     "paths.py",          # **统一路径解析**（数据/程序双根）
+    "rfcalc.py",         # RF 计算引擎（传输线/噪声/杂散/偏置，纯函数 stdlib）
     "server.py",         # HTTP/SSE 服务
     "shared_models.py",  # 跨工作区共享模型库
+    "spice_schematic.py", # 保守解析 SPICE 原理图导出子集为 Circuit IR
+    "spice_ads_plan.py", # Circuit IR 到 ADS 元件/连接的只读映射计划
     "tools.py",          # 工具派发 + ADS 端 RPC
 ]
 
@@ -74,6 +88,7 @@ ADDON_FILES = [
     "project_store.py",  # 会话原子保存
     "result_page.py",    # 设计结果页
     "rf_audit.py",       # 射频/Layout 审查
+    "rfcalc_panel.py",   # RF 计算器窗口（AppCAD 风格，引擎经 pathbridge 共享）
     "toolserver.py",     # ADS 进程内工具服务
     "uiscale.py",        # 自适应缩放与设计令牌
 ]
@@ -97,8 +112,14 @@ OPTIONAL_ROOT_FILES = [
 DOCS_FILES = [
     "Layout 审查设计.md",
     "原理图建图与仿真经验总结.md",
+    "原理图网表导入与射频设计规则.md",
     "兼容性矩阵.md",
     "版本证据报告.md",
+    # ADS 长计算卡死修复：审查证据 + 实施报告。放在包里是因为用户遇到
+    # "界面卡住"时第一件想做的事是查"这算不算已知问题、边界在哪"，
+    # 而这两份文档正是那个边界（含"哪些指标尚未实机验证"）。
+    "ADS未响应审查与优化方案_2026-10-30.md",
+    "ADS未响应修复实施报告_2026-10-30.md",
 ]
 
 #: 放到包**根目录**的文档（源在 docs/ 下，平铺到根方便用户一眼看到）

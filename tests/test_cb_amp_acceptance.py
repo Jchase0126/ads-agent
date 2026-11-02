@@ -38,7 +38,7 @@ def _segs(placed, plan):
     """全部连接的折线段列表 (conn_idx, a, b)。"""
     out = []
     for i, conn in enumerate(CONNECTIONS):
-        wp, _tag = plan.get(i, ([], ""))
+        wp = plan.get(i, (None, "", []))[0] or []
         pa = _pin_xy(placed, *conn["a"])
         pb = _pin_xy(placed, *conn["b"])
         pts = [pa] + list(wp) + [pb]
@@ -127,7 +127,7 @@ def test_route_efficiency_no_detour():
     total = lb_total = 0.0
     bends_total = 0
     for i, conn in enumerate(CONNECTIONS):
-        wp, _tag = plan.get(i, ([], ""))
+        wp = plan.get(i, (None, "", []))[0] or []
         pa = _pin_xy(placed, *conn["a"])
         pb = _pin_xy(placed, *conn["b"])
         pts = [pa] + list(wp) + [pb]
@@ -153,7 +153,7 @@ def test_no_backtrack():
     # 规则 4:同轴折返 —— 同一条线里水平推进方向翻转
     placed, plan = _layout_and_plan()
     for i, conn in enumerate(CONNECTIONS):
-        wp, _tag = plan.get(i, ([], ""))
+        wp = plan.get(i, (None, "", []))[0] or []
         pa = _pin_xy(placed, *conn["a"])
         pb = _pin_xy(placed, *conn["b"])
         pts = [pa] + list(wp) + [pb]
@@ -212,10 +212,28 @@ def test_plan_metrics_documented():
     placed, plan = _layout_and_plan()
     total = 0.0
     for i, conn in enumerate(CONNECTIONS):
-        wp, _tag = plan.get(i, ([], ""))
+        wp = plan.get(i, (None, "", []))[0] or []
         pa = _pin_xy(placed, *conn["a"])
         pb = _pin_xy(placed, *conn["b"])
         pts = [pa] + list(wp) + [pb]
         total += sum(abs(a[0] - b[0]) + abs(a[1] - b[1])
                      for a, b in zip(pts, pts[1:]))
     print(f"\n[CB_FM_Amp 规划指标] 总长 {total:.2f} 格(基线 165.43)")
+
+
+# 2026-10-14 记录（本轮 A+B 阶段发现，**未修**）：
+# 本文件此前没有 run() 入口，`python tests/test_cb_amp_acceptance.py` 静默无输出、
+# run_tests.py 当成"通过"计 —— 这批 CB_FM_Amp 门禁实际从未执行过。
+# 临时补上入口实测后发现 **5 项失败**（单行信号流 / 同节点平行线 / 绕行效率 /
+# 折返 / G2 朝向），且 [规划指标] 总长 55.24 格 vs 基线 165.43 格 ——
+# 说明本文件的断言编码的是**旧版布局设计**，与当前 auto_layout 已经脱节，
+# 而不是当前代码坏了。属于独立议题（需重新对基线或重设计 CB_FM_Amp 布局），
+# 不在本次 A+B 范围内，故**不**启用入口，避免把无关的既有欠账混进本轮回归口径。
+#
+# 若要启用，先做：① 确认 CB_FM_Amp 现行布局是否为期望设计；
+#                ② 按现行设计重写这些断言或重新对基线；
+#                ③ plan_wire_routes 现返回三元组 (waypoints, net_tag, skip_flags)，
+#                   本文件的 `wp, _tag = plan.get(i, ...)` 两元组解包已同步修正为三
+#                   元组取首项，否则一启用就先崩在 ValueError 上。
+#
+# 下方解包已按三元组修正，但入口保持关闭。

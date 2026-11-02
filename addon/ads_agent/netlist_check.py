@@ -48,9 +48,21 @@ def parse_netlist(text):
     _CTRL = {"s_param", "sweepplan", "outputplan", "component",
              "equation", "meas_eqn", "optim", "goal", "nodeset",
              "parameter_sweep", "stim"}
+    in_definition = 0
     for raw in (text or "").splitlines():
         line = raw.rstrip("\\").strip()
         if not line or line.startswith(";") or line.startswith("#"):
+            continue
+        # 层次子电路定义块：define NAME ( pins ) ... end NAME。
+        # 实测（2026-10-11 之后的实机）里，块内是**被实例化元件的内部网表**；
+        # 把它当顶层元件解析会让"多出网络"全部来自子电路内部（
+        # PKG_R_S/PKG_L_S 等），顶层划分永远对不上。
+        if re.match(r"^define\s+\S+", line, re.I):
+            in_definition += 1
+            continue
+        if in_definition:
+            if re.match(r"^end\s+\S+", line, re.I):
+                in_definition -= 1
             continue
         if line.startswith("Options") or ":" not in line.split()[0]:
             continue
@@ -212,13 +224,21 @@ def compare_partitions(exp, act, pin_universe=None):
     return diffs
 
 
-def check_netlist_equivalence(netlist_text, instances, connections):
+def check_netlist_equivalence(netlist_text, instances, connections,
+                              ignore_names=()):
     """一站式校验：网表文本 vs 连接清单 的引脚级电气等价。
 
     返回 (ok, diffs, parsed)。接地实例的引脚自动并入 GND 块；
     无引脚实例（S_Param/Include/VAR/MSUB 控制器与注释件）两侧都跳过；
     端口（Port:）网表行的第 2 节点是隐含地参考，并入 GND。
+
+    ``ignore_names``：层次端子（Term）的名字。它们挂在已有网络上，是
+    **对外引脚声明**而不是电路元件；算进引脚划分会让同一网络块多出
+    Term.x 成员，和期望划分不等。端子与引脚的对应由 symbol 只读复核
+    单独核对。
     """
+    ignored = {str(n) for n in (ignore_names or ())}
+
     def _npins(s):
         short = str(s.get("master", "")).replace("/", ":").split(":")[-1].upper()
         return len(_pin_order_of(short, s))
@@ -229,10 +249,10 @@ def check_netlist_equivalence(netlist_text, instances, connections):
     no_pin_names = {str(s.get("name")) for s in instances or []
                     if _npins(s) == 0}
     parsed_all = parse_netlist(netlist_text)
-    # 网表侧修剪：无引脚实例的行剔除；端口的第 2 节点=隐含地
+    # 网表侧修剪：无引脚实例与层次端子的行剔除；端口的第 2 节点=隐含地
     parsed = {}
     for name, nodes in parsed_all.items():
-        if name in no_pin_names:
+        if name in no_pin_names or name in ignored:
             continue
         is_port = False
         for raw in (netlist_text or "").splitlines():
@@ -288,20 +308,28 @@ def _find_param(netlist_text, inst, key, value):
 
     值可能含空格单位（"50 Ohm"、"5 V"）—— 截断到下一个 Key= 或行尾，
     与请求值整体（空白不敏感）比较；另兼容请求值不含单位、网表值
-    带单位的情形（"50" 匹配 "50 Ohm" 前缀）。参数匹配不限定在同名
-    元件行内 —— ADS 网表的参数唯一性由 Key+值共同保证，误配概率
-    可忽略（R16 再收严到同名元件行）。
+    带单位的情形（"50" 匹配 "50 Ohm"）。只检查指定实例，保留引号内的
+    Windows 文件路径和空格，不把路径反斜杠当成折行。
     """
-    pat = re.compile(r"[\s:]%s\s*=\s*([^\\\n]+)" % re.escape(key))
-    for m in pat.finditer(netlist_text or ""):
-        seg = m.group(1)
-        # 截断到下一个 Key=（后续是别的参数）
-        stop = re.search(r"\s\S+\s*=", seg)
-        val = seg[:stop.start()] if stop else seg
-        if _canon(val) == _canon(value):
+    joined = re.sub(r"\\\r?\n\s*", " ", netlist_text or "")
+    line_pat = re.compile(r"^\s*[^\s:]+:" + re.escape(inst) + r"\s+(.+)$", re.M)
+    pat = re.compile(r"(?:^|\s)" + re.escape(key) +
+                     r'\s*=\s*("(?:\\.|[^"\\])*"|.*?)(?=\s+\w+(?:\[\d+\])?\s*=|$)')
+    for line in line_pat.finditer(joined):
+        match = pat.search(line.group(1))
+        if match is None:
+            continue
+        val = match.group(1).strip()
+        actual, expected = _canon(val), _canon(value)
+        if str(key).lower() == "file":
+            actual, expected = actual.replace("\\", "/"), expected.replace("\\", "/")
+        if actual == expected:
             return True
         # 单位容错:请求 "50" vs 网表 "50 Ohm"
-        if _canon(value) and _canon(val).startswith(_canon(value)):
+        number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+        with_unit = re.fullmatch(r"(" + number + r")\s+([A-Za-zΩµμ]+)", val)
+        if re.fullmatch(number, str(value).strip()) and with_unit \
+                and float(value) == float(with_unit.group(1)):
             return True
     return False
 

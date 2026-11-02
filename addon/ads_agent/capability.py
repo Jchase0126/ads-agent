@@ -55,6 +55,7 @@ def _probe_de() -> dict:
     for attr, key in (
         ("workspace_is_open", "de_workspace_is_open"),
         ("active_workspace", "de_active_workspace"),
+        ("open_workspace", "de_open_workspace"),
     ):
         out[key] = ((SUPPORTED, "") if callable(getattr(de, attr, None))
                     else (UNAVAILABLE, f"keysight.ads.de 缺少 {attr}"))
@@ -232,6 +233,7 @@ def detect() -> dict:
 #: dataset 模块；仿真依赖 CircuitSimulator。缺任何一项即不可用。
 TOOL_REQUIREMENTS = {
     "get_workspace_info": ("de_module", "de_workspace_is_open", "de_active_workspace"),
+    "open_workspace": ("de_module", "de_open_workspace", "de_active_workspace"),
     "list_designs": ("de_module", "de_active_workspace"),
     "get_design_variables": ("de_module", "de_active_workspace", "design_mode_enum"),
     "set_design_variables": ("de_module", "de_active_workspace", "design_mode_enum"),

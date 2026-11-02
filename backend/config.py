@@ -12,6 +12,7 @@ Reads config.ini at the project root; environment variables override:
 
 import configparser
 import json
+import model_context
 import os
 import re
 from urllib.parse import urlparse
@@ -49,8 +50,33 @@ DEFAULTS = {
     # 把耗时仿真放到后台线程执行（不占用 ADS 主线程）。
     # 网表生成等必须访问 DE 数据库的步骤始终留在主线程；见 ads_ops.run_simulation。
     "sim_off_main_thread": True,
+    # 取消仿真时给 hpeesofsim 的收尾宽限（秒）：先 terminate，超时才
+    # taskkill /T 整棵**自己 spawn 的**进程树（绝不按进程名批量杀）。
+    "sim_cancel_grace_s": 3.0,
     # 统一模型库：ZIP 备份和索引放在此目录，各 ADS Workspace 按需导入副本。
     "model_library_root": "",
+    # PDF 解析运行时：后端解释器缺 pymupdf 时，指向一个装了 pymupdf 的
+    # 解释器，解析在子进程里跑同一份代码（backend/pdf_worker.py）。
+    # 留空 = 只用进程内引擎 + 受限降级扫描。
+    "datasheet_runtime_python": "",
+    # ---- 独立计算 worker（run_compute，2026-10-30）------------------------
+    # NumPy/SciPy 优化、拟合、大规模数据处理在后端计算子进程里执行，
+    # 不占 ADS 主线程。以下键都在 [agent] 段。
+    # 同时运行的计算作业上限。
+    "compute_max_workers": 2,
+    # 排队容量：队列满时 run_compute 立即返回 busy（可预测拒绝，不无限积压）。
+    "compute_queue_capacity": 8,
+    # 单个计算作业默认执行预算（秒）；代码可按作业覆盖，硬上限见下一项。
+    "compute_timeout_s": 600,
+    # 执行预算硬上限（秒）：超过这个值的 timeout_s 请求会被拒绝/截断。
+    "compute_max_timeout_s": 7200,
+    # 取消宽限期（秒）：请求停止后给协作退出的时间，超时才 terminate。
+    "compute_cancel_grace_s": 3.0,
+    # 计算子进程解释器：留空用当前后端解释器；需要独立 NumPy/SciPy 环境
+    # 时指向其 python.exe（依赖探测失败会明确报错，不会静默换解释器）。
+    "compute_python": "",
+    # 计算作业目录（request/result/log 与进程记录）：留空用数据根下 compute_jobs。
+    "compute_base_dir": "",
 }
 
 
@@ -74,6 +100,7 @@ def load() -> dict:
                 cfg[out_key] = raw in ("1", "true", "yes", "on")
 
     gi = int
+    gf = float
     get("llm", "base_url", "llm_base_url")
     get("llm", "model", "llm_model")
     get("llm", "api_key", "llm_api_key")
@@ -86,7 +113,17 @@ def load() -> dict:
     get("agent", "sim_timeout", "sim_timeout", gi)
     get("agent", "context_budget_chars", "context_budget_chars", gi)
     get_bool("agent", "sim_off_main_thread", "sim_off_main_thread")
+    get("agent", "sim_cancel_grace_s", "sim_cancel_grace_s", gf)
+    # 独立计算 worker（run_compute，2026-10-30）
+    get("agent", "compute_max_workers", "compute_max_workers", gi)
+    get("agent", "compute_queue_capacity", "compute_queue_capacity", gi)
+    get("agent", "compute_timeout_s", "compute_timeout_s", gi)
+    get("agent", "compute_max_timeout_s", "compute_max_timeout_s", gi)
+    get("agent", "compute_cancel_grace_s", "compute_cancel_grace_s", gf)
+    get("agent", "compute_python", "compute_python")
+    get("agent", "compute_base_dir", "compute_base_dir")
     get("models", "library_root", "model_library_root")
+    get("datasheet", "runtime_python", "datasheet_runtime_python")
     # 留空时由共享库模块按当前 ADS Workspace 的父目录解析为同级 libraries。
     cfg["model_library_root"] = (
         os.environ.get("ADS_AGENT_LIBRARY_ROOT", "").strip()
@@ -124,6 +161,9 @@ def _read_profiles(parser) -> dict:
             raise ValueError("模型连接参数必须为字符串")
         if not isinstance(profile.get("enabled", True), bool):
             raise ValueError("供应商启用状态必须为布尔值")
+        tokens = profile.get("context_window_tokens", 0)
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise ValueError("模型上下文上限必须为非负整数 tokens")
     connection = {
         "base_url": parser.get("llm", "base_url", fallback=DEFAULTS["llm_base_url"], raw=True),
         "api_key": parser.get("llm", "api_key", fallback="", raw=True),
@@ -145,6 +185,7 @@ def model_profile(name: str) -> dict | None:
     return {"model": name, "base_url": profile.get("base_url", ""),
             "api_key": profile.get("api_key", ""), "provider_name": provider_label(profile),
             "enabled": profile.get("enabled", True),
+            "context_window_tokens": profile.get("context_window_tokens", 0),
             "models": next((g['models'] for g in provider_groups(cfg) if name in g['models']), [name])}
 
 
@@ -240,6 +281,8 @@ def update_llm_settings(
     provider_models: list | None = None,
     provider_model: str | None = None,
     provider_enabled: bool | None = None,
+    context_model: str | None = None,
+    context_window_tokens: int | None = None,
 ) -> dict:
     """Persist [llm] settings into config.ini, preserving comments & other keys.
 
@@ -252,6 +295,9 @@ def update_llm_settings(
     """
     if provider_enabled is not None and not isinstance(provider_enabled, bool):
         raise ValueError("供应商启用状态必须为布尔值")
+    if context_window_tokens is not None and (isinstance(context_window_tokens, bool)
+            or not isinstance(context_window_tokens, int) or context_window_tokens < 0):
+        raise ValueError("模型上下文上限必须为非负整数 tokens")
     updates: dict[str, str] = {}
     if base_url is not None and base_url.strip():
         updates["base_url"] = base_url.strip()
@@ -275,6 +321,7 @@ def update_llm_settings(
                             and _connection_identity(p) == _connection_identity(origin)]
         connection = dict(profiles.get(target, profiles.get(active, {
             "base_url": DEFAULTS["llm_base_url"], "api_key": ""})))
+        connection.pop("context_window_tokens", None)
         if base_url is not None and base_url.strip():
             connection["base_url"] = base_url.strip()
         if api_key is not None:
@@ -297,12 +344,26 @@ def update_llm_settings(
                 if name not in members:
                     profiles.pop(name)
             for name in members:
+                old_limit = profiles.get(name, {}).get("context_window_tokens", 0)
                 profiles[name] = dict(connection)
+                if old_limit:
+                    profiles[name]["context_window_tokens"] = old_limit
             saved = models if models is not None else parser.get('llm', 'models', fallback=active).split(',')
             updates['models'] = ', '.join(dict.fromkeys([n.strip() for n in saved
                 if n.strip() and (n.strip() not in previous_members or n.strip() in members)] + members))
         else:
+            old_limit = profiles.get(target, {}).get("context_window_tokens", 0)
             profiles[target] = connection
+            if old_limit:
+                profiles[target]["context_window_tokens"] = old_limit
+        if context_window_tokens is not None:
+            limit_model = (context_model or target).strip()
+            if limit_model not in (members if provider_models is not None else [target]):
+                raise ValueError("上下文设置的模型必须在当前供应商选中的模型列表中")
+            if context_window_tokens:
+                profiles[limit_model]["context_window_tokens"] = context_window_tokens
+            else:
+                profiles[limit_model].pop("context_window_tokens", None)
         updates["base_url"] = connection.get("base_url", "")
         updates["api_key"] = connection.get("api_key", "")
         updates["profiles"] = json.dumps(profiles, ensure_ascii=False)
@@ -340,6 +401,7 @@ def update_llm_settings(
         "api_key_hint": key_hint(cfg["llm_api_key"]),
         "profile_labels": profile_labels(cfg),
         "provider_groups": provider_groups(cfg),
+        "model_contexts": model_context.capacities(cfg),
         # 是否在跨进程锁内完成（正常恒为 True；False 说明当时锁被占住，
         # 本次写入退化为无锁，极小概率丢更新 —— 面板/日志据此排查）
         "config_locked": locked,
