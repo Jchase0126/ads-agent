@@ -471,6 +471,68 @@ def test_health_is_open_but_never_leaks_the_token():
     not_contains(raw, authbridge.mask(TOKEN), "/health 不应出现令牌指纹")
 
 
+def test_ads_ops_import_failure_reports_real_cause_not_keyerror():
+    """ads_ops 导入失败时，调用方必须看到真实原因，绝不能是 KeyError。
+
+    回归 ADSAgent v1.3.0 的现场问题：发行清单漏登记 geometry_policy /
+    schematic_rules，全新安装后 import ads_ops 抛 ModuleNotFoundError。
+    旧代码里 pump() 的 except 分支引用未绑定的 ads_ops → UnboundLocalError，
+    box 里既无 error 也无 result，HTTP 层退化成 KeyError: 'result'，
+    把"缺两个文件"伪装成"服务崩溃"，导致使用者去重启 ADS。
+    """
+    _reset()
+
+    def boom(**kwargs):
+        raise ModuleNotFoundError("No module named 'geometry_policy'")
+
+    real = toolserver._get_ads_ops
+    toolserver._get_ads_ops = boom
+    try:
+        t, out = _submit_async("get_workspace_info", timeout=10)
+        t.join(15)
+    finally:
+        toolserver._get_ads_ops = real
+
+    ok("error" in out, f"导入失败必须回错误，实际拿到 {out}")
+    err = out["error"]
+    ok(not isinstance(err, KeyError),
+       f"绝不能退化成 KeyError（v1.3.0 现场症状）: {type(err).__name__}: {err}")
+    contains(type(err).__name__, "RuntimeError")
+    joined = str(err)
+    contains(joined, "ModuleNotFoundError", "真实异常类型必须透出给调用方")
+    contains(joined, "geometry_policy", "真实缺失模块名必须透出给调用方")
+    eq(toolserver.active_jobs(), [], "导入失败的作业应从忙碌表摘掉")
+
+
+def test_empty_box_becomes_explicit_error_not_keyerror():
+    """处理器既没写 result 也没写 error 时，submit() 必须给明确错误。
+
+    兜底：就算 pump() 的 except 分支本身失效（这里把 ctx.fail 打成空操作来
+    模拟），空 box 也不能退化成 KeyError，作业更不能被记成 succeeded。
+    """
+    _reset()
+
+    def swallow(args, ctx):
+        raise ValueError("swallowed by broken fail()")
+
+    _install({"swallow": swallow})
+
+    real_fail = toolserver.JobContext.fail
+    toolserver.JobContext.fail = lambda self, msg: None
+    try:
+        t, out = _submit_async("swallow", timeout=10)
+        t.join(15)
+    finally:
+        toolserver.JobContext.fail = real_fail
+
+    err = out.get("error")
+    ok(err is not None, f"空 box 必须变成错误，实际 {out}")
+    ok(not isinstance(err, KeyError),
+       f"不能是 KeyError（v1.3.0 现场症状）: {type(err).__name__}: {err}")
+    contains(str(err), "未产生结果", "错误信息应指明处理器没有产出结果")
+    eq(toolserver.active_jobs(), [], "该作业应从忙碌表摘掉")
+
+
 if __name__ == "__main__":
     try:
         code = run(globals(), "toolserver 忙碌状态")

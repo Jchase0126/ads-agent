@@ -646,7 +646,8 @@ def active_jobs() -> list:
 _ADS_OPS_PATH = os.path.join(_HERE, "ads_ops.py")
 # ads_ops 依赖的本地纯计算模块：ads_ops 热重载前要先重载它们，
 # 否则 reload(ads_ops) 里的 import 命中 sys.modules 缓存，改了也不生效
-_ADS_OPS_DEPS = ("rf_audit", "model_ops", "netlist_check")
+_ADS_OPS_DEPS = ("rf_audit", "model_ops", "netlist_check",
+                 "geometry_policy", "schematic_rules")
 
 
 def _get_ads_ops(starting_job_id=None):
@@ -866,6 +867,14 @@ def submit(name: str, args: dict, timeout: float = 300.0,
         if box.get("kind") == "precondition":
             raise PreconditionFailure(box["error"])
         raise RuntimeError(box["error"])
+    if "result" not in box:
+        # 处理器既没成功也没报错就收尾了（例如异常处理器自己抛异常、把真实
+        # 原因吞掉）。绝不能让它退化成 KeyError：那会把"缺文件/导入失败"
+        # 伪装成"服务崩溃"，让人误判方向去重启 ADS。
+        raise RuntimeError(
+            "工具执行结束但未返回结果（疑似处理器异常被吞，"
+            "见 %LOCALAPPDATA%\\ADSAgent\\logs\\ads_toolserver.log）"
+        )
     return box["result"]
 
 
@@ -957,6 +966,11 @@ def pump() -> None:
                          sim_off_main_thread=_sim_off_main_thread(),
                          client_id=client_id)
         _t0 = time.perf_counter()
+        # 预绑定：_get_ads_ops() 自己就可能抛（例如安装不完整、依赖模块缺失）。
+        # 若不留初值，下面 except 分支里的 getattr(ads_ops, ...) 会抛
+        # UnboundLocalError，把真实异常顶掉，box 里既没有 error 也没有 result，
+        # 调用方只能看到一个毫无意义的 KeyError。
+        ads_ops = None
         try:
             # This request has not entered its handler yet. Queued requests
             # and this starting request must not prevent an idle reload;
@@ -1002,14 +1016,24 @@ def pump() -> None:
             ctx.deferred = False
             # 前置条件（未打开工作区、最近记录失效）是调用方可直接改正的状态
             # 问题，不是服务崩溃：保留类别，让 HTTP 层回 4xx 而不是 500。
+            # ads_ops 为 None（导入就失败）时 getattr 返回 ()，不会误判。
             if isinstance(e, getattr(ads_ops, "PreconditionError", ())):
                 box["kind"] = "precondition"
-            ctx.fail(f"{type(e).__name__}: {e}")
+            try:
+                ctx.fail(f"{type(e).__name__}: {e}")
+            except BaseException:  # fail() 自己再炸也要把错误写进 box
+                box["error"] = f"{type(e).__name__}: {e}"
         finally:
             # 只有"本次作业真的结束了"才摘掉忙碌记录；
             # defer 过的作业交给后台线程收尾（_settle 里摘），
             # 否则一个作业结束会把其它仍在跑的作业的状态一起清空。
             if not ctx.deferred:
+                # 兜底：既没有 result 也没有 error 说明上面有东西被吞了。
+                # 必须补一条 error，否则 submit() 拿到空 box，作业还会被记成
+                # succeeded —— 真实原因就此彻底消失。
+                if "error" not in box and "result" not in box:
+                    box["error"] = (f"工具 {name} 结束但未产生结果或错误"
+                                    "（处理器异常被吞，见 ads_toolserver.log）")
                 _job_settle(jid, "failed" if "error" in box else "succeeded")
                 done.set()
         executed += 1

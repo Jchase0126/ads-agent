@@ -1,5 +1,34 @@
 # 更新记录
 
+## 1.3.1 — 2026-11-03（安装完整性修复）
+
+修复 v1.3.0 全新安装后**所有工具报 HTTP 500 / `KeyError: 'result'`** 的通用
+故障。详见 [docs/releases/1.3.1.md](docs/releases/1.3.1.md)。
+
+- **发行清单漏登记 6 个模块（P0）**：`release_manifest.py` 的 `ADDON_FILES`
+  是分发链路唯一白名单，v1.3.0 漏登记 `geometry_policy.py` 与
+  `schematic_rules.py`，而 `addon/ads_agent/ads_ops.py` 在模块顶层 import 它们
+  → 全新安装后 `import ads_ops` 抛 `ModuleNotFoundError`，`DISPATCH` 不存在，
+  21 个工具全部失效。同时补上 `appcad_chrome.py` / `appcad_circ.py` /
+  `appcad_spec.py` / `appcad_tl.py`（缺失会让 RF 计算器静默降级）。现清单登记
+  26 个模块，与目录实际数量一致。
+- **真实异常不再被吞成 KeyError（P1）**：`toolserver.py` 的 `pump()` 里
+  `ads_ops = _get_ads_ops(...)` 自身抛异常时，`except` 分支引用未绑定局部变量
+  → `UnboundLocalError` → `ctx.fail()` 执行不到 → box 空 → `box["result"]`
+  抛 `KeyError`，且作业被错记成 `succeeded`。现在：`try` 前预绑定
+  `ads_ops = None`；`ctx.fail()` 包一层兜底；`submit()` 对空 box 抛带排查指引的
+  `RuntimeError`；`finally` 补最后一道兜底。这类故障将直接显示真实的
+  `ModuleNotFoundError`。
+- **热重载依赖表补项（P2）**：`_ADS_OPS_DEPS` 补 `geometry_policy` /
+  `schematic_rules`，改这两个文件不再需要重启 ADS。
+- **安装后自检（新增）**：`install_addon.py` 的 `verify_deployed()` 以清单为
+  权威，检查「登记的模块是否都落地」与「磁盘模块的 import 是否都在清单内」，
+  不通过则中止安装并报「安装自检未通过」，不让问题留到用户第一次调用工具。
+- **测试**：新增 `test_manifest_covers_every_addon_module_that_is_imported`、
+  `test_install_selfcheck_catches_incomplete_deploy` 与两条 toolserver 回归
+  测试；均已用「还原旧代码 → 观察失败」证伪（旧清单被准确报出漏掉的 6 个模块，
+  旧 toolserver 精确复现 `KeyError: 'result'`）。
+
 ## 未发布 — 2026-10-30（ADS 长计算卡死修复）
 
 修复"Agent 执行长计算时 ADS 界面卡死 / 未响应"的根因（审查见

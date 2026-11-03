@@ -427,6 +427,75 @@ def _copy_newer(src: str, dst: str) -> None:
     raise InstallError(f"复制失败（目标被占用）：{dst}")
 
 
+def verify_deployed(target, note=None):
+    """安装后自检：装出来的目录**能不能真的 import**。
+
+    只看"文件复制了没"是不够的 —— v1.3.0 的故障就是文件按清单全部复制成功，
+    但清单本身漏了两个模块，于是 ads_ops 一 import 就 ModuleNotFoundError，
+    等到用户第一次调工具才炸（还被 toolserver 伪装成 KeyError）。
+
+    所以这里做两件事，都以 release_manifest.ADDON_FILES 为权威：
+      1. 清单登记的模块，装出来的目录里必须**都在**；
+      2. 在磁盘上的模块里静态求 import 关系，凡是被 import 却不在清单里的
+         本地模块，一律报出来（这是"改代码加了模块、忘了登记"的漏网路径）。
+
+    返回问题列表（空列表 = 通过）。不 import 被测模块本身：ads_ops / panel
+    依赖 ADS 运行时，安装器跑在**普通解释器**里，导进来必然失败。
+    """
+    import ast
+
+    import release_manifest as manifest
+
+    problems = []
+    addon_dir = os.path.join(target, "addon", "ads_agent")
+    if not os.path.isdir(addon_dir):
+        return ["安装目录缺少 addon/ads_agent：%s" % addon_dir]
+
+    declared = [n for n in manifest.ADDON_FILES if n.endswith(".py")]
+    declared_stems = {n[:-3] for n in declared}
+
+    # 1) 清单登记的文件必须都在
+    for name in declared:
+        if not os.path.isfile(os.path.join(addon_dir, name)):
+            problems.append("缺少清单登记模块 %s" % name)
+
+    # 2) 磁盘上每个模块的本地 import 都必须落在清单内
+    on_disk = {fn[:-3] for fn in os.listdir(addon_dir)
+               if fn.endswith(".py") and not fn.startswith("__")}
+    on_disk.add("__init__")
+    for name in sorted(on_disk):
+        path = os.path.join(addon_dir, name + ".py")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                tree = ast.parse(fh.read(), filename=path)
+        except (OSError, SyntaxError) as e:
+            problems.append("%s.py 无法解析：%s: %s" % (name, type(e).__name__, e))
+            continue
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module.split(".")[0]]
+            for nm in names:
+                # 只关心"确实存在于磁盘、但没被清单登记"的模块
+                if nm in on_disk and nm not in declared_stems:
+                    problems.append(
+                        "%s.py import 了未登记的本地模块 %s.py"
+                        "（分发时不会被复制，全新安装会 ImportError）"
+                        % (name, nm)
+                    )
+
+    if note is not None:
+        if problems:
+            note.append("自检发现 %d 个问题" % len(problems))
+        else:
+            note.append("自检通过：清单登记 %d 个模块，全部就位"
+                        % len(declared))
+    return problems
+
+
+
 # ---------------------------------------------------------------------------
 # 命令实现
 # ---------------------------------------------------------------------------
@@ -632,6 +701,14 @@ def _install_one(args, paths, adslocate, adscompat, note,
 
     if not _same_path(target_root, source_root):
         deploy(source_root, target_root, note)
+    # 装完自检：清单漏登记/复制不全都在这一步当场暴露，
+    # 而不是等用户第一次调用工具时收到一个看不懂的 KeyError。
+    selfcheck = verify_deployed(target_root, note)
+    if selfcheck:
+        raise InstallError(
+            "安装自检未通过（程序文件不完整，插件将无法使用）：\n  - "
+            + "\n  - ".join(selfcheck)
+        )
     target_init = os.path.join(target_root, PLUGIN_ENTRY)
 
     xml_path, scope = resolve_target_xml(ads_dir, args.user_level)

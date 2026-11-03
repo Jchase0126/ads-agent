@@ -73,9 +73,14 @@ BACKEND_FILES = [
 ADDON_FILES = [
     "__init__.py",       # 菜单与自动启动（ADS addon 契约）
     "ads_ops.py",        # 建图/改图/仿真的真实实现
+    "appcad_chrome.py",  # RF 计算器：原厂版式 chrome 常量（窗口/菜单/Web 条）
+    "appcad_circ.py",    # RF 计算器：电路类页面示意图规格数据
+    "appcad_spec.py",    # RF 计算器：示意图规格模型与 SpecDiagram 绘制
+    "appcad_tl.py",      # RF 计算器：传输线类页面示意图规格数据
     "authbridge.py",     # 按文件路径加载共享令牌模块
     "backend_launcher.py",  # 拉起并监护后端进程
     "capability.py",     # 运行时能力检测 + 工具门禁（只读探测，三态）
+    "geometry_policy.py",  # 几何判定原语：ads_ops 顶层 import，规划/写入/复核共用
     "mdplain.py",        # 面板用的极简 Markdown
     "model_attachments.py", # 模型 ZIP 附件上传与卡片
     "model_deps.py",     # 仿真结果模型依赖指纹
@@ -89,6 +94,7 @@ ADDON_FILES = [
     "result_page.py",    # 设计结果页
     "rf_audit.py",       # 射频/Layout 审查
     "rfcalc_panel.py",   # RF 计算器窗口（引擎经 pathbridge 共享）
+    "schematic_rules.py",  # 建图规则登记表：ads_ops 顶层 import，规则号/阶段/严重级
     "toolserver.py",     # ADS 进程内工具服务
     "uiscale.py",        # 自适应缩放与设计令牌
 ]

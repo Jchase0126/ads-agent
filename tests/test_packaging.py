@@ -74,6 +74,107 @@ def test_scan_for_leaks_finds_real_config():
         ok("projects.json" in leaks, "应检测出临时会话文件")
 
 
+def test_manifest_covers_every_addon_module_that_is_imported():
+    """白名单必须覆盖 addon/ads_agent 下**所有被 import 的本地模块**。
+
+    回归 ADSAgent v1.3.0：ADDON_FILES 漏登记 geometry_policy / schematic_rules，
+    而 ads_ops 在模块顶层 import 它们 → 全新安装后 ads_ops 整个导入失败，
+    DISPATCH 不存在，21 个工具全部挂掉。清单是分发链路的唯一白名单，
+    漏一个模块的代价是"装了不能用"，必须在打包前就拦住。
+
+    判定用静态 AST 求入口可达闭包，不 import 这些模块本身
+    （它们要求 ADS 运行时，测试机上导不进来）。
+    """
+    import ast
+
+    addon_dir = os.path.join(ROOT, "addon", "ads_agent")
+    local = {fn[:-3] for fn in os.listdir(addon_dir)
+             if fn.endswith(".py") and not fn.startswith("__")}
+    local.add("__init__")
+
+    edges = {}
+    for name in sorted(local):
+        path = os.path.join(addon_dir, name + ".py")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        deps = set()
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module.split(".")[0]]
+            for nm in names:
+                if nm in local:
+                    deps.add(nm)
+        edges[name] = deps
+
+    # 从真正的入口出发：__init__（ADS 加载）、panel（界面）、
+    # toolserver（工具服务）、ads_ops（工具实现）
+    seen, stack = set(), [r for r in ("__init__", "panel", "toolserver", "ads_ops")
+                          if r in local]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(edges.get(cur, ()))
+
+    registered = {fn[:-3] for fn in manifest.ADDON_FILES if fn.endswith(".py")}
+
+    missing = sorted(seen - registered)
+    eq(missing, [],
+       "入口可达但白名单漏登记的模块（全新安装会 ImportError）："
+       + ", ".join(m + ".py" for m in missing))
+
+    ghosts = sorted(registered - local)
+    eq(ghosts, [],
+       "白名单登记了磁盘上不存在的模块：" + ", ".join(g + ".py" for g in ghosts))
+
+    # 顺带：未可达的模块（可选依赖/离线工具）也必须登记，
+    # 否则它们在包里缺失属于"悄悄降级"，同样不该发生。
+    orphans = sorted(local - registered)
+    eq(orphans, [],
+       "白名单漏登记这些模块：" + ", ".join(o + ".py" for o in orphans))
+
+
+def test_install_selfcheck_catches_incomplete_deploy():
+    """安装后自检必须能抓到"模块缺失"和"模块未登记"两种不完整。
+
+    v1.3.0 的故障是文件按清单复制成功、但清单本身漏登记，
+    所以自检必须**以清单为权威**去比对磁盘，而不是只数磁盘上有几个文件。
+    """
+    import install_addon
+    import shutil
+
+    # 正常情况：当前仓库应当自检通过
+    eq(install_addon.verify_deployed(ROOT, []), [], "当前仓库应通过安装自检")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        addon = os.path.join(tmp, "addon", "ads_agent")
+        shutil.copytree(os.path.join(ROOT, "addon", "ads_agent"), addon)
+
+        # 情形一：清单登记了但磁盘上没有（= 复制不全/清单漏打包上游）
+        os.remove(os.path.join(addon, "geometry_policy.py"))
+        problems = install_addon.verify_deployed(tmp, [])
+        ok(any("geometry_policy" in p for p in problems),
+           f"缺少 geometry_policy.py 应被自检抓到：{problems}")
+
+        # 情形二：模块在磁盘上，但清单没登记（= 改了代码忘了登记）
+        # 用一份去掉 geometry_policy 的清单模拟
+        real = list(manifest.ADDON_FILES)
+        try:
+            manifest.ADDON_FILES = [n for n in real if n != "schematic_rules.py"]
+            with open(os.path.join(addon, "geometry_policy.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("# restored\n")
+            problems = install_addon.verify_deployed(tmp, [])
+            ok(any("schematic_rules" in p for p in problems),
+               f"清单漏登记但仍在磁盘上的模块应被抓到：{problems}")
+        finally:
+            manifest.ADDON_FILES = real
+
+
 def test_build_produces_clean_zip():
     with tempfile.TemporaryDirectory() as out:
         code = build_release.main(["--out", out])
