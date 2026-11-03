@@ -498,6 +498,75 @@ def test_auto_check_setting_persists_without_touching_other_sections():
         close(widget)
 
 
+# ---------------------------------------------------------------- 顶部绿色一键更新按钮
+def test_top_update_button_hidden_by_default_and_toggles():
+    """默认隐藏；发现新版本出现并带版本号；已是最新时收起。"""
+    widget = make_panel()
+    try:
+        ok(hasattr(widget, "update_top_btn"), "面板顶部应有绿色一键更新按钮")
+        ok(not widget.update_top_btn.isVisible(), "默认必须隐藏")
+        widget._on_update_checked(dict(AVAILABLE))
+        ok(widget.update_top_btn.isVisible(), "发现新版本时按钮应出现")
+        contains(widget.update_top_btn.text(), "1.4.0", "按钮文案应带新版本号")
+        widget._on_update_checked(dict(UP_TO_DATE))
+        ok(not widget.update_top_btn.isVisible(), "已是最新时按钮应收起")
+    finally:
+        close(widget)
+
+
+def test_top_button_click_runs_prepare_then_apply_chain():
+    """点击绿色按钮：prepare(ready) → 自动 apply → applied 后自动重启后端。"""
+    widget = make_panel()
+    try:
+        calls = {"apply": 0, "restart": 0}
+        widget._on_update_checked(dict(AVAILABLE))          # 按钮出现
+        original_prepare = panel.AgentPanelWidget._prepare_update
+        original_apply = panel.AgentPanelWidget._apply_update
+        original_restart = panel.AgentPanelWidget._restart_backend_async
+        try:
+            def fake_prepare(self):
+                self._update_preparing = True
+                self._on_update_prepared(dict(READY))
+
+            def fake_apply(self):
+                calls["apply"] += 1
+                self._gc_prepare_worker(None)
+                self._on_update_applied({
+                    "status": "applied", "applied_version": "1.4.0",
+                    "message": "已应用更新", "files": 3,
+                })
+
+            panel.AgentPanelWidget._prepare_update = fake_prepare
+            panel.AgentPanelWidget._apply_update = fake_apply
+            panel.AgentPanelWidget._restart_backend_async = (
+                lambda self: calls.__setitem__("restart", calls["restart"] + 1))
+            widget.update_top_btn.click()
+            APP.processEvents()
+        finally:
+            panel.AgentPanelWidget._prepare_update = original_prepare
+            panel.AgentPanelWidget._apply_update = original_apply
+            panel.AgentPanelWidget._restart_backend_async = original_restart
+        eq(calls["apply"], 1, "ready 后必须立即自动 apply（一键语义）")
+        eq(calls["restart"], 1, "applied 后必须自动重启后端")
+        contains(widget.status.text(), "1.4.0", "状态栏应显示已更新到的版本")
+        ok(not widget.update_top_btn.isVisible(), "更新完成后按钮应收起")
+    finally:
+        close(widget)
+
+
+def test_top_button_failure_restores_button():
+    """prepare 失败时按钮恢复可点，且不能把「正在下载」卡死。"""
+    widget = make_panel()
+    try:
+        widget._on_update_checked(dict(AVAILABLE))
+        widget._apply_update_now()
+        widget._on_update_prepared({"error": "后端未启动", "backend_down": True})
+        ok(widget.update_top_btn.isEnabled(), "失败后按钮应恢复可用")
+        contains(widget.update_top_btn.text(), "一键更新", "按钮文案应复位")
+    finally:
+        close(widget)
+
+
 def test_startup_check_is_delayed_and_respects_setting():
     """启动检查必须延时（避开首屏），关掉开关就完全不查。"""
     widget = make_panel()

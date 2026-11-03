@@ -248,7 +248,131 @@ def test_privacy_notice_states_what_is_and_is_not_collected():
     notice = feedback.PRIVACY_NOTICE
     for must in ("不包含", "密钥", "路径"):
         contains(notice, must, "隐私声明必须写明边界：%s" % must)
+    contains(notice, "自动上传", "新口径必须写明联网时会自动上传")
     ok(len(notice) > 80, "隐私声明要看得懂，不能是一句话敷衍")
+
+
+# ---------------------------------------------------------------------------
+# 自动上传（v1.3.5：联网默认上传，无需用户登录）
+# ---------------------------------------------------------------------------
+def _fake_report():
+    return {"kind": "crash", "error": "TypeError: boom",
+            "env": {"plugin_version": "1.3.5"}}
+
+
+def test_upload_without_token_fails_closed():
+    """无令牌：绝不发网络请求，报告只落本机。"""
+    calls = {"post": 0}
+
+    def _spy(*args, **kwargs):
+        calls["post"] += 1
+        return 201, '{"html_url": "https://x"}'
+
+    original = feedback._http_post_json
+    try:
+        feedback._http_post_json = _spy
+        result = feedback.upload(_fake_report(), "# r", "[崩溃] t", token="")
+    finally:
+        feedback._http_post_json = original
+    eq(calls["post"], 0, "无令牌时不得发出任何网络请求")
+    ok(not result.get("ok"), "无令牌时上传必须失败（fail-closed）")
+    contains(result.get("error") or "", "令牌", "错误信息应说明缺令牌")
+
+
+def test_upload_with_token_posts_and_returns_issue_url():
+    captured = {}
+
+    def _fake(url, payload, headers, timeout=10.0):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["headers"] = headers
+        return 201, '{"html_url": "https://github.com/Jchase0126/ads-agent/issues/9"}'
+
+    original = feedback._http_post_json
+    try:
+        feedback._http_post_json = _fake
+        result = feedback.upload(_fake_report(), "# 正文", "[崩溃] t",
+                                 token="ghp_test")
+    finally:
+        feedback._http_post_json = original
+    ok(result.get("ok"), "带令牌上传应成功")
+    eq(result.get("issue_url"), "https://github.com/Jchase0126/ads-agent/issues/9",
+       "应带回 GitHub 返回的 issue 链接")
+    eq(captured["url"], feedback.UPLOAD_URL, "只能 POST 到固定仓库地址")
+    contains(captured["headers"].get("Authorization") or "", "ghp_test",
+             "Authorization 应使用调用方令牌")
+    ok(captured["payload"].get("title"), "issue 标题不得为空")
+
+
+def test_snapshot_carries_upload_result():
+    """snapshot()（面板手动/静默路径）必须把上传结果放进返回 dict。"""
+    original_post = feedback._http_post_json
+    original_token = feedback.resolve_token
+    try:
+        feedback.resolve_token = lambda cfg=None: "ghp_test"
+        feedback._http_post_json = (
+            lambda url, payload, headers, timeout=10.0: (
+                201, '{"html_url": "https://github.com/x/issues/2"}'))
+        snap = feedback.snapshot("error", "TypeError: upload-path",
+                                 context={"source": "panel-test"})
+    finally:
+        feedback._http_post_json = original_post
+        feedback.resolve_token = original_token
+    ok(snap.get("ok"), "snapshot 应成功")
+    up = snap.get("upload") or {}
+    ok(up.get("ok"), "snapshot 返回值应包含成功的 upload 结果")
+    contains(up.get("issue_url") or "", "issues", "upload 结果应带 issue 链接")
+
+
+def test_auto_upload_disabled_skips_network():
+    """auto_upload=false（config 或 env 注入）时不发任何请求。"""
+    calls = {"post": 0}
+
+    def _spy(*args, **kwargs):
+        calls["post"] += 1
+        return 201, "{}"
+
+    original_post = feedback._http_post_json
+    original_settings = feedback.settings
+    try:
+        feedback._http_post_json = _spy
+        feedback.settings = lambda cfg=None: {
+            "enabled": True, "auto_upload": False, "upload_token": "ghp_test",
+            "include_logs": True, "max_log_lines": 120, "hang_seconds": 180,
+        }
+        out = feedback._maybe_auto_upload(_fake_report(), background=False)
+    finally:
+        feedback._http_post_json = original_post
+        feedback.settings = original_settings
+    eq(calls["post"], 0, "auto_upload=false 时不得发请求")
+    contains(out.get("error") or "", "未开启", "应说明自动上传未开启")
+
+
+def test_resolve_token_precedence_env_over_config():
+    """env > config.ini > 打包注入。"""
+    original_embedded = feedback.EMBEDDED_UPLOAD_TOKEN
+    original_settings = feedback.settings
+    try:
+        feedback.settings = lambda cfg=None: {
+            "enabled": True, "auto_upload": True,
+            "upload_token": "cfg-token", "include_logs": True,
+            "max_log_lines": 120, "hang_seconds": 180,
+        }
+        os.environ["ADS_AGENT_FEEDBACK_TOKEN"] = "env-token"
+        try:
+            eq(feedback.resolve_token(), "env-token", "env 必须优先于 config")
+        finally:
+            os.environ.pop("ADS_AGENT_FEEDBACK_TOKEN", None)
+        eq(feedback.resolve_token(), "cfg-token", "config 次于 env")
+        feedback.EMBEDDED_UPLOAD_TOKEN = "pkg-token"
+        feedback.settings = lambda cfg=None: {
+            "enabled": True, "auto_upload": True, "upload_token": "",
+            "include_logs": True, "max_log_lines": 120, "hang_seconds": 180,
+        }
+        eq(feedback.resolve_token(), "pkg-token", "打包注入是最后一级")
+    finally:
+        feedback.EMBEDDED_UPLOAD_TOKEN = original_embedded
+        feedback.settings = original_settings
 
 
 if __name__ == "__main__":

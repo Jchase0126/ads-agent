@@ -49,6 +49,8 @@ DEFAULTS = {
     "include_logs": True,
     "max_log_lines": 120,
     "hang_seconds": 180,
+    "auto_upload": True,
+    "upload_token": "",
 }
 
 _TRUE = ("1", "true", "yes", "on")
@@ -225,11 +227,13 @@ def read_settings() -> dict:
         value = str(raw.get(key) or "").strip()
         if isinstance(default, bool):
             cfg[key] = value.lower() in _TRUE
-        else:
+        elif isinstance(default, int):
             try:
                 cfg[key] = int(value or 0) if value else default
             except (TypeError, ValueError):
                 cfg[key] = default
+        else:
+            cfg[key] = value
     return cfg
 
 
@@ -247,11 +251,13 @@ def save_settings(values: dict) -> bool:
         value = values[key]
         if isinstance(default, bool):
             clean[key] = "true" if value else "false"
-        else:
+        elif isinstance(default, int):
             try:
                 clean[key] = str(int(value))
             except (TypeError, ValueError):
                 continue
+        else:
+            clean[key] = str(value)
     if not clean:
         return False
     try:

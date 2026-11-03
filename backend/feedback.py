@@ -62,7 +62,9 @@ PRIVACY_NOTICE = (
     "反馈报告只包含：插件与 ADS 版本、操作系统与 Python 版本、异常堆栈、"
     "已脱敏的运行日志、出错时正在执行的工具名。\n"
     "不包含：API 密钥与令牌、你的工程/设计/元件名称、本机文件路径、"
-    "与助手的对话内容、任何网络上传（报告只存在本机，由你确认后提交）。"
+    "与助手的对话内容。\n"
+    "联网时报告会自动上传到插件作者的 GitHub 仓库（仅用于修复崩溃/报错），"
+    "同时在本机保留一份副本；未联网或上传失败时只保存在本机，不会重试上传。"
 )
 
 #: 报告里逐条列出"已屏蔽什么"，让用户能自己核对（比空口承诺可信）。
@@ -165,7 +167,21 @@ DEFAULTS = {
     "max_log_lines": 120,
     # 卡死判定：心跳超过这个秒数没更新即判定卡死（0 = 不检测）
     "hang_seconds": 180,
+    # 联网时自动把脱敏报告直接上传到 GitHub issue（无需用户登录/操作）。
+    # 上传失败或未配置令牌时报告仍保存在本机（fail-closed）。
+    "auto_upload": True,
+    # GitHub PAT（只允许往插件仓库开 issue 的最小权限令牌）。
+    # 优先级：环境变量 ADS_AGENT_FEEDBACK_TOKEN > 这里的值 > 打包注入值。
+    "upload_token": "",
 }
+
+#: 打包时由 tools/build_release.py 注入（读取 gitignore 的
+#: tools/feedback_token.local）。仓库里恒为空串——凭据绝不进源码。
+EMBEDDED_UPLOAD_TOKEN = ""
+
+#: GitHub Issues API（只写 issue，固定仓库，无任何客户端可控字段）。
+UPLOAD_URL = "https://api.github.com/repos/Jchase0126/ads-agent/issues"
+UPLOAD_TIMEOUT_S = 10.0
 
 _TRUE = ("1", "true", "yes", "on")
 
@@ -520,6 +536,8 @@ def record(kind: str, error_text, context=None, log_lines=None,
     返回 ``{"report", "paths", "duplicate", "fingerprint"}``。
     同一指纹在 ``dedupe_window_s`` 内重复出现时 ``duplicate=True``
     （仍然更新计数，但不重复弹窗 —— 用户不会想被同一个 bug 弹十次）。
+    非重复且 ``[feedback] auto_upload`` 开启时，后台线程自动上传到
+    GitHub issue（不阻塞调用方；结果只写进日志）。
     """
     result = {"report": None, "paths": {}, "duplicate": False, "fingerprint": ""}
     try:
@@ -551,6 +569,7 @@ def record(kind: str, error_text, context=None, log_lines=None,
         if not result["duplicate"]:
             result["paths"] = save_report(report)
             prune(keep=40)
+            _maybe_auto_upload(report, background=True)
         _log.error("已记录%s报告 %s（指纹 %s）", report["kind_label"],
                    "重复" if result["duplicate"] else "新", fp)
         return result
@@ -571,6 +590,125 @@ def recent_duplicates(window_s: float = 600.0) -> list:
                 if info.get("count", 0) > 1 and now - float(info.get("last") or 0) < window_s]
     except Exception:  # noqa: BLE001
         return []
+
+
+# ---------------------------------------------------------------------------
+# 自动上传（联网直连 GitHub Issues API，用户无需登录/操作）
+# ---------------------------------------------------------------------------
+def resolve_token(cfg=None) -> str:
+    """上传令牌的三级来源：环境变量 > config.ini > 打包注入。都空则 fail-closed。"""
+    token = ""
+    try:
+        token = str(os.environ.get("ADS_AGENT_FEEDBACK_TOKEN") or "").strip()
+    except Exception:  # noqa: BLE001
+        token = ""
+    if not token:
+        try:
+            token = str(settings(cfg).get("upload_token") or "").strip()
+        except Exception:  # noqa: BLE001
+            token = ""
+    if not token:
+        token = str(EMBEDDED_UPLOAD_TOKEN or "").strip()
+    return token
+
+
+def _http_post_json(url: str, payload: dict, headers: dict,
+                    timeout: float = UPLOAD_TIMEOUT_S) -> tuple:
+    """POST JSON 并返回 ``(status, body_text)``。**绝不抛异常**（失败返回 (0, 原因)）。"""
+    try:
+        import urllib.request
+
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers=dict(headers))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — 固定 URL
+            raw = resp.read(65536)
+            return int(resp.status or 0), raw.decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001 — 网络/HTTP 错误都归一成 (0, 原因)
+        status = 0
+        detail = f"{type(e).__name__}: {e}"
+        try:  # HTTPError 带状态码与响应体，尽量把 GitHub 的错误信息带回来
+            code = getattr(e, "code", None)
+            if code:
+                status = int(code)
+                raw = e.read(4096)  # noqa: BLE001
+                detail = raw.decode("utf-8", "replace")[:400]
+        except Exception:  # noqa: BLE001
+            pass
+        return status, detail
+
+
+def upload(report: dict, markdown: str, title: str, token: str = "",
+           timeout: float = UPLOAD_TIMEOUT_S) -> dict:
+    """把一份**已脱敏**的报告作为 issue 提交到插件仓库。**绝不抛异常**。
+
+    返回 ``{"ok", "issue_url", "status", "error"}``。没有令牌时直接拒绝
+    （报告已保存在本机，不会丢）。
+    """
+    try:
+        token = str(token or "").strip()
+        if not token:
+            return {"ok": False, "issue_url": "", "status": 0,
+                    "error": "未配置上传令牌（报告已保存在本机）"}
+        status, body = _http_post_json(
+            UPLOAD_URL,
+            {"title": str(title or "反馈报告")[:200], "body": str(markdown or "")[:60000]},
+            {"Authorization": "Bearer " + token,
+             "Accept": "application/vnd.github+json",
+             "X-GitHub-Api-Version": "2022-11-28",
+             "User-Agent": "ADSAgent-feedback",
+             "Content-Type": "application/json"},
+            timeout=timeout)
+        if 200 <= status < 300:
+            url = ""
+            try:
+                url = str((json.loads(body) or {}).get("html_url") or "")
+            except Exception:  # noqa: BLE001
+                pass
+            _log.error("诊断报告已自动上传：%s", url or "(GitHub 未返回链接)")
+            return {"ok": True, "issue_url": url, "status": status, "error": ""}
+        err = "上传失败（HTTP %s）：%s" % (status or "网络错误", (body or "")[:200])
+        _log.error("诊断报告自动上传未完成：%s", err)
+        return {"ok": False, "issue_url": "", "status": status, "error": err}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "issue_url": "", "status": 0,
+                "error": f"{type(e).__name__}: {e}"}
+
+
+def _maybe_auto_upload(report: dict, background: bool = False) -> dict:
+    """按配置自动上传；``background=True`` 时在守护线程里跑（不阻塞调用方）。
+
+    重复报告（去重窗口内）跳过上传，避免同一个 bug 把 issue 区刷屏。
+    """
+    out = {"ok": False, "issue_url": "", "status": 0,
+           "error": "自动上传未开启"}
+    try:
+        if report is None:
+            return out
+        cfg = settings()
+        if not (cfg.get("enabled", True) and cfg.get("auto_upload", True)):
+            return out
+
+        def _do():
+            token = resolve_token(cfg)
+            if not token:
+                return {"ok": False, "issue_url": "", "status": 0,
+                        "error": "未配置上传令牌（报告已保存在本机）"}
+            return upload(report, render_markdown(report),
+                          issue_title(report), token=token)
+
+        if background:
+            threading.Thread(target=_do, daemon=True).start()
+            out["error"] = ""  # 后台执行，结果只写日志
+            return out
+        out = _do()
+        return out
+    except Exception as e:  # noqa: BLE001
+        try:
+            out["error"] = f"{type(e).__name__}: {e}"
+        except Exception:  # noqa: BLE001
+            pass
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +883,12 @@ def snapshot(kind: str, error_text, context=None) -> dict:
         # record() 被开关关掉或自身出错：退化成"不落盘、只渲染"
         report = build_report(kind, error_text, context)
         result["report"] = report
+    if result.get("duplicate"):
+        # 面板的"生成报告"是手动动作：重复时报 still 展示，但不再刷 issue
+        upload_result = {"ok": False, "issue_url": "", "status": 0,
+                         "error": "10 分钟内已上报过同一错误，已跳过上传"}
+    else:
+        upload_result = _maybe_auto_upload(report, background=False)
     return {
         "ok": True,
         "report": report,
@@ -757,6 +901,7 @@ def snapshot(kind: str, error_text, context=None) -> dict:
         "dir": feedback_dir(create=True),
         "privacy_notice": PRIVACY_NOTICE,
         "repo": FEEDBACK_REPO,
+        "upload": upload_result,
     }
 
 

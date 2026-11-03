@@ -92,6 +92,11 @@ DEFAULTS = {
     "feedback_max_log_lines": 120,
     # 卡死判定阈值（秒）：ADS 端心跳超过这么久没更新就认为卡住了。0 = 关闭判定。
     "feedback_hang_seconds": 180,
+    # 联网时自动把脱敏报告直接上传到 GitHub issue（2026-11-03，默认开）。
+    "feedback_auto_upload": True,
+    # GitHub PAT（只允许往插件仓库开 issue 的最小权限令牌）。留空=不上传。
+    # 也可用环境变量 ADS_AGENT_FEEDBACK_TOKEN；该值不出现在任何 UI。
+    "feedback_upload_token": "",
 }
 
 
@@ -145,6 +150,8 @@ def load() -> dict:
     get_bool("feedback", "include_logs", "feedback_include_logs")
     get("feedback", "max_log_lines", "feedback_max_log_lines", gi)
     get("feedback", "hang_seconds", "feedback_hang_seconds", gi)
+    get_bool("feedback", "auto_upload", "feedback_auto_upload")
+    get("feedback", "upload_token", "feedback_upload_token")
     # 留空时由共享库模块按当前 ADS Workspace 的父目录解析为同级 libraries。
     cfg["model_library_root"] = (
         os.environ.get("ADS_AGENT_LIBRARY_ROOT", "").strip()
@@ -436,6 +443,8 @@ _FEEDBACK_KEYS = {
     "include_logs": "feedback_include_logs",
     "max_log_lines": "feedback_max_log_lines",
     "hang_seconds": "feedback_hang_seconds",
+    "auto_upload": "feedback_auto_upload",
+    "upload_token": "feedback_upload_token",
 }
 
 

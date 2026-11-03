@@ -312,6 +312,8 @@ def _feedback_cfg() -> dict:
         "include_logs": bool(CFG.get("feedback_include_logs", True)),
         "max_log_lines": int(CFG.get("feedback_max_log_lines") or 120),
         "hang_seconds": int(CFG.get("feedback_hang_seconds") or 0),
+        "auto_upload": bool(CFG.get("feedback_auto_upload", True)),
+        "upload_token": str(CFG.get("feedback_upload_token") or ""),
     }
 
 
@@ -1283,6 +1285,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"status": "error", "message": "请求体必须是空 JSON 对象"}, 400)
                 return
             self._send_json(update_service.prepare())
+            return
+        if self.path == "/updates/apply":
+            body = self._read_json()
+            if body is None:
+                return
+            if body:
+                self._send_json({"status": "error", "message": "请求体必须是空 JSON 对象"}, 400)
+                return
+            # 只应用本服务此前暂存并通过校验的更新包；不接受任何客户端路径。
+            self._send_json(update_service.apply())
             return
         if self.path == "/chat/cancel":
             body = self._read_json() or {}

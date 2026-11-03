@@ -1546,6 +1546,22 @@ class AgentPanelWidget(QWidget):
         title_col.addWidget(self.subtitle)
         top.addLayout(title_col, 1)
 
+        # 顶部「一键更新」亮绿按钮：只有检查到新版本时才出现（默认隐藏）。
+        self.update_top_btn = QPushButton("发现新版本")
+        self.update_top_btn.setObjectName("updateTopBtn")
+        self.update_top_btn.setAccessibleName("发现新版本：一键下载并自动更新")
+        self.update_top_btn.setToolTip("GitHub 上有新版本。点击后自动下载、校验并更新，随后自动重启后端。")
+        self.update_top_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_top_btn.setStyleSheet(
+            f"QPushButton{{background:#22C55E;color:#ffffff;border:none;"
+            f"border-radius:{U.R('pill')}px;padding:{U.px(5)}px {U.px(14)}px;"
+            f"font-size:{U.fs('small')}px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:#16A34A;}}"
+            f"QPushButton:disabled{{background:{'#9CA3AF'};}}")
+        self.update_top_btn.hide()
+        self.update_top_btn.clicked.connect(self._apply_update_now)
+        top.addWidget(self.update_top_btn)
+
         self.theme_btn = self._round_tool_button("🌙", "深色 / 浅色主题")
         self.theme_btn.clicked.connect(self._toggle_theme)
         top.addWidget(self.theme_btn)
@@ -1741,36 +1757,15 @@ class AgentPanelWidget(QWidget):
             pass
 
     def _load_feedback_settings(self):
-        """把 config.ini 的 [feedback] 段读进控件。
-
-        自己读 ini 而不是问后端：后端没起的时候开关也要能正确显示和保存。
-        """
-        try:
-            values = feedbackbridge.read_settings()
-        except BaseException:  # noqa: BLE001
-            values = dict(feedbackbridge.DEFAULTS)
-        try:
-            self.feedback_enabled.setChecked(bool(values.get("enabled", True)))
-            self.feedback_auto_open_browser.setChecked(
-                bool(values.get("auto_open_browser", True)))
-            self.feedback_include_logs.setChecked(bool(values.get("include_logs", True)))
-            self.feedback_notice_view.setPlainText(feedbackbridge.privacy_notice())
-        except BaseException:  # noqa: BLE001
-            pass
+        """诊断已全部转为后端静默自动上传，面板不再显示任何反馈控件。"""
+        return
 
     def _feedback_values(self) -> dict:
-        return {
-            "enabled": self.feedback_enabled.isChecked(),
-            "auto_open_browser": self.feedback_auto_open_browser.isChecked(),
-            "include_logs": self.feedback_include_logs.isChecked(),
-        }
+        return {}
 
     def _persist_feedback_settings(self) -> bool:
-        """直写 config.ini 的 [feedback] 段（走 authbridge 的跨进程锁与原子替换）。"""
-        try:
-            return feedbackbridge.save_settings(self._feedback_values())
-        except BaseException:  # noqa: BLE001
-            return False
+        """开关已从 UI 移除；这里保留调用点兼容 _save_settings，不再写任何东西。"""
+        return True
 
     def _generate_feedback_report(self):
         """用户主动生成一份本机报告：存盘 + 打开 issue 页 + 报告正文进剪贴板。"""
@@ -1779,7 +1774,6 @@ class AgentPanelWidget(QWidget):
             context = {
                 "source": "settings",
                 "state": self._feedback_state(),
-                "include_logs": self.feedback_include_logs.isChecked(),
             }
             data = feedbackbridge.post_report("error", error_text, context)
             self._finish_feedback_report(data)
@@ -1852,21 +1846,30 @@ class AgentPanelWidget(QWidget):
 
     def _maybe_offer_feedback(self, kind: str, error_text: str,
                               context: dict | None = None):
-        """出错后非阻塞地询问是否上报；never-raise。"""
+        """静默诊断路径：联网时后端自动上传脱敏报告，面板只在状态栏轻提示。
+
+        不弹窗、不打开浏览器、不打断任何操作；never-raise。
+        """
         try:
-            if not self.feedback_enabled.isChecked():
+            if _setting("feedback", "enabled", "true").strip().lower() \
+                    not in ("1", "true", "yes", "on"):
                 return
-            data = feedbackbridge.post_report(kind, error_text, context or {})
+            data = feedbackbridge.post_report(kind, error_text, context or {}) or {}
             if not data or not data.get("ok"):
-                data = feedbackbridge.snapshot_local(kind, error_text, context or {})
-            if not data or not data.get("ok"):
                 return
-            url = (data.get("url") or "").strip()
-            if self.feedback_auto_open_browser.isChecked():
-                if url:
-                    self._open_external(url)
-                return
-            self._ask_feedback(data, url, error_text)
+            up = data.get("upload") or {}
+            fp = str(data.get("fingerprint") or "")[:8]
+            if up.get("ok"):
+                url = str(up.get("issue_url") or "").strip()
+                self.status.setText(
+                    "已自动上传诊断报告"
+                    + (f"（{url}）" if url else "")
+                    + ("，本机留有副本。" if not url else ""))
+            else:
+                reason = str(up.get("error") or "").strip()
+                self.status.setText(
+                    f"诊断报告已保存在本机（指纹 {fp}"
+                    + (f"；自动上传未完成：{reason}" if reason else "") + "）。")
         except BaseException:  # noqa: BLE001 - 诊断路径绝不打断主流程
             pass
 
@@ -2063,20 +2066,94 @@ class AgentPanelWidget(QWidget):
             message = str(data.get("message") or "")
             if status == "update_available":
                 self._update_state(status, message, current, latest)
+                self._show_top_update(latest)
                 if callable(on_available):
                     on_available(data)
                 elif silent:
-                    # 启动时静默检查发现新版本：只提示，不自动下载、不弹模态框。
+                    # 启动时静默检查发现新版本：顶部亮绿按钮已出现，这里只轻提示。
                     try:
-                        self.status.setText(f"发现新版本 {latest}，可在设置页「软件更新」里准备更新。")
+                        self.status.setText(f"发现新版本 {latest}：点右上角绿色「一键更新」按钮即可自动更新。")
                     except BaseException:  # noqa: BLE001
                         pass
             elif status == "up_to_date":
+                self._show_top_update("")
                 if not silent:
                     self._update_state(status, message, current, latest)
             else:
                 if not silent:
                     self._update_state("error", message or "检查更新失败")
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _show_top_update(self, latest: str):
+        """发现新版本时显示顶部绿色按钮；已是最新/检查失败时隐藏。never-raise。"""
+        try:
+            btn = getattr(self, "update_top_btn", None)
+            if btn is None:
+                return
+            if latest:
+                btn.setText(f"一键更新 v{latest}")
+                btn.setToolTip(f"GitHub 上有新版本 v{latest}。点击后自动下载、校验并更新，"
+                               "随后自动重启后端完成升级。")
+                btn.show()
+            else:
+                btn.hide()
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _apply_update_now(self):
+        """绿色按钮：不弹确认、后台 prepare（下载+校验）→ apply（覆盖）→ 重启后端。"""
+        try:
+            if getattr(self, "_update_preparing", False):
+                return
+            self._update_apply_requested = True
+            try:
+                self.update_top_btn.setEnabled(False)
+                self.update_top_btn.setText("正在下载更新…")
+            except BaseException:  # noqa: BLE001
+                pass
+            self.status.setText("正在后台下载并校验新版本（完成后自动安装并重启后端）…")
+            self._prepare_update()
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _apply_update(self):
+        """POST /updates/apply：把已校验的暂存包覆盖到程序目录（后端自己做安全检查）。"""
+        try:
+            worker = ConfigWorker({}, path="/updates/apply", timeout=120)
+            worker.result.connect(self._on_update_applied)
+            worker.finished.connect(lambda w=worker: self._gc_prepare_worker(w))
+            self._update_workers = getattr(self, "_update_workers", [])
+            self._update_workers.append(worker)
+            worker.start()
+        except BaseException as exc:  # noqa: BLE001
+            self._update_apply_requested = False
+            self._restore_top_update_btn()
+            self.status.setText(f"自动更新启动失败：{type(exc).__name__}（未改动任何文件）")
+
+    def _restore_top_update_btn(self):
+        try:
+            btn = getattr(self, "update_top_btn", None)
+            if btn is not None and btn.isVisible():
+                btn.setEnabled(True)
+                btn.setText("一键更新")
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _on_update_applied(self, data: dict):
+        try:
+            self._update_apply_requested = False
+            data = data or {}
+            status = str(data.get("status") or "").strip()
+            if status == "applied":
+                version = str(data.get("applied_version") or "")
+                self._show_top_update("")   # 更新完成，按钮收起
+                self.status.setText(f"已更新到 v{version}，正在自动重启后端…")
+                # 复用 1.3.4 的后端重启链路（核对身份 → taskkill → 拉起 → 健康检查）
+                self._restart_backend_async()
+            else:
+                self._restore_top_update_btn()
+                self.status.setText(str(data.get("message") or "自动更新未完成，未改动安装。"))
         except BaseException:  # noqa: BLE001
             pass
 
@@ -2143,6 +2220,9 @@ class AgentPanelWidget(QWidget):
                 self._update_state("error", data.get("error", ""))
                 return
             if "error" in data and "status" not in data:
+                if getattr(self, "_update_apply_requested", False):
+                    self._update_apply_requested = False
+                    self._restore_top_update_btn()
                 self._update_state("error", data.get("error", ""))
                 return
             status = str(data.get("status") or "").strip()
@@ -2150,6 +2230,11 @@ class AgentPanelWidget(QWidget):
             latest = str(data.get("latest_version") or "")
             message = str(data.get("message") or "")
             if status == "ready":
+                if getattr(self, "_update_apply_requested", False):
+                    # 绿色按钮的一键流程：下载校验完成 → 立即应用（覆盖文件）
+                    self.status.setText("下载校验完成，正在应用更新…")
+                    self._apply_update()
+                    return
                 self._update_state("ready", message, current, latest,
                                    instruction=str(data.get("instruction") or ""),
                                    package_path=str(data.get("package_path") or ""),
@@ -3174,67 +3259,16 @@ class AgentPanelWidget(QWidget):
         self.shared_connection_hint.setWordWrap(True)
         sv.addWidget(self.shared_connection_hint)
 
-        # ---- 崩溃反馈（诊断报告只存本机，不上传；面板只负责生成与打开）
-        self.feedback_heading = QLabel("崩溃反馈")
+        # ---- 崩溃/卡死诊断：已改为后端静默自动上传（联网时），UI 不再显示任何开关；
+        # 菜单「报告问题 / 反馈崩溃…」仍可手动生成报告。
+        self.feedback_heading = QLabel("崩溃与诊断")
         sv.addWidget(self.feedback_heading)
-        self.feedback_enabled = QCheckBox("启用崩溃/卡死诊断报告")
-        self.feedback_enabled.setObjectName("settings.feedback.enabled")
-        self.feedback_enabled.setToolTip(
-            "面板每 30 秒写一次心跳；后端发现心跳长时间不更新，就会把疑似卡死"
-            "记录成一份本机报告，方便你事后提交。"
-        )
-        sv.addWidget(self.feedback_enabled)
-        self.feedback_auto_open_browser = QCheckBox("崩溃后自动打开浏览器")
-        self.feedback_auto_open_browser.setObjectName("settings.feedback.auto_open_browser")
-        self.feedback_auto_open_browser.setToolTip(
-            "开启后崩溃时直接打开浏览器的 GitHub issue 预填页面，不再逐次询问；"
-            "关闭则每次弹窗询问。"
-        )
-        sv.addWidget(self.feedback_auto_open_browser)
-        self.feedback_auto_hint = QLabel(
-            "开启后崩溃将自动打开 GitHub 预填页面；关闭则每次弹窗询问。")
-        self.feedback_auto_hint.setObjectName("settings.feedback.auto_hint")
-        self.feedback_auto_hint.setWordWrap(True)
-        sv.addWidget(self.feedback_auto_hint)
-        self.feedback_include_logs = QCheckBox("报告中附带最近日志（已脱敏）")
-        self.feedback_include_logs.setObjectName("settings.feedback.include_logs")
-        self.feedback_include_logs.setToolTip(
-            "只附最近若干行日志，且已抹掉密钥、路径与工程名；关掉后报告只剩版本与堆栈。"
-        )
-        sv.addWidget(self.feedback_include_logs)
         self.feedback_hint = QLabel(
-            "报告只写入本机文件夹；需要提交时由你点开浏览器，"
-            "面板不会自行上传任何内容。"
-        )
+            "出现崩溃或卡死时，插件会自动在后端生成脱敏诊断报告；联网时自动上传给作者用于修复，"
+            "并在本机保留副本。此过程不需要你登录或操作。")
         self.feedback_hint.setObjectName("settings.feedback.hint")
         self.feedback_hint.setWordWrap(True)
         sv.addWidget(self.feedback_hint)
-        self.feedback_notice_view = QPlainTextEdit()
-        self.feedback_notice_view.setObjectName("settings.feedback.notice")
-        self.feedback_notice_view.setReadOnly(True)
-        self.feedback_notice_view.setFrameShape(QPlainTextEdit.Shape.NoFrame)
-        self.feedback_notice_view.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.feedback_notice_view.setFixedHeight(U.px(104))
-        self.feedback_notice_view.setPlainText(feedbackbridge.privacy_notice())
-        self.feedback_notice_view.setToolTip("报告里包含什么、不包含什么，一次性说清。")
-        sv.addWidget(self.feedback_notice_view)
-        feedback_btn_row = QVBoxLayout()
-        feedback_btn_row.setSpacing(U.px(8))
-        self.feedback_report_btn = QPushButton("生成当前状态报告")
-        self.feedback_report_btn.setObjectName("settings.feedback.report")
-        self.feedback_report_btn.setToolTip("现在就把版本、日志与最近一次错误打包成一份本机报告")
-        self.feedback_report_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.feedback_report_btn.clicked.connect(self._generate_feedback_report)
-        feedback_btn_row.addWidget(self.feedback_report_btn)
-        self.feedback_dir_btn = QPushButton("打开报告文件夹")
-        self.feedback_dir_btn.setObjectName("settings.feedback.open_dir")
-        self.feedback_dir_btn.setToolTip("在资源管理器里查看本机保存的反馈报告")
-        self.feedback_dir_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.feedback_dir_btn.clicked.connect(self._open_feedback_dir)
-        feedback_btn_row.addWidget(self.feedback_dir_btn)
-        sv.addLayout(feedback_btn_row)
-        self._load_feedback_settings()
 
         # ---- 软件更新（只下载与校验安装包；真正的安装要用户关掉 ADS 后自己运行）
         self.update_heading = QLabel("软件更新")
@@ -3373,23 +3407,20 @@ class AgentPanelWidget(QWidget):
             section.setStyleSheet(f"color:{pal['text']};font-size:{U.fs('small')}px;font-weight:bold;"
                                  f"padding-top:{U.px(8)}px;")
         for hint in (self.cfg_hint, self.model_list_hint, self.model_editor_hint, self.shared_connection_hint,
-                     self.settings_save_hint, self.feedback_hint, self.feedback_auto_hint,
+                     self.settings_save_hint, self.feedback_hint,
                      self.update_status_label, self.update_hint):
             hint.setStyleSheet(
                 f"color:{pal['subtle']}; font-size:{U.fs('tiny')}px;"
                 "background:transparent;" + base
             )
-        for check in (self.feedback_enabled, self.feedback_auto_open_browser,
-                      self.feedback_include_logs, self.update_auto_check):
+        for check in (self.update_auto_check,):
             check.setStyleSheet(
                 f"QCheckBox{{color:{pal['text']};background:transparent;spacing:{U.px(8)}px;"
                 f"font-size:{U.fs('small')}px;{base}}}" + U.indicator_css(pal))
-        self.feedback_report_btn.setStyleSheet(_button_css(pal, "primary"))
-        self.feedback_dir_btn.setStyleSheet(_button_css(pal, "soft"))
         self.update_check_btn.setStyleSheet(_button_css(pal, "primary"))
         self.update_prepare_btn.setStyleSheet(_button_css(pal, "soft"))
         self.update_reveal_btn.setStyleSheet(_button_css(pal, "soft"))
-        for view in (self.feedback_notice_view, self.update_instruction_view):
+        for view in (self.update_instruction_view,):
             view.setStyleSheet(
                 f"QPlainTextEdit{{background:{pal['input_bg']};border:1px solid {pal['card_border']};"
                 f" border-radius:{U.R('md')}px; color:{pal['subtle']};"

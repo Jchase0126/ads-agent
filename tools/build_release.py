@@ -421,6 +421,8 @@ def build_staging(app_root: str, staging: str) -> tuple[list, dict]:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
 
+    _inject_feedback_token(staging)
+
     # 三个 bat 入口（版本号写进去，便于用户核对拿到的是哪一版）
     for name, body in _collect_bat_templates().items():
         dst = os.path.join(staging, name)
@@ -434,6 +436,32 @@ def build_staging(app_root: str, staging: str) -> tuple[list, dict]:
         packed.append((name, os.path.join(staging, name)))
     packed.sort()
     return packed, {"version": paths.PLUGIN_VERSION}
+
+
+def _inject_feedback_token(staging: str) -> str:
+    """把崩溃反馈的上传令牌注入包内 backend/feedback.py。
+
+    令牌来源：``tools/feedback_token.local``（gitignore，**永不入库**）。
+    没有这个文件就保持源码里的空串（= 用户端 fail-closed，只存本机不上传）。
+    源码里的 ``EMBEDDED_UPLOAD_TOKEN`` 恒为空 —— 凭据绝不进 git。
+    """
+    token_path = os.path.join(HERE, "feedback_token.local")
+    if not os.path.isfile(token_path):
+        return ""
+    with open(token_path, encoding="utf-8") as f:
+        token = f.read().strip()
+    if not token:
+        return ""
+    target = os.path.join(staging, "backend", "feedback.py")
+    with open(target, encoding="utf-8") as f:
+        body = f.read()
+    marker = 'EMBEDDED_UPLOAD_TOKEN = ""'
+    if marker not in body:
+        raise BuildError("backend/feedback.py 缺少 EMBEDDED_UPLOAD_TOKEN 注入点")
+    body = body.replace(marker, 'EMBEDDED_UPLOAD_TOKEN = "%s"' % token, 1)
+    with open(target, "w", encoding="utf-8", newline="") as f:
+        f.write(body)
+    return "injected"
 
 
 def write_manifest_txt(staging: str, packed: list, version: str) -> str:

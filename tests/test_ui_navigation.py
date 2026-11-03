@@ -17,6 +17,11 @@ from ui_fixtures import sample_job
 
 APP = QApplication.instance() or QApplication([])
 panel.AgentPanelWidget.reload_config = lambda self: None
+# 启动时延时的「检查更新」会真的打到 127.0.0.1:<port>：开发机上若恰好跑着
+# 旧版后端，会弹出「自动重启后端」提示框抢走焦点，让粘贴/焦点类断言随
+# 网络时机抖动。本套件不测更新逻辑（见 test_update_ui 的 mock），这里同
+# reload_config 一样做模块级桩。
+panel.AgentPanelWidget._maybe_check_updates_on_start = lambda self: None
 
 
 def make(w=330, h=520):

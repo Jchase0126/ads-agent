@@ -202,6 +202,96 @@ class UpdateTests(unittest.TestCase):
         self.assertIn("一次更新准备", second["message"])
 
 
+class ApplyTests(unittest.TestCase):
+    """一键更新 apply()：只认本模块暂存目录；保护开发检出与用户数据。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.app = tempfile.mkdtemp(dir=self.tmp.name)
+        self.target = patch.object(u.paths, "app_root", return_value=self.app)
+        self.target.start()
+        u._PREPARE_LAST_DIR.clear()
+
+    def tearDown(self):
+        self.target.stop()
+        u._PREPARE_LAST_DIR.clear()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _stage(app_dir, version="1.4.0", extra_pkg=()):
+        """伪造一个 prepare() 成功后的暂存目录，返回 (暂存目录, 单根目录)。"""
+        staging = tempfile.mkdtemp(prefix="adsagent-update-", dir=None)
+        root = os.path.join(staging, "ADSAgent-" + version)
+        os.makedirs(os.path.join(root, "backend"), exist_ok=True)
+        os.makedirs(os.path.join(root, "addon", "ads_agent"), exist_ok=True)
+        with open(os.path.join(root, "install_addon.py"), "w", encoding="utf-8") as fh:
+            fh.write("# installer\n")
+        with open(os.path.join(root, "install_addon.bat"), "w", encoding="utf-8") as fh:
+            fh.write("@echo off\r\n")
+        with open(os.path.join(root, "config.ini"), "w", encoding="utf-8") as fh:
+            fh.write("[feedback]\nauto_upload = true\n")
+        with open(os.path.join(root, "backend", "paths.py"), "w", encoding="utf-8") as fh:
+            fh.write('PLUGIN_VERSION = "%s"\n' % version)
+        for name, value in extra_pkg:
+            with open(os.path.join(root, name), "w", encoding="utf-8") as fh:
+                fh.write(value)
+        # 目标程序目录：完整的已安装形态
+        with open(os.path.join(app_dir, "install_addon.py"), "w", encoding="utf-8") as fh:
+            fh.write("# old installer\n")
+        os.makedirs(os.path.join(app_dir, "backend"), exist_ok=True)
+        with open(os.path.join(app_dir, "backend", "paths.py"), "w", encoding="utf-8") as fh:
+            fh.write('PLUGIN_VERSION = "1.3.4"\n')
+        with open(os.path.join(app_dir, "config.ini"), "w", encoding="utf-8") as fh:
+            fh.write("[feedback]\nauto_upload = false\nupload_token = keep-me\n")
+        return staging, root
+
+    def test_apply_without_staged_package_is_error(self):
+        result = u.apply()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("还没有准备好的更新包", result["message"])
+
+    def test_apply_copies_over_user_data_and_cleans_staging(self):
+        staging, _root = self._stage(self.app)
+        u._PREPARE_LAST_DIR.append(staging)
+        result = u.apply()
+        self.assertEqual(result["status"], "applied", result["message"])
+        self.assertEqual(result.get("applied_version"), "1.4.0")
+        self.assertGreater(result.get("files", 0), 0)
+        with open(os.path.join(self.app, "backend", "paths.py"), encoding="utf-8") as fh:
+            self.assertIn("1.4.0", fh.read())
+        # 用户数据永不被覆盖
+        with open(os.path.join(self.app, "config.ini"), encoding="utf-8") as fh:
+            content = fh.read()
+        self.assertIn("keep-me", content)
+        self.assertNotIn("auto_upload = true", content)
+        # 暂存目录已清空托管
+        self.assertEqual(u._PREPARE_LAST_DIR, [])
+        self.assertFalse(os.path.isdir(staging))
+
+    def test_apply_refuses_development_checkout(self):
+        staging, _root = self._stage(self.app)
+        os.makedirs(os.path.join(self.app, ".git"))
+        u._PREPARE_LAST_DIR.append(staging)
+        result = u.apply()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("开发检出", result["message"])
+        self.assertTrue(os.path.isdir(staging), "拒绝时不得删除暂存目录")
+
+    def test_apply_refuses_when_staging_lost_or_incomplete(self):
+        staging, _root = self._stage(self.app)
+        u._PREPARE_LAST_DIR.append(staging)
+        shutil.rmtree(staging)
+        self.assertEqual(u.apply()["status"], "error")
+        self.assertEqual(u._PREPARE_LAST_DIR, [], "目录已丢时应清空托管")
+
+        staging2, root2 = self._stage(self.app)
+        os.remove(os.path.join(root2, "install_addon.py"))
+        u._PREPARE_LAST_DIR.append(staging2)
+        result = u.apply()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("安装器", result["message"])
+
+
 class HttpTests(unittest.TestCase):
     def test_routes_require_auth_and_contract(self):
         import adslog

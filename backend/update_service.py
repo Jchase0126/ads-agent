@@ -257,6 +257,92 @@ def prepare():
         _PREPARE_LOCK.release()
 
 
+# ---------------------------------------------------------------------------
+# 应用更新：把已通过校验的暂存包覆盖到程序目录（面板"一键更新"用）。
+# ---------------------------------------------------------------------------
+def apply():
+    """把 prepare() 暂存的更新包复制进程序目录。
+
+    安全边界：
+    - 只使用本模块自己暂存的目录（``_PREPARE_LAST_DIR``），绝不接受客户端路径；
+    - 与 prepare 共用一把单飞锁，准备/应用不会并发交叉；
+    - 目标目录是开发检出（含 ``.git``）或缺少安装器时拒绝——保护源码工作区；
+    - 永不覆盖用户数据文件（config.ini / config.example.ini / user_data）；
+    - 覆盖失败时中止并如实报告（不做部分回滚，安装器本身也是就地覆盖语义）。
+    """
+    if not _PREPARE_LOCK.acquire(blocking=False):
+        return _result("error", "已有一次更新准备或安装在进行中，请稍后再试。")
+    try:
+        return _apply_locked()
+    finally:
+        _PREPARE_LOCK.release()
+
+
+def _apply_locked():
+    try:
+        if not _PREPARE_LAST_DIR:
+            return _result("error", "还没有准备好的更新包，请先检查并准备更新。")
+        directory = _PREPARE_LAST_DIR[-1]
+        if not os.path.isdir(directory):
+            _PREPARE_LAST_DIR.clear()
+            return _result("error", "准备好的更新包已丢失，请重新准备更新。")
+        # 暂存目录里是单根 ADSAgent-<ver>/ 的解包结果
+        roots = [n for n in os.listdir(directory)
+                 if os.path.isdir(os.path.join(directory, n))]
+        if len(roots) != 1:
+            return _result("error", "暂存的更新包结构异常，请重新准备更新。")
+        src_root = os.path.join(directory, roots[0])
+        if not os.path.isfile(os.path.join(src_root, "install_addon.py")):
+            return _result("error", "暂存的更新包缺少安装器，已中止应用。")
+        target = paths.app_root()
+        if os.path.isdir(os.path.join(target, ".git")):
+            return _result("error",
+                           "当前程序目录是开发检出（含 .git），自动更新不覆盖源码；"
+                           "请按「准备更新」给出的指引手动安装。")
+        if not os.path.isfile(os.path.join(target, "install_addon.py")):
+            return _result("error",
+                           "程序目录不完整（缺 install_addon.py），已中止自动更新；"
+                           "请重新解压安装包后手动安装。")
+        copied = 0
+        _SKIP_NAMES = {"config.ini", "config.example.ini", "ads_toolserver.log"}
+        for dirpath, _dirnames, filenames in os.walk(src_root):
+            rel = os.path.relpath(dirpath, src_root)
+            dst_dir = target if rel == "." else os.path.join(target, rel)
+            os.makedirs(dst_dir, exist_ok=True)
+            for fn in filenames:
+                if fn.lower() in _SKIP_NAMES:
+                    continue  # 用户配置与运行日志永不覆盖
+                dst = os.path.join(dst_dir, fn)
+                try:
+                    if os.path.exists(dst):
+                        os.chmod(dst, stat.S_IWUSR)
+                    shutil.copy2(os.path.join(dirpath, fn), dst)
+                    copied += 1
+                except PermissionError as exc:
+                    return _result(
+                        "error",
+                        f"更新中断：文件被占用（{os.path.relpath(dst, target)}）。"
+                        "请关闭所有 ADS 窗口与 ADS Agent 后端后重试。"
+                        f"（{type(exc).__name__}）")
+        shutil.rmtree(directory, ignore_errors=True)
+        _PREPARE_LAST_DIR.clear()
+        # 读出新版本号用于回执（复制后的 backend/paths.py）
+        new_version = ""
+        try:
+            with open(os.path.join(target, "backend", "paths.py"),
+                      encoding="utf-8") as fh:
+                m = re.search(r'PLUGIN_VERSION\s*=\s*"([^"]+)"', fh.read())
+            new_version = m.group(1) if m else ""
+        except Exception:  # noqa: BLE001 — 版本号读不出来不影响成功回执
+            pass
+        return _result("applied",
+                       f"已应用更新（覆盖 {copied} 个文件，版本 {new_version or '未知'}）；"
+                       "后端即将自动重启以加载新版本。",
+                       applied_version=new_version, files=copied)
+    except Exception as exc:  # noqa: BLE001
+        return _result("error", "应用更新失败：" + str(exc))
+
+
 def _prepare_locked():
     directory = None
     deadline = time.monotonic() + DEADLINE_S

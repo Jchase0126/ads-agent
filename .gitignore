@@ -6,6 +6,9 @@ __pycache__/
 
 # 令牌与密钥在这里（config.example.ini 是入库的模板）
 config.ini
+# 崩溃反馈自动上传用的 GitHub PAT（打包时由 tools/build_release.py 注入 zip，
+# 绝不进源码库；泄露了直接去 GitHub 吊销重建即可）
+tools/feedback_token.local
 
 # 日志 / 任务数据 / 仿真产物 / 会话数据
 logs/
