@@ -77,6 +77,21 @@ DEFAULTS = {
     "compute_python": "",
     # 计算作业目录（request/result/log 与进程记录）：留空用数据根下 compute_jobs。
     "compute_base_dir": "",
+    # ---- 崩溃反馈（2026-11-03）------------------------------------------
+    # 这些键都在 [feedback] 段。**刻意**用 feedback_ 前缀：backend/feedback.py
+    # 的 settings() 按**短键名**（enabled/auto_open_browser/...）合并调用方
+    # 传进来的 dict，若这里也叫 enabled，CFG 被整体传进去时就会互相顶掉。
+    # 后端的做法是 server.py 里显式映射成短键名再交给 feedback.settings()。
+    # 总开关：关掉后不装异常钩子、不写报告（心跳仍写，用于卡死判定）。
+    "feedback_enabled": True,
+    # 崩溃时自动用浏览器打开预填好的 GitHub issue 页（默认关：不打扰用户）。
+    "feedback_auto_open_browser": False,
+    # 报告里附上最近日志摘录（默认开：没有日志的崩溃报告基本没法看）。
+    "feedback_include_logs": True,
+    # 附多少行日志（feedback._tail_lines 内部再夹到 1..2000）。
+    "feedback_max_log_lines": 120,
+    # 卡死判定阈值（秒）：ADS 端心跳超过这么久没更新就认为卡住了。0 = 关闭判定。
+    "feedback_hang_seconds": 180,
 }
 
 
@@ -124,6 +139,12 @@ def load() -> dict:
     get("agent", "compute_base_dir", "compute_base_dir")
     get("models", "library_root", "model_library_root")
     get("datasheet", "runtime_python", "datasheet_runtime_python")
+    # 崩溃反馈（[feedback] 段，2026-11-03）
+    get_bool("feedback", "enabled", "feedback_enabled")
+    get_bool("feedback", "auto_open_browser", "feedback_auto_open_browser")
+    get_bool("feedback", "include_logs", "feedback_include_logs")
+    get("feedback", "max_log_lines", "feedback_max_log_lines", gi)
+    get("feedback", "hang_seconds", "feedback_hang_seconds", gi)
     # 留空时由共享库模块按当前 ADS Workspace 的父目录解析为同级 libraries。
     cfg["model_library_root"] = (
         os.environ.get("ADS_AGENT_LIBRARY_ROOT", "").strip()
@@ -406,3 +427,90 @@ def update_llm_settings(
         # 本次写入退化为无锁，极小概率丢更新 —— 面板/日志据此排查）
         "config_locked": locked,
     }
+
+
+#: [feedback] 段各键的 ini 键名 -> (出参名, 中文说明)
+_FEEDBACK_KEYS = {
+    "enabled": "feedback_enabled",
+    "auto_open_browser": "feedback_auto_open_browser",
+    "include_logs": "feedback_include_logs",
+    "max_log_lines": "feedback_max_log_lines",
+    "hang_seconds": "feedback_hang_seconds",
+}
+
+
+def update_feedback_settings(
+    enabled: bool | None = None,
+    auto_open_browser: bool | None = None,
+    include_logs: bool | None = None,
+    max_log_lines: int | None = None,
+    hang_seconds: int | None = None,
+) -> dict:
+    """把崩溃反馈的几个开关写进 config.ini 的 ``[feedback]`` 段。
+
+    只写**显式给出**的键：面板从不发这几个字段，所以缺省必须"不改"，
+    否则面板每次保存 LLM 设置都会把反馈开关重置回默认值。
+
+    写入同样走 ads_auth.edit_config —— 与令牌轮换、LLM 设置共用同一把
+    跨进程锁，避免整文件写回时互相覆盖。返回写入后的**实际生效值**
+    （长键名，与 load() 的 DEFAULTS 同名），server.py 据此刷新内存 CFG。
+    """
+    # 类型校验先做完再动文件：写一半才发现参数非法，会留下半截配置。
+    for name, value in (("enabled", enabled),
+                        ("auto_open_browser", auto_open_browser),
+                        ("include_logs", include_logs)):
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"反馈开关 {name} 必须为布尔值")
+    if max_log_lines is not None and (isinstance(max_log_lines, bool)
+                                      or not isinstance(max_log_lines, int)
+                                      or max_log_lines < 0):
+        raise ValueError("反馈日志行数必须为非负整数")
+    if hang_seconds is not None and (isinstance(hang_seconds, bool)
+                                     or not isinstance(hang_seconds, int)
+                                     or hang_seconds < 0):
+        raise ValueError("卡死判定秒数必须为非负整数")
+
+    updates: dict[str, str] = {}
+    if enabled is not None:
+        updates["enabled"] = "true" if enabled else "false"
+    if auto_open_browser is not None:
+        updates["auto_open_browser"] = "true" if auto_open_browser else "false"
+    if include_logs is not None:
+        updates["include_logs"] = "true" if include_logs else "false"
+    if max_log_lines is not None:
+        # feedback._tail_lines 自己会夹到 1..2000，这里只保证不写负数。
+        updates["max_log_lines"] = str(int(max_log_lines))
+    if hang_seconds is not None:
+        updates["hang_seconds"] = str(int(hang_seconds))
+
+    if updates:
+        def mutate(lines: list) -> None:
+            start = next((i for i, l in enumerate(lines)
+                          if l.strip().lower() == "[feedback]"), None)
+            if start is None:
+                if lines and lines[-1].strip():
+                    lines.append("")  # 段之间留空行，和手写的文件保持一致
+                lines.append("[feedback]")
+                start = len(lines) - 1
+            end = len(lines)  # 段落到下一个 [section] 头或文件末尾
+            for i in range(start + 1, len(lines)):
+                s = lines[i].strip()
+                if s.startswith("[") and s.endswith("]"):
+                    end = i
+                    break
+            for key, value in updates.items():
+                idx = next(
+                    (i for i in range(start + 1, end)
+                     if re.match(rf"{re.escape(key)}\s*=", lines[i])),
+                    None,
+                )
+                if idx is not None:
+                    lines[idx] = f"{key} = {value}"
+                else:
+                    lines.insert(end, f"{key} = {value}")
+                    end += 1
+
+        ads_auth.edit_config(mutate)
+
+    cfg = load()
+    return {out_key: cfg[out_key] for out_key in _FEEDBACK_KEYS.values()}

@@ -60,6 +60,7 @@ BACKEND_FILES = [
     "sample_adapters.py",  # SHA 锁定的已复核样本曲线映射（回归数据）
     "device_models.py",  # 有源器件建模引擎（选择/拟合/建图计划/验证）
     "device_library.py", # 器件模型身份/版本/发布/检索/跨工作区导入
+    "feedback.py",       # 崩溃/卡死反馈：脱敏、报告落盘、心跳看门狗、异常钩子
     "paths.py",          # **统一路径解析**（数据/程序双根）
     "rfcalc.py",         # RF 计算引擎（传输线/噪声/杂散/偏置，纯函数 stdlib）
     "server.py",         # HTTP/SSE 服务
@@ -80,6 +81,7 @@ ADDON_FILES = [
     "authbridge.py",     # 按文件路径加载共享令牌模块
     "backend_launcher.py",  # 拉起并监护后端进程
     "capability.py",     # 运行时能力检测 + 工具门禁（只读探测，三态）
+    "feedbackbridge.py", # 按文件路径加载后端 feedback，写面板心跳（卡死检测信号）
     "geometry_policy.py",  # 几何判定原语：ads_ops 顶层 import，规划/写入/复核共用
     "mdplain.py",        # 面板用的极简 Markdown
     "model_attachments.py", # 模型 ZIP 附件上传与卡片

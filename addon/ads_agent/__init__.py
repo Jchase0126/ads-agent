@@ -272,6 +272,13 @@ def generate_menu(addon, win_def) -> None:
                 None,
             )
         )
+        menu.add_action(
+            app.Action(
+                "报告问题 / 反馈崩溃…",
+                lambda action, window: _report_problem(),
+                None,
+            )
+        )
         tools_menu.add_menu(menu)
 
     # Arm the tool server + main-thread pump timer now (we are on the main
@@ -309,6 +316,27 @@ def _open_rfcalc_panel() -> None:
         rfcalc_panel.open_rfcalc_panel(parent)
     except Exception as e:  # noqa: BLE001
         _show_message("ADS Agent", "无法打开 RF 计算器", f"{type(e).__name__}: {e}", warning=True)
+
+
+def _report_problem() -> None:
+    """菜单项：打开面板设置页的「崩溃反馈」分组，让用户自己决定要不要提交。"""
+    try:
+        _ensure_sys_path()
+        import panel
+
+        widget = panel.open_panel()
+        # 设置页里的「崩溃反馈」分组需要滚动到可见位置，否则用户会以为菜单没反应。
+        try:
+            widget.settings_btn.setChecked(True)
+            widget.settings_scroll.ensureWidgetVisible(widget.feedback_notice_view)
+        except Exception:  # noqa: BLE001 — 面板版本不一致时退化为纯打开
+            pass
+    except Exception as e:  # noqa: BLE001 — 诊断入口绝不打断 ADS
+        try:
+            _show_message("ADS Agent", "无法打开崩溃反馈",
+                          f"{type(e).__name__}: {e}", warning=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _show_message(title: str, text: str, details: str = "", warning: bool = False) -> None:

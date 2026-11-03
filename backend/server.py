@@ -64,6 +64,7 @@ import agent
 import config as config_mod
 import design_job as design_job_mod
 import design_service as design_svc
+import feedback
 import llm as llm_mod
 import model_orchestration
 import model_store
@@ -229,6 +230,10 @@ def workspace_mismatch(current_path: str, target_workspace: str):
 _PID = None  # main() 里赋值；模块被测试导入时不依赖运行状态
 _STARTED_AT = ""
 
+# 崩溃反馈的心跳/看守线程（start_feedback_watch 里创建，daemon）
+_FEEDBACK_THREAD = None
+_FEEDBACK_STOP = None
+
 
 def _identity() -> dict:
     """本实例的身份（放进 /health，供面板/启动器判断"是不是自己那份安装"）。
@@ -259,7 +264,176 @@ def _config_status() -> dict:
         # 面板用它在状态栏如实描述"仿真期间界面会不会卡"
         "sim_off_main_thread": CFG["sim_off_main_thread"],
         "sim_timeout": CFG["sim_timeout"],
+        # 崩溃反馈的开关（[feedback] 段）。面板据此显示"崩溃时自动打开
+        # issue 页"之类的状态；写回走 POST /config 的 feedback_* 字段。
+        "feedback_enabled": bool(CFG.get("feedback_enabled", True)),
+        "feedback_auto_open_browser": bool(CFG.get("feedback_auto_open_browser", False)),
+        "feedback_include_logs": bool(CFG.get("feedback_include_logs", True)),
+        "feedback_max_log_lines": int(CFG.get("feedback_max_log_lines") or 120),
+        "feedback_hang_seconds": int(CFG.get("feedback_hang_seconds") or 0),
     }
+
+
+# ---------------------------------------------------------------------------
+# 崩溃反馈：配置映射 / 心跳线程 / 卡死看守（2026-11-03）
+# ---------------------------------------------------------------------------
+#: 后端自己写心跳用的名字。**刻意**与面板侧不同：ADS 端写心跳用的名字是
+#: feedback.HEARTBEAT_NAME（"ads_panel"），后端写 "backend" —— 各写各的，
+#: 后端要判定的是"ADS 主线程还转不转"，不能拿自己的心跳去判。
+_BACKEND_HEARTBEAT = "backend"
+
+#: 心跳与看守的间隔（秒）。必须明显小于 hang_seconds，否则发现不及时。
+_WATCH_INTERVAL_S = 30.0
+
+#: 报告正文的长度上限（字符）。feedback.build_report 内部还会再截到 12000。
+REPORT_MAX_CHARS = 20000
+
+#: 允许的上报类型。未知类型一律 400，不静默改成 error —— 那会让"卡死"
+#: 混进"崩溃"，去重指纹也就乱了。
+REPORT_KINDS = ("crash", "hang", "error")
+
+#: "这个 bug 又出现了"的统计窗口（秒）。与 feedback.record 的
+#: dedupe_window_s 默认值保持一致，两处口径不同会让面板显示自相矛盾。
+_DEDUPE_WINDOW_S = 600.0
+
+
+def _feedback_cfg() -> dict:
+    """把 CFG 里的 feedback_* **长键**映射成 feedback.settings() 认的**短键**。
+
+    不能直接把 CFG 交给 feedback.settings()：它只认
+    enabled/auto_open_browser/include_logs/max_log_lines/hang_seconds，
+    而 config.DEFAULTS 里刻意用的是 feedback_ 前缀（见那里的说明），
+    两边名字必须在这里接上，否则面板改了开关后端读到的还是默认值。
+    """
+    return {
+        "enabled": bool(CFG.get("feedback_enabled", True)),
+        "auto_open_browser": bool(CFG.get("feedback_auto_open_browser", False)),
+        "include_logs": bool(CFG.get("feedback_include_logs", True)),
+        "max_log_lines": int(CFG.get("feedback_max_log_lines") or 120),
+        "hang_seconds": int(CFG.get("feedback_hang_seconds") or 0),
+    }
+
+
+def _feedback_payload() -> dict:
+    """心跳里带一点"后端正在干什么"，卡死时能看出卡在哪类作业上。"""
+    payload = {"pid": os.getpid()}
+    try:
+        with _TURNS_LOCK:
+            payload["active_turns"] = len(_ACTIVE_TURNS)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        compute = agent.compute_health()
+        payload["compute"] = {
+            "available": bool(compute.get("available")),
+            "running": int(compute.get("running") or 0),
+            "queued": int(compute.get("queued") or 0),
+        }
+    except Exception:  # noqa: BLE001
+        pass
+    return payload
+
+
+def _check_hang(auto_record: bool = True) -> dict:
+    """读一次 ADS 端心跳，判定是否卡死；检出时**自动**生成一份报告。
+
+    ``auto_record`` 为真时，一旦发现"心跳陈旧且进程已经不在"，就调一次
+    feedback.record("hang", ...) —— 这就是"无人值守自动上报"的后端半边。
+    不在这里自己做去重：feedback.record 内置指纹去重（dedupe_window_s
+    默认 600s），重复调用只会返回 duplicate=True，不会刷出第二份报告。
+
+    任何异常都吞掉并降级成 {"stale": False, "error": ...}：看门狗坏掉
+    不能反过来把 /feedback/pending 拖成 500。
+    """
+    cfg = _feedback_cfg()
+    out = {
+        "heartbeat": feedback.HEARTBEAT_NAME,
+        "stale": False,
+        "age": None,
+        "pid": None,
+        "alive": False,
+        "limit": float(cfg["hang_seconds"]),
+        "payload": {},
+        "auto_reported": None,
+    }
+    try:
+        status = feedback.check_stale(feedback.HEARTBEAT_NAME, cfg["hang_seconds"])
+        out.update({k: status.get(k) for k in ("stale", "age", "pid", "alive", "limit")})
+        out["payload"] = status.get("payload") or {}
+    except Exception as e:  # noqa: BLE001
+        log.exception("读取卡死心跳失败: %s: %s", type(e).__name__, e)
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    if not auto_record or not out["stale"] or out["alive"]:
+        return out
+    # 心跳陈旧 + 进程已经不在 = 上一次运行是被掐断的（崩溃/强杀/卡死后被关）。
+    age = float(out["age"] or 0)
+    limit = float(out["limit"] or 0)
+    pid = out["pid"]
+    # 正文必须**逐字稳定**：fingerprint() 只吃 kind + error_text，把秒数
+    # 拼进正文会让每 30s 一次的看守各算出一个新指纹，"靠内置去重不重复
+    # 上报"就彻底失效了（实测：同一个卡死，age 3600/3630/3660 给出三个
+    # 不同指纹）。变化的数字只放进 context —— 它不参与指纹计算。
+    error_text = (
+        f"ADS 端疑似卡死：{feedback.HEARTBEAT_NAME} 的心跳长时间未更新，"
+        f"进程已不再响应。"
+    )
+    try:
+        result = feedback.record(
+            "hang", error_text,
+            context={
+                "source": "backend_watchdog",
+                "heartbeat": feedback.HEARTBEAT_NAME,
+                "age_s": round(age, 1),
+                "limit_s": round(limit, 1),
+                "pid": pid,
+            },
+            extra_names=(),
+        )
+        out["auto_reported"] = {
+            "duplicate": bool(result.get("duplicate")),
+            "fingerprint": result.get("fingerprint"),
+            "paths": result.get("paths") or {},
+        }
+        log.warning("检出 ADS 端卡死（心跳 %.0fs 未更新，进程 %s 不在），已自动生成反馈报告：%s",
+                    age, pid, (result.get("paths") or {}).get("json") or "（重复，未新增）")
+    except Exception as e:  # noqa: BLE001
+        log.exception("自动生成卡死报告失败: %s: %s", type(e).__name__, e)
+        out["auto_reported"] = {"error": f"{type(e).__name__}: {e}"}
+    return out
+
+
+def _feedback_loop(stop_event: threading.Event) -> None:
+    """后台看门狗：写自己的心跳，顺便周期性检查 ADS 端有没有卡死。
+
+    必须是 daemon 且绝不把异常抛出去 —— 这个线程只是"顺带看一眼"，
+    它挂了不能影响主服务，更不能让进程退出码变脏。
+    """
+    while not stop_event.wait(_WATCH_INTERVAL_S):
+        try:
+            feedback.write_heartbeat(_BACKEND_HEARTBEAT, _feedback_payload())
+        except Exception:  # noqa: BLE001
+            pass  # write_heartbeat 自己就不抛，这里只是双保险
+        try:
+            _check_hang(auto_record=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def start_feedback_watch() -> bool:
+    """启动心跳/看守线程（幂等：重复调用只有第一次生效）。"""
+    # 两个名字都要声明 global：_FEEDBACK_THREAD 先读后写，少了声明会被
+    # Python 当成局部变量，第一次调用就 UnboundLocalError。
+    global _FEEDBACK_THREAD, _FEEDBACK_STOP
+    if _FEEDBACK_THREAD is not None and _FEEDBACK_THREAD.is_alive():
+        return False
+    _FEEDBACK_STOP = threading.Event()
+    thread = threading.Thread(target=_feedback_loop, args=(_FEEDBACK_STOP,),
+                              name="feedback-watch", daemon=True)
+    thread.start()
+    _FEEDBACK_THREAD = thread
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1057,6 +1231,38 @@ class Handler(BaseHTTPRequestHandler):
                              "n_points": len(xs), "csv": "\n".join(lines)})
         elif path == "/config":
             self._send_json(_config_status())
+        elif path == "/feedback/pending":
+            # 面板/脚本查询"有没有待上报的崩溃"：窗口内重复出现的指纹
+            # + ADS 端心跳是否已经卡死（顺带触发一次自动上报）。
+            body = {"ok": True}
+            try:
+                body["duplicates"] = feedback.recent_duplicates(_DEDUPE_WINDOW_S)
+            except Exception as e:  # noqa: BLE001
+                log.exception("读取重复指纹失败: %s: %s", type(e).__name__, e)
+                body["duplicates"] = []
+                body["duplicates_error"] = f"{type(e).__name__}: {e}"
+            body["hang"] = _check_hang(auto_record=True)
+            self._send_json(body)
+        elif path == "/feedback/list":
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                limit = int((query.get("limit") or ["20"])[0])
+            except ValueError:
+                limit = 20
+            limit = max(1, min(limit, 200))
+            body = {"ok": True, "limit": limit}
+            try:
+                body["reports"] = feedback.list_reports(limit)
+                body["dir"] = feedback.feedback_dir(create=False)
+            except Exception as e:  # noqa: BLE001
+                log.exception("列出反馈报告失败: %s: %s", type(e).__name__, e)
+                body["ok"] = False
+                body["reports"] = []
+                body["error"] = f"{type(e).__name__}: {e}"
+            body["hooks"] = feedback.hooks_installed()
+            body["privacy_notice"] = feedback.PRIVACY_NOTICE
+            body["repo"] = feedback.FEEDBACK_REPO
+            self._send_json(body)
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1164,7 +1370,97 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": f"保存配置失败: {type(e).__name__}: {e}"}, 500)
                 return
             CFG.update(config_mod.load())  # apply immediately
+            # 任务书要求在 /config 里也能写这几个键。**只在请求体真的带了
+            # 它们时才写** —— 面板保存模型设置时从不带 feedback_* 字段，
+            # 若照抄"缺省即默认值"的写法，会把人家的反馈开关静默重置。
+            if any(k in body for k in (
+                    "feedback_enabled", "feedback_auto_open_browser",
+                    "feedback_include_logs", "feedback_max_log_lines",
+                    "feedback_hang_seconds")):
+                try:
+                    status.update(config_mod.update_feedback_settings(
+                        enabled=body.get("feedback_enabled"),
+                        auto_open_browser=body.get("feedback_auto_open_browser"),
+                        include_logs=body.get("feedback_include_logs"),
+                        max_log_lines=body.get("feedback_max_log_lines"),
+                        hang_seconds=body.get("feedback_hang_seconds"),
+                    ))
+                    CFG.update(config_mod.load())
+                except ValueError as e:
+                    self._send_json(
+                        {"error": f"保存反馈配置失败: {e}", **status}, 400)
+                    return
+                except Exception as e:  # noqa: BLE001
+                    log.exception("保存反馈配置失败: %s: %s", type(e).__name__, e)
+                    self._send_json(
+                        {"error": f"保存反馈配置失败: {type(e).__name__}: {e}"}, 500)
+                    return
             self._send_json({"ok": True, **status})
+            return
+
+        if self.path == "/config/feedback":
+            # 崩溃反馈的几个开关单独走一条：面板保存 LLM 设置时从不带这些
+            # 字段，混在 /config 里会让"保存模型"顺带把反馈开关写成默认值。
+            body = self._read_json(limit=20_000)
+            if body is None:
+                return
+            try:
+                status = config_mod.update_feedback_settings(
+                    enabled=body.get("feedback_enabled"),
+                    auto_open_browser=body.get("feedback_auto_open_browser"),
+                    include_logs=body.get("feedback_include_logs"),
+                    max_log_lines=body.get("feedback_max_log_lines"),
+                    hang_seconds=body.get("feedback_hang_seconds"),
+                )
+            except ValueError as e:
+                # 参数不合法是调用方的问题，按 400 回，别报成 500
+                self._send_json({"error": f"保存反馈配置失败: {e}"}, 400)
+                return
+            except Exception as e:  # noqa: BLE001
+                log.exception("保存反馈配置失败: %s: %s", type(e).__name__, e)
+                self._send_json({"error": f"保存反馈配置失败: {type(e).__name__}: {e}"}, 500)
+                return
+            CFG.update(config_mod.load())  # apply immediately
+            # 关掉总开关时把钩子卸掉？不做 —— 钩子已装的话继续装，
+            # feedback.record 内部会因为 enabled=False 直接返回空结构，
+            # 反而比"装一半卸一半"更容易排查。
+            self._send_json({"ok": True, **status})
+            return
+
+        if self.path == "/feedback/report":
+            body = self._read_json(limit=REPORT_MAX_CHARS * 4 + 20_000)
+            if body is None:
+                return
+            kind = str(body.get("kind") or "crash").strip().lower()
+            if kind not in REPORT_KINDS:
+                self._send_json(
+                    {"error": "kind 只接受 crash / hang / error",
+                     "kinds": list(REPORT_KINDS)}, 400)
+                return
+            error_text = body.get("error")
+            if not isinstance(error_text, str) or not error_text.strip():
+                self._send_json({"error": "缺少 error（崩溃/报错的原文，不能为空）"}, 400)
+                return
+            truncated = False
+            if len(error_text) > REPORT_MAX_CHARS:
+                # 超长直接截断而不是拒绝：用户手上的报错文本可能就是一大坨
+                # 日志，拒掉等于让人自己去删。截断位置在响应里如实说明。
+                error_text = error_text[:REPORT_MAX_CHARS]
+                truncated = True
+            context = body.get("context")
+            if context is not None and not isinstance(context, dict):
+                self._send_json({"error": "context 必须是 JSON 对象"}, 400)
+                return
+            try:
+                result = feedback.snapshot(kind, error_text, context or {})
+            except Exception as e:  # noqa: BLE001
+                log.exception("生成反馈报告失败: %s: %s", type(e).__name__, e)
+                self._send_json({"error": f"生成反馈报告失败: {type(e).__name__}: {e}"}, 500)
+                return
+            if truncated:
+                result["truncated"] = True
+                result["max_chars"] = REPORT_MAX_CHARS
+            self._send_json(result)
             return
 
         if self.path == "/test_connection":
@@ -1372,6 +1668,20 @@ def main():
                         len(broken), broken)
     except Exception as e:  # noqa: BLE001 — 同上
         log.exception("模型导入启动恢复失败: %s: %s", type(e).__name__, e)
+
+    # 崩溃反馈：装异常钩子（未捕获异常/线程崩溃 → 自动落一份报告），
+    # 并起心跳/看守线程。都在 serve_forever 之前，否则启动阶段崩了就没人管。
+    try:
+        if feedback.install_hooks({"source": "backend"}):
+            log.info("崩溃反馈钩子已安装（数据目录=%s）", feedback.feedback_dir(create=False))
+    except Exception as e:  # noqa: BLE001 — 反馈装不上不能挡住服务启动
+        log.exception("安装崩溃反馈钩子失败: %s: %s", type(e).__name__, e)
+    try:
+        if start_feedback_watch():
+            log.info("崩溃反馈看门狗已启动（间隔 %.0fs，卡死阈值 %ss）",
+                     _WATCH_INTERVAL_S, CFG.get("feedback_hang_seconds"))
+    except Exception as e:  # noqa: BLE001 — 同上
+        log.exception("启动崩溃反馈看门狗失败: %s: %s", type(e).__name__, e)
 
     print(f"[ADS Agent] backend listening on http://{host}:{port}")
     print(f"[ADS Agent] model: {CFG['llm_model']}  api_key: {'已配置' if CFG.get('llm_api_key') else '未配置!'}")

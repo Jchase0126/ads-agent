@@ -76,6 +76,7 @@ QPoint = QtCore.QPoint
 
 import uiscale as U
 import project_store
+import feedbackbridge
 from mdplain import to_plain
 
 from result_page import ResultPageRow
@@ -1700,6 +1701,204 @@ class AgentPanelWidget(QWidget):
         self.reload_config()
         self._fit_input_height()
         QTimer.singleShot(0, self._adapt_responsive)
+        self._start_feedback_heartbeat()
+
+    # ------------------------------------------------------------ 崩溃反馈（面板侧）
+    def _start_feedback_heartbeat(self):
+        """每 30 秒写一次心跳，供后端看门狗判断面板是否卡死。
+
+        刻意放在主线程（而不是独立线程）：主线程被长任务卡住正是要检测的信号，
+        换到旁路线程反而会在面板假死时继续"报平安"。
+        """
+        try:
+            self._feedback_beat = QTimer(self)
+            self._feedback_beat.setInterval(30000)
+            self._feedback_beat.timeout.connect(self._beat_feedback)
+            self._feedback_beat.start()
+            self._beat_feedback()  # 立刻写一次，避免刚启动的 30 秒是盲区
+        except BaseException:  # noqa: BLE001 - 诊断路径绝不打断面板初始化
+            pass
+
+    def _feedback_state(self) -> str:
+        try:
+            if getattr(self, '_worker', None) is not None:
+                return "running"
+            if getattr(self, '_run_error', ""):
+                return "error"
+            return "idle"
+        except BaseException:  # noqa: BLE001
+            return "idle"
+
+    def _beat_feedback(self):
+        try:
+            feedbackbridge.heartbeat(feedbackbridge.HEARTBEAT_NAME,
+                                     {"state": self._feedback_state()})
+        except BaseException:  # noqa: BLE001 - 心跳失败只影响看门狗，不影响用户
+            pass
+
+    def _load_feedback_settings(self):
+        """把 config.ini 的 [feedback] 段读进控件。
+
+        自己读 ini 而不是问后端：后端没起的时候开关也要能正确显示和保存。
+        """
+        try:
+            values = feedbackbridge.read_settings()
+        except BaseException:  # noqa: BLE001
+            values = dict(feedbackbridge.DEFAULTS)
+        try:
+            self.feedback_enabled.setChecked(bool(values.get("enabled", True)))
+            self.feedback_auto_open_browser.setChecked(
+                bool(values.get("auto_open_browser", False)))
+            self.feedback_include_logs.setChecked(bool(values.get("include_logs", True)))
+            self.feedback_notice_view.setPlainText(feedbackbridge.privacy_notice())
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _feedback_values(self) -> dict:
+        return {
+            "enabled": self.feedback_enabled.isChecked(),
+            "auto_open_browser": self.feedback_auto_open_browser.isChecked(),
+            "include_logs": self.feedback_include_logs.isChecked(),
+        }
+
+    def _persist_feedback_settings(self) -> bool:
+        """直写 config.ini 的 [feedback] 段（走 authbridge 的跨进程锁与原子替换）。"""
+        try:
+            return feedbackbridge.save_settings(self._feedback_values())
+        except BaseException:  # noqa: BLE001
+            return False
+
+    def _generate_feedback_report(self):
+        """用户主动生成一份本机报告：存盘 + 打开 issue 页 + 报告正文进剪贴板。"""
+        try:
+            error_text = (getattr(self, '_run_error', "") or "用户主动反馈")
+            context = {
+                "source": "settings",
+                "state": self._feedback_state(),
+                "include_logs": self.feedback_include_logs.isChecked(),
+            }
+            data = feedbackbridge.post_report("error", error_text, context)
+            self._finish_feedback_report(data)
+        except BaseException as exc:  # noqa: BLE001 - 诊断路径绝不抛
+            try:
+                self.status.setText(f"生成反馈报告失败：{type(exc).__name__}")
+            except BaseException:  # noqa: BLE001
+                pass
+
+    def _finish_feedback_report(self, data: dict):
+        """报告落盘后的收尾：提示、剪贴板、浏览器。后端不可用时退回本机快照。"""
+        try:
+            if not data or not data.get("ok"):
+                data = feedbackbridge.snapshot_local(
+                    "error", getattr(self, '_run_error', "") or "用户主动反馈",
+                    {"source": "settings"})
+        except BaseException:  # noqa: BLE001
+            data = {}
+        try:
+            if not data or not data.get("ok"):
+                reason = feedbackbridge.last_error() or "本机也无法生成报告"
+                self.status.setText(f"生成反馈报告失败：{reason}")
+                return
+            paths = data.get("paths") or []
+            self._copy_feedback_text(data.get("markdown") or "", paths)
+            url = (data.get("url") or "").strip()
+            if url:
+                self._open_external(url)
+            else:
+                self._open_feedback_dir()
+            hint = "报告已保存到本机"
+            if data.get("duplicate"):
+                hint += "（与最近一次报告的堆栈相同，已合并去重）"
+            self.status.setText(hint + "，可点「打开报告文件夹」查看。")
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _copy_feedback_text(self, markdown: str, paths=None):
+        """把报告正文放进剪贴板，方便用户粘贴到 issue 里。"""
+        text = markdown or ""
+        if not text:
+            try:
+                with open((paths or [""])[0], "r", encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+            except BaseException:  # noqa: BLE001 - 读不到就只复制链接
+                text = ""
+        if not text:
+            return
+        try:
+            QApplication.clipboard().setText(text)
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _open_external(self, url: str):
+        """用系统浏览器打开链接（面板自身不发任何网络请求）。"""
+        try:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _open_feedback_dir(self):
+        try:
+            target = feedbackbridge.dir(create=True)
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+        except BaseException as exc:  # noqa: BLE001
+            try:
+                self.status.setText(f"打开报告文件夹失败：{type(exc).__name__}")
+            except BaseException:  # noqa: BLE001
+                pass
+
+    def _maybe_offer_feedback(self, kind: str, error_text: str,
+                              context: dict | None = None):
+        """出错后非阻塞地询问是否上报；never-raise。"""
+        try:
+            if not self.feedback_enabled.isChecked():
+                return
+            data = feedbackbridge.post_report(kind, error_text, context or {})
+            if not data or not data.get("ok"):
+                data = feedbackbridge.snapshot_local(kind, error_text, context or {})
+            if not data or not data.get("ok"):
+                return
+            url = (data.get("url") or "").strip()
+            if self.feedback_auto_open_browser.isChecked():
+                if url:
+                    self._open_external(url)
+                return
+            self._ask_feedback(data, url, error_text)
+        except BaseException:  # noqa: BLE001 - 诊断路径绝不打断主流程
+            pass
+
+    def _ask_feedback(self, data: dict, url: str, error_text: str):
+        """三按钮询问框（非阻塞 show()）。"""
+        try:
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("ADS Agent")
+            box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+            box.setText("刚才那次操作出错了。")
+            box.setInformativeText(
+                "面板已经把这次错误的诊断报告存在本机。"
+                "要去 GitHub 反馈的话，可以打开已填好内容的 issue 页面。")
+            box.setDetailedText(error_text or "")
+            open_btn = box.addButton("打开 GitHub 填写",
+                                     QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            save_btn = box.addButton("只保存到本机",
+                                     QtWidgets.QMessageBox.ButtonRole.ActionRole)
+            box.addButton("忽略", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(save_btn)
+            box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            box.buttonClicked.connect(
+                lambda clicked: self._on_feedback_choice(clicked is open_btn, url))
+            box.show()
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _on_feedback_choice(self, open_browser: bool, url: str):
+        try:
+            if open_browser and url:
+                self._open_external(url)
+                self.status.setText("已在浏览器打开 issue 页面，报告正文已复制到剪贴板。")
+            else:
+                self.status.setText("报告已保存到本机（可在设置页打开报告文件夹）。")
+        except BaseException:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------ 小控件工厂
     def _round_tool_button(self, text: str, tip: str, checkable: bool = False) -> QToolButton:
@@ -2539,6 +2738,64 @@ class AgentPanelWidget(QWidget):
         self.shared_connection_hint = QLabel("同一供应商的模型共用 API 地址和密钥。")
         self.shared_connection_hint.setWordWrap(True)
         sv.addWidget(self.shared_connection_hint)
+
+        # ---- 崩溃反馈（诊断报告只存本机，不上传；面板只负责生成与打开）
+        self.feedback_heading = QLabel("崩溃反馈")
+        sv.addWidget(self.feedback_heading)
+        self.feedback_enabled = QCheckBox("启用崩溃/卡死诊断报告")
+        self.feedback_enabled.setObjectName("settings.feedback.enabled")
+        self.feedback_enabled.setToolTip(
+            "面板每 30 秒写一次心跳；后端发现心跳长时间不更新，就会把疑似卡死"
+            "记录成一份本机报告，方便你事后提交。"
+        )
+        sv.addWidget(self.feedback_enabled)
+        self.feedback_auto_open_browser = QCheckBox("崩溃后自动打开浏览器")
+        self.feedback_auto_open_browser.setObjectName("settings.feedback.auto_open_browser")
+        self.feedback_auto_open_browser.setToolTip(
+            "开启后崩溃时直接打开浏览器的 GitHub issue 预填页面，不再逐次询问；"
+            "关闭则每次弹窗询问。"
+        )
+        sv.addWidget(self.feedback_auto_open_browser)
+        self.feedback_include_logs = QCheckBox("报告中附带最近日志（已脱敏）")
+        self.feedback_include_logs.setObjectName("settings.feedback.include_logs")
+        self.feedback_include_logs.setToolTip(
+            "只附最近若干行日志，且已抹掉密钥、路径与工程名；关掉后报告只剩版本与堆栈。"
+        )
+        sv.addWidget(self.feedback_include_logs)
+        self.feedback_hint = QLabel(
+            "报告只写入本机文件夹；需要提交时由你点开浏览器，"
+            "面板不会自行上传任何内容。"
+        )
+        self.feedback_hint.setObjectName("settings.feedback.hint")
+        self.feedback_hint.setWordWrap(True)
+        sv.addWidget(self.feedback_hint)
+        self.feedback_notice_view = QPlainTextEdit()
+        self.feedback_notice_view.setObjectName("settings.feedback.notice")
+        self.feedback_notice_view.setReadOnly(True)
+        self.feedback_notice_view.setFrameShape(QPlainTextEdit.Shape.NoFrame)
+        self.feedback_notice_view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.feedback_notice_view.setFixedHeight(U.px(104))
+        self.feedback_notice_view.setPlainText(feedbackbridge.privacy_notice())
+        self.feedback_notice_view.setToolTip("报告里包含什么、不包含什么，一次性说清。")
+        sv.addWidget(self.feedback_notice_view)
+        feedback_btn_row = QHBoxLayout()
+        feedback_btn_row.setSpacing(U.px(8))
+        self.feedback_report_btn = QPushButton("生成报告")
+        self.feedback_report_btn.setObjectName("settings.feedback.report")
+        self.feedback_report_btn.setToolTip("现在就把版本、日志与最近一次错误打包成一份本机报告")
+        self.feedback_report_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.feedback_report_btn.clicked.connect(self._generate_feedback_report)
+        feedback_btn_row.addWidget(self.feedback_report_btn)
+        self.feedback_dir_btn = QPushButton("打开文件夹")
+        self.feedback_dir_btn.setObjectName("settings.feedback.open_dir")
+        self.feedback_dir_btn.setToolTip("在资源管理器里查看本机保存的反馈报告")
+        self.feedback_dir_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.feedback_dir_btn.clicked.connect(self._open_feedback_dir)
+        feedback_btn_row.addWidget(self.feedback_dir_btn)
+        sv.addLayout(feedback_btn_row)
+        self._load_feedback_settings()
+
         sv.addStretch(1)
         self.settings_scroll.setWidget(self.settings_box)
         footer = QHBoxLayout()
@@ -2616,15 +2873,28 @@ class AgentPanelWidget(QWidget):
         self.python_setting.setStyleSheet(
             f"QCheckBox{{color:{pal['text']};background:transparent;spacing:{U.px(8)}px;"
             f"font-size:{U.fs('small')}px;{base}}}" + U.indicator_css(pal))
-        for section in (self.connection_heading, self.model_label, self.permission_heading):
+        for section in (self.connection_heading, self.model_label, self.permission_heading,
+                        self.feedback_heading):
             section.setStyleSheet(f"color:{pal['text']};font-size:{U.fs('small')}px;font-weight:bold;"
                                  f"padding-top:{U.px(8)}px;")
         for hint in (self.cfg_hint, self.model_list_hint, self.model_editor_hint, self.shared_connection_hint,
-                     self.settings_save_hint):
+                     self.settings_save_hint, self.feedback_hint):
             hint.setStyleSheet(
                 f"color:{pal['subtle']}; font-size:{U.fs('tiny')}px;"
                 "background:transparent;" + base
             )
+        for check in (self.feedback_enabled, self.feedback_auto_open_browser,
+                      self.feedback_include_logs):
+            check.setStyleSheet(
+                f"QCheckBox{{color:{pal['text']};background:transparent;spacing:{U.px(8)}px;"
+                f"font-size:{U.fs('small')}px;{base}}}" + U.indicator_css(pal))
+        self.feedback_report_btn.setStyleSheet(_button_css(pal, "primary"))
+        self.feedback_dir_btn.setStyleSheet(_button_css(pal, "soft"))
+        self.feedback_notice_view.setStyleSheet(
+            f"QPlainTextEdit{{background:{pal['input_bg']};border:1px solid {pal['card_border']};"
+            f" border-radius:{U.R('md')}px; color:{pal['subtle']};"
+            f" font-size:{U.fs('tiny')}px; padding:{U.px(6)}px;" + base + "}"
+        )
         self.get_key_label.setStyleSheet(
             f"font-size:{U.fs('tiny')}px; background:transparent;" + base
         )
@@ -3272,6 +3542,8 @@ class AgentPanelWidget(QWidget):
     def _save_settings(self):
         if self._profile_loading:
             return
+        # 反馈开关是纯本机行为，先落盘；后端没起或模型没填也照样生效。
+        self._persist_feedback_settings()
         model = self.model_combo.currentText().strip()
         if not model or not self.base_url_edit.text().strip():
             self.cfg_hint.setText("请填写模型名称和 API 地址。")
@@ -5202,6 +5474,8 @@ class AgentPanelWidget(QWidget):
                 self._run_error = "执行失败：" + ev.get('message', '')
                 self._run_error_project = project
                 self.status.setText(self._run_error)
+                self._maybe_offer_feedback("error", self._run_error,
+                                           {"source": "chat", "tool": ev.get("tool") or ""})
 
         if foreground:
             self._sync_context_usage()

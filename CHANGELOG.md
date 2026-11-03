@@ -1,5 +1,29 @@
 # 更新记录
 
+## 1.3.2 — 2026-11-03（崩溃/卡死反馈）
+
+新增**故障反馈通道**：崩溃、卡死或工具报错时一键生成脱敏诊断报告，并打开
+预填好的 GitHub issue 页面由用户提交。详见 [docs/releases/1.3.2.md](docs/releases/1.3.2.md)。
+
+- **一键报告**：面板「设置 → 崩溃反馈」生成 Markdown 报告（复制到剪贴板）+
+  打开预填 issue 页；插件**不发送任何网络请求**、不内置凭据，提交由用户在浏览器完成。
+- **崩溃捕获**：`backend/feedback.py` 安装 `sys.excepthook` +
+  `threading.excepthook`，主线程与后台线程的未捕获异常自动留档。
+- **卡死看门狗**：面板每 30 秒写心跳文件，后端读取；超过 `hang_seconds`
+  （默认 180s）未更新即记录疑似卡死报告（心跳文件而非进程内计时——真卡死时
+  卡住的线程自己也不会跑）。
+- **弹窗/自动双触发**：默认故障后弹窗询问；勾选「崩溃后自动打开浏览器」后跳过
+  询问直接打开预填页。隐私声明完整展示在设置页，`[feedback]` 段五个开关可随时改。
+- **隐私边界**：只含版本/系统/异常栈/工具名/脱敏日志尾；密钥、本机路径与用户名、
+  设计名与工程名、对话与设计内容一律不发。三道脱敏：令牌 → `<本机路径>` →
+  ≥40 字符长串屏蔽；调用方另点名屏蔽当前设计/Workspace 名。
+- **新文件**：`backend/feedback.py`、`addon/ads_agent/feedbackbridge.py`
+  （均已登记进 `release_manifest.py` 白名单，安装自检会核对）。
+- **测试**：新增 `tests/test_feedback.py`（19 项）、`tests/test_feedback_http.py`
+  （11 项）、`tests/test_feedback_panel.py`（13 项），其中
+  `test_heartbeat_name_matches_panel_bridge` 专钉「面板与后端心跳名一致」
+  （漂移会让卡死检测静默失效）。
+
 ## 1.3.1 — 2026-11-03（安装完整性修复）
 
 修复 v1.3.0 全新安装后**所有工具报 HTTP 500 / `KeyError: 'result'`** 的通用
