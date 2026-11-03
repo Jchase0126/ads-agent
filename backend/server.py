@@ -70,6 +70,7 @@ import model_orchestration
 import model_store
 import model_tools
 import shared_models
+import update_service
 import tools as tools_mod
 from tools import TOOLS
 
@@ -1129,6 +1130,9 @@ class Handler(BaseHTTPRequestHandler):
         # /health 保持开放：插件启动探测、check_env.py 都靠它判断后端是否活着
         if path != "/health" and not self._authorized():
             return
+        if path == "/updates/check":
+            self._send_json(update_service.check())
+            return
         if path.startswith("/models/"):
             self._handle_models("GET", path)
             return
@@ -1270,6 +1274,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         # 所有 POST 都是可操作接口（改配置 / 驱动 Agent），一律先鉴权
         if not self._authorized():
+            return
+        if self.path == "/updates/prepare":
+            body = self._read_json()
+            if body is None:
+                return
+            if body:
+                self._send_json({"status": "error", "message": "请求体必须是空 JSON 对象"}, 400)
+                return
+            self._send_json(update_service.prepare())
             return
         if self.path == "/chat/cancel":
             body = self._read_json() or {}

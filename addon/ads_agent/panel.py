@@ -1702,6 +1702,7 @@ class AgentPanelWidget(QWidget):
         self._fit_input_height()
         QTimer.singleShot(0, self._adapt_responsive)
         self._start_feedback_heartbeat()
+        self._maybe_check_updates_on_start()
 
     # ------------------------------------------------------------ 崩溃反馈（面板侧）
     def _start_feedback_heartbeat(self):
@@ -1897,6 +1898,290 @@ class AgentPanelWidget(QWidget):
                 self.status.setText("已在浏览器打开 issue 页面，报告正文已复制到剪贴板。")
             else:
                 self.status.setText("报告已保存到本机（可在设置页打开报告文件夹）。")
+        except BaseException:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------ 软件更新（面板侧）
+    def _load_update_settings(self):
+        """读启动时是否自动检查更新的开关。默认开启（只查版本号，不下载）。"""
+        try:
+            raw = _setting("updates", "auto_check", "true").strip().lower()
+            self.update_auto_check.setChecked(raw in ("1", "true", "yes", "on"))
+        except BaseException:  # noqa: BLE001
+            try:
+                self.update_auto_check.setChecked(True)
+            except BaseException:  # noqa: BLE001
+                pass
+
+    def _save_update_settings(self) -> bool:
+        """把「启动时自动检查」写回 config.ini 的 [updates] 段。"""
+        try:
+            import authbridge
+
+            want = "true" if self.update_auto_check.isChecked() else "false"
+
+            def mutate(lines):
+                start = next((i for i, line in enumerate(lines)
+                              if line.strip().lower() == "[updates]"), None)
+                if start is None:
+                    if lines and lines[-1].strip():
+                        lines.append("")
+                    lines.append("[updates]")
+                    start = len(lines) - 1
+                end = len(lines)
+                for i in range(start + 1, len(lines)):
+                    stripped = lines[i].strip()
+                    if stripped.startswith("[") and stripped.endswith("]"):
+                        end = i
+                        break
+                for i in range(start + 1, end):
+                    stripped = lines[i].strip()
+                    if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+                        continue
+                    if stripped.split("=", 1)[0].strip().lower() == "auto_check":
+                        lines[i] = "auto_check = " + want
+                        return
+                lines.insert(end, "auto_check = " + want)
+
+            authbridge.auth().edit_config(mutate)
+            return True
+        except BaseException:  # noqa: BLE001 - 设置写不进去不该打断用户
+            return False
+
+    def _update_state(self, status: str, message: str, current: str = "",
+                      latest: str = "", **extra):
+        """把后端状态翻成面板文案。**只有 prepare 成功才说「已下载校验」，永不说已安装。**"""
+        try:
+            self._update_last = {"status": status, "message": message,
+                                 "current_version": current, "latest_version": latest,
+                                 "instruction": extra.get("instruction", ""),
+                                 "package_path": extra.get("package_path", ""),
+                                 "installer_path": extra.get("installer_path", "")}
+        except BaseException:  # noqa: BLE001
+            pass
+        text = message or ""
+        try:
+            if status == "up_to_date":
+                detail = f"已是最新版本（{current}）。" if current else "已是最新版本。"
+                self.update_status_label.setText(detail + ((" " + text) if text else ""))
+                self.update_prepare_btn.setEnabled(False)
+                self.update_reveal_btn.setEnabled(bool(getattr(self, "_update_ready_path", "")))
+            elif status == "update_available":
+                detail = f"发现新版本 {latest}" + (f"（当前 {current}）" if current else "") + "。"
+                self.update_status_label.setText(detail + " 点「准备更新」可下载并校验安装包。")
+                self.update_prepare_btn.setEnabled(True)
+                self.update_instruction_view.hide()
+            elif status == "ready":
+                detail = f"更新包已下载并通过校验（{latest}），但尚未安装。"
+                self.update_status_label.setText(detail)
+                self.update_prepare_btn.setEnabled(False)
+                self.update_instruction_view.setPlainText(
+                    (extra.get("instruction") or "") +
+                    (("\n\n安装器位置：" + extra["installer_path"])
+                     if extra.get("installer_path") else ""))
+                self.update_instruction_view.show()
+                self._update_ready_path = extra.get("installer_path") or extra.get("package_path") or ""
+                self.update_reveal_btn.setEnabled(bool(self._update_ready_path))
+            elif status == "checking":
+                self.update_status_label.setText("正在检查更新…（不会下载任何文件）")
+                self.update_check_btn.setEnabled(False)
+                self.update_prepare_btn.setEnabled(False)
+            elif status == "preparing":
+                self.update_status_label.setText("正在下载并校验安装包，请稍候…（不要关闭 ADS）")
+                self.update_prepare_btn.setEnabled(False)
+                self.update_reveal_btn.setEnabled(False)
+            else:  # error / 未知
+                reason = text or "后端没有给出原因"
+                prefix = "准备更新失败" if "准备更新失败" in reason else "更新检查失败"
+                # 后端已把原因写在 message 里时，不要再叠一层同样的话
+                if reason.startswith(prefix):
+                    self.update_status_label.setText(reason)
+                else:
+                    self.update_status_label.setText(f"{prefix}：{reason}")
+                self.update_prepare_btn.setEnabled(False)
+                self.update_instruction_view.hide()
+        except BaseException:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                self.update_check_btn.setEnabled(status not in ("checking", "preparing"))
+            except BaseException:  # noqa: BLE001
+                pass
+
+    def _check_updates(self, silent: bool = False, on_available=None):
+        """后台线程查更新，绝不阻塞 UI；失败静默（silent）或显示原因。"""
+        try:
+            if getattr(self, "_update_checking", False):
+                return
+            self._update_checking = True
+            if not silent:
+                self._update_state("checking", "")
+            worker = ConfigWorker(None, path="/updates/check", timeout=30)
+            worker.result.connect(
+                lambda data, s=silent, cb=on_available: self._on_update_checked(data, s, cb))
+            worker.finished.connect(lambda w=worker: self._gc_update_worker(w))
+            self._update_workers = getattr(self, "_update_workers", [])
+            self._update_workers.append(worker)
+            worker.start()
+        except BaseException:  # noqa: BLE001 - 更新检查绝不打断用户
+            self._update_checking = False
+            if not silent:
+                try:
+                    self.update_status_label.setText("更新检查启动失败（面板内部错误）。")
+                except BaseException:  # noqa: BLE001
+                    pass
+
+    def _gc_update_worker(self, worker):
+        try:
+            workers = getattr(self, "_update_workers", [])
+            if worker in workers:
+                workers.remove(worker)
+        except BaseException:  # noqa: BLE001
+            pass
+        finally:
+            self._update_checking = False
+
+    def _on_update_checked(self, data: dict, silent: bool = False, on_available=None):
+        try:
+            data = data or {}
+            if "error" in data and "status" not in data:
+                if not silent:
+                    self._update_state("error", data.get("error", ""))
+                return
+            status = str(data.get("status") or "").strip()
+            current = str(data.get("current_version") or "")
+            latest = str(data.get("latest_version") or "")
+            message = str(data.get("message") or "")
+            if status == "update_available":
+                self._update_state(status, message, current, latest)
+                if callable(on_available):
+                    on_available(data)
+                elif silent:
+                    # 启动时静默检查发现新版本：只提示，不自动下载、不弹模态框。
+                    try:
+                        self.status.setText(f"发现新版本 {latest}，可在设置页「软件更新」里准备更新。")
+                    except BaseException:  # noqa: BLE001
+                        pass
+            elif status == "up_to_date":
+                if not silent:
+                    self._update_state(status, message, current, latest)
+            else:
+                if not silent:
+                    self._update_state("error", message or "检查更新失败")
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _confirm_prepare_update(self):
+        """准备更新前的确认框：说清「只是下载，不会安装」。"""
+        try:
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("准备更新")
+            box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+            box.setText("现在下载并校验新版安装包？")
+            box.setInformativeText(
+                "这一步只会把安装包下载到本机临时目录并做 SHA-256 校验，"
+                "**不会安装，也不会改动你当前的 ADS 和用户数据**。\n\n"
+                "安装需要：先保存工作 → 关闭全部 ADS 窗口和后端 → 手动双击安装器。")
+            yes = box.addButton("下载并校验", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("取消", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(yes)
+            box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            box.buttonClicked.connect(lambda clicked: self._on_prepare_choice(clicked is yes))
+            box.show()
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _on_prepare_choice(self, confirmed: bool):
+        if not confirmed:
+            return
+        self._prepare_update()
+
+    def _prepare_update(self):
+        """后台下载+校验；只有后端回 ready 才允许展示安装说明。"""
+        try:
+            if getattr(self, "_update_preparing", False):
+                return
+            self._update_preparing = True
+            self._update_state("preparing", "")
+            worker = ConfigWorker({}, path="/updates/prepare", timeout=600)
+            worker.result.connect(self._on_update_prepared)
+            worker.finished.connect(lambda w=worker: self._gc_prepare_worker(w))
+            self._update_workers = getattr(self, "_update_workers", [])
+            self._update_workers.append(worker)
+            worker.start()
+        except BaseException:  # noqa: BLE001
+            self._update_preparing = False
+            try:
+                self.update_status_label.setText("准备更新启动失败（面板内部错误），未下载任何文件。")
+            except BaseException:  # noqa: BLE001
+                pass
+
+    def _gc_prepare_worker(self, worker):
+        try:
+            workers = getattr(self, "_update_workers", [])
+            if worker in workers:
+                workers.remove(worker)
+        except BaseException:  # noqa: BLE001
+            pass
+        finally:
+            self._update_preparing = False
+
+    def _on_update_prepared(self, data: dict):
+        try:
+            data = data or {}
+            if "error" in data and "status" not in data:
+                self._update_state("error", data.get("error", ""))
+                return
+            status = str(data.get("status") or "").strip()
+            current = str(data.get("current_version") or "")
+            latest = str(data.get("latest_version") or "")
+            message = str(data.get("message") or "")
+            if status == "ready":
+                self._update_state("ready", message, current, latest,
+                                   instruction=str(data.get("instruction") or ""),
+                                   package_path=str(data.get("package_path") or ""),
+                                   installer_path=str(data.get("installer_path") or ""))
+                try:
+                    self.status.setText("安装包已下载校验，但仍需关闭 ADS 后手动运行安装器。")
+                except BaseException:  # noqa: BLE001
+                    pass
+            elif status == "up_to_date":
+                self._update_state(status, message, current, latest)
+            else:
+                self._update_state("error", message or "准备更新失败，未修改任何文件")
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _reveal_update_package(self):
+        """在资源管理器里定位安装器。只定位，不执行。"""
+        try:
+            target = getattr(self, "_update_ready_path", "")
+            if not target:
+                self.status.setText("还没有已下载的安装包。")
+                return
+            target = os.path.normpath(target)
+            folder = target if os.path.isdir(target) else os.path.dirname(target)
+            if not os.path.isdir(folder):
+                self.status.setText("安装包目录不存在了（可能已被清理），请重新准备更新。")
+                self.update_reveal_btn.setEnabled(False)
+                return
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
+        except BaseException as exc:  # noqa: BLE001
+            try:
+                self.status.setText(f"打开安装包目录失败：{type(exc).__name__}")
+            except BaseException:  # noqa: BLE001
+                pass
+
+    def _maybe_check_updates_on_start(self):
+        """启动后的静默更新检查：延时几秒，避开面板首屏渲染。"""
+        try:
+            if not self.update_auto_check.isChecked():
+                return
+            self._update_timer = QTimer(self)
+            self._update_timer.setSingleShot(True)
+            self._update_timer.setInterval(6000)
+            self._update_timer.timeout.connect(lambda: self._check_updates(silent=True))
+            self._update_timer.start()
         except BaseException:  # noqa: BLE001
             pass
 
@@ -2756,6 +3041,11 @@ class AgentPanelWidget(QWidget):
             "关闭则每次弹窗询问。"
         )
         sv.addWidget(self.feedback_auto_open_browser)
+        self.feedback_auto_hint = QLabel(
+            "开启后崩溃将自动打开 GitHub 预填页面；关闭则每次弹窗询问。")
+        self.feedback_auto_hint.setObjectName("settings.feedback.auto_hint")
+        self.feedback_auto_hint.setWordWrap(True)
+        sv.addWidget(self.feedback_auto_hint)
         self.feedback_include_logs = QCheckBox("报告中附带最近日志（已脱敏）")
         self.feedback_include_logs.setObjectName("settings.feedback.include_logs")
         self.feedback_include_logs.setToolTip(
@@ -2779,15 +3069,15 @@ class AgentPanelWidget(QWidget):
         self.feedback_notice_view.setPlainText(feedbackbridge.privacy_notice())
         self.feedback_notice_view.setToolTip("报告里包含什么、不包含什么，一次性说清。")
         sv.addWidget(self.feedback_notice_view)
-        feedback_btn_row = QHBoxLayout()
+        feedback_btn_row = QVBoxLayout()
         feedback_btn_row.setSpacing(U.px(8))
-        self.feedback_report_btn = QPushButton("生成报告")
+        self.feedback_report_btn = QPushButton("生成当前状态报告")
         self.feedback_report_btn.setObjectName("settings.feedback.report")
         self.feedback_report_btn.setToolTip("现在就把版本、日志与最近一次错误打包成一份本机报告")
         self.feedback_report_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.feedback_report_btn.clicked.connect(self._generate_feedback_report)
         feedback_btn_row.addWidget(self.feedback_report_btn)
-        self.feedback_dir_btn = QPushButton("打开文件夹")
+        self.feedback_dir_btn = QPushButton("打开报告文件夹")
         self.feedback_dir_btn.setObjectName("settings.feedback.open_dir")
         self.feedback_dir_btn.setToolTip("在资源管理器里查看本机保存的反馈报告")
         self.feedback_dir_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2795,6 +3085,61 @@ class AgentPanelWidget(QWidget):
         feedback_btn_row.addWidget(self.feedback_dir_btn)
         sv.addLayout(feedback_btn_row)
         self._load_feedback_settings()
+
+        # ---- 软件更新（只下载与校验安装包；真正的安装要用户关掉 ADS 后自己运行）
+        self.update_heading = QLabel("软件更新")
+        sv.addWidget(self.update_heading)
+        self.update_status_label = QLabel("还没有检查过更新。")
+        self.update_status_label.setObjectName("settings.update.status")
+        self.update_status_label.setWordWrap(True)
+        sv.addWidget(self.update_status_label)
+        self.update_auto_check = QCheckBox("启动时自动检查更新")
+        self.update_auto_check.setObjectName("settings.update.auto_check")
+        self.update_auto_check.setToolTip("只查询版本号，不下载、不安装；关掉后仅在你点按钮时才检查。")
+        sv.addWidget(self.update_auto_check)
+        update_btn_row = QVBoxLayout()
+        update_btn_row.setSpacing(U.px(8))
+        self.update_check_btn = QPushButton("检查更新")
+        self.update_check_btn.setObjectName("settings.update.check")
+        self.update_check_btn.setToolTip("向后端查询最新稳定版本，不会下载任何文件")
+        self.update_check_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_check_btn.clicked.connect(lambda: self._check_updates(silent=False))
+        update_btn_row.addWidget(self.update_check_btn)
+        self.update_prepare_btn = QPushButton("准备更新（仅下载与校验，不安装）")
+        self.update_prepare_btn.setObjectName("settings.update.prepare")
+        self.update_prepare_btn.setToolTip(
+            "下载新版安装包并做 SHA-256 校验，解压到临时目录；"
+            "安装仍需要你关闭 ADS 后自行运行安装器。")
+        self.update_prepare_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_prepare_btn.setEnabled(False)
+        self.update_prepare_btn.clicked.connect(self._confirm_prepare_update)
+        update_btn_row.addWidget(self.update_prepare_btn)
+        self.update_reveal_btn = QPushButton("打开安装包所在文件夹")
+        self.update_reveal_btn.setObjectName("settings.update.reveal")
+        self.update_reveal_btn.setToolTip(
+            "在资源管理器里定位已解压的安装器；面板不会替你运行它。")
+        self.update_reveal_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_reveal_btn.setEnabled(False)
+        self.update_reveal_btn.clicked.connect(self._reveal_update_package)
+        update_btn_row.addWidget(self.update_reveal_btn)
+        sv.addLayout(update_btn_row)
+        self.update_instruction_view = QPlainTextEdit()
+        self.update_instruction_view.setObjectName("settings.update.instruction")
+        self.update_instruction_view.setReadOnly(True)
+        self.update_instruction_view.setFrameShape(QPlainTextEdit.Shape.NoFrame)
+        self.update_instruction_view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.update_instruction_view.setFixedHeight(U.px(120))
+        self.update_instruction_view.setPlainText("")
+        self.update_instruction_view.hide()
+        sv.addWidget(self.update_instruction_view)
+        self.update_hint = QLabel(
+            "面板只负责下载与校验安装包；安装需要你关闭全部 ADS 窗口后手动运行安装器，"
+            "面板不会自动替换任何文件。")
+        self.update_hint.setObjectName("settings.update.hint")
+        self.update_hint.setWordWrap(True)
+        sv.addWidget(self.update_hint)
+        self._load_update_settings()
 
         sv.addStretch(1)
         self.settings_scroll.setWidget(self.settings_box)
@@ -2874,27 +3219,32 @@ class AgentPanelWidget(QWidget):
             f"QCheckBox{{color:{pal['text']};background:transparent;spacing:{U.px(8)}px;"
             f"font-size:{U.fs('small')}px;{base}}}" + U.indicator_css(pal))
         for section in (self.connection_heading, self.model_label, self.permission_heading,
-                        self.feedback_heading):
+                        self.feedback_heading, self.update_heading):
             section.setStyleSheet(f"color:{pal['text']};font-size:{U.fs('small')}px;font-weight:bold;"
                                  f"padding-top:{U.px(8)}px;")
         for hint in (self.cfg_hint, self.model_list_hint, self.model_editor_hint, self.shared_connection_hint,
-                     self.settings_save_hint, self.feedback_hint):
+                     self.settings_save_hint, self.feedback_hint, self.feedback_auto_hint,
+                     self.update_status_label, self.update_hint):
             hint.setStyleSheet(
                 f"color:{pal['subtle']}; font-size:{U.fs('tiny')}px;"
                 "background:transparent;" + base
             )
         for check in (self.feedback_enabled, self.feedback_auto_open_browser,
-                      self.feedback_include_logs):
+                      self.feedback_include_logs, self.update_auto_check):
             check.setStyleSheet(
                 f"QCheckBox{{color:{pal['text']};background:transparent;spacing:{U.px(8)}px;"
                 f"font-size:{U.fs('small')}px;{base}}}" + U.indicator_css(pal))
         self.feedback_report_btn.setStyleSheet(_button_css(pal, "primary"))
         self.feedback_dir_btn.setStyleSheet(_button_css(pal, "soft"))
-        self.feedback_notice_view.setStyleSheet(
-            f"QPlainTextEdit{{background:{pal['input_bg']};border:1px solid {pal['card_border']};"
-            f" border-radius:{U.R('md')}px; color:{pal['subtle']};"
-            f" font-size:{U.fs('tiny')}px; padding:{U.px(6)}px;" + base + "}"
-        )
+        self.update_check_btn.setStyleSheet(_button_css(pal, "primary"))
+        self.update_prepare_btn.setStyleSheet(_button_css(pal, "soft"))
+        self.update_reveal_btn.setStyleSheet(_button_css(pal, "soft"))
+        for view in (self.feedback_notice_view, self.update_instruction_view):
+            view.setStyleSheet(
+                f"QPlainTextEdit{{background:{pal['input_bg']};border:1px solid {pal['card_border']};"
+                f" border-radius:{U.R('md')}px; color:{pal['subtle']};"
+                f" font-size:{U.fs('tiny')}px; padding:{U.px(6)}px;" + base + "}"
+            )
         self.get_key_label.setStyleSheet(
             f"font-size:{U.fs('tiny')}px; background:transparent;" + base
         )
@@ -3544,6 +3894,7 @@ class AgentPanelWidget(QWidget):
             return
         # 反馈开关是纯本机行为，先落盘；后端没起或模型没填也照样生效。
         self._persist_feedback_settings()
+        self._save_update_settings()
         model = self.model_combo.currentText().strip()
         if not model or not self.base_url_edit.text().strip():
             self.cfg_hint.setText("请填写模型名称和 API 地址。")

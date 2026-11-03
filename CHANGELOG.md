@@ -1,5 +1,23 @@
 # 更新记录
 
+## 1.3.3 — 2026-11-03（更新推送）
+
+联网检测 GitHub Release 新版本：设置页新增「软件更新」，启动静默检查（可关），
+发现新版本后可一键**下载并通过 SHA-256 校验**——只下载与暂存，不自动安装；
+面板给出指引：关闭 ADS 与后端后手动双击安装器完成升级。详见 [docs/releases/1.3.3.md](docs/releases/1.3.3.md)。
+
+- **安全边界**：只信 GitHub API 的 release 元数据与 asset digest（sha256），固定仓库
+  `Jchase0126/ads-agent`，拒绝任何客户端 URL；不降级；重定向仅允许 GitHub 系域名；
+  ZIP 解压前逐条校验路径（防 zip-slip/设备名/重复/符号链接/加密条目）与总量。
+- **资源防护**：`prepare` 全程单飞（并发请求直接返回「已在进行中」），下载有 600s
+  总时限，ZIP 中央目录在解析前先有界预检（项数/目录大小超限即拒），成功目录只
+  保留最新一份、下次准备前自动清理。
+- **诚实口径**：「准备更新」≠已安装；UI 从不声称安装完成；`[updates] auto_check`
+  可关闭启动检查。
+- **测试**：`tests/test_update_service.py` 10 项、`tests/test_update_ui.py` 18 项；
+  全量回归（feedback 19+11+13、packaging 10、ui_navigation 38、rfcalc_panel 33、
+  qtcompat 8、toolserver_busy 19）全部通过。
+
 ## 1.3.2 — 2026-11-03（崩溃/卡死反馈）
 
 新增**故障反馈通道**：崩溃、卡死或工具报错时一键生成脱敏诊断报告，并打开

@@ -63,6 +63,7 @@ BACKEND_FILES = [
     "feedback.py",       # 崩溃/卡死反馈：脱敏、报告落盘、心跳看门狗、异常钩子
     "paths.py",          # **统一路径解析**（数据/程序双根）
     "rfcalc.py",         # RF 计算引擎（传输线/噪声/杂散/偏置，纯函数 stdlib）
+    "update_service.py", # 稳定版 Release 校验与手动安装准备
     "server.py",         # HTTP/SSE 服务
     "shared_models.py",  # 跨工作区共享模型库
     "spice_schematic.py", # 保守解析 SPICE 原理图导出子集为 Circuit IR
