@@ -18,10 +18,13 @@ import configparser
 import json
 import os
 import re
+import socket
+import subprocess
 import threading
 import time
 import uuid as _uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import qtcompat
@@ -698,7 +701,7 @@ class ConfigWorker(QThread):
                         return
                 self.result.emit(
                     {"error": "后端版本过旧（缺少该接口），请关闭后端窗口后重新运行 start_backend.bat",
-                     "backend_down": True}
+                     "backend_down": True, "backend_old": True}
                 )
             elif e.code == 401:
                 self.result.emit({"error": _unauthorized_hint(), "unauthorized": True})
@@ -1749,7 +1752,7 @@ class AgentPanelWidget(QWidget):
         try:
             self.feedback_enabled.setChecked(bool(values.get("enabled", True)))
             self.feedback_auto_open_browser.setChecked(
-                bool(values.get("auto_open_browser", False)))
+                bool(values.get("auto_open_browser", True)))
             self.feedback_include_logs.setChecked(bool(values.get("include_logs", True)))
             self.feedback_notice_view.setPlainText(feedbackbridge.privacy_notice())
         except BaseException:  # noqa: BLE001
@@ -2044,6 +2047,12 @@ class AgentPanelWidget(QWidget):
     def _on_update_checked(self, data: dict, silent: bool = False, on_available=None):
         try:
             data = data or {}
+            if data.get("backend_old"):
+                # 后端缺 /updates 接口 = 升级前的旧进程还在跑：主动提出自动重启。
+                self._offer_backend_restart()
+                if not silent:
+                    self._update_state("error", data.get("error", ""))
+                return
             if "error" in data and "status" not in data:
                 if not silent:
                     self._update_state("error", data.get("error", ""))
@@ -2129,6 +2138,10 @@ class AgentPanelWidget(QWidget):
     def _on_update_prepared(self, data: dict):
         try:
             data = data or {}
+            if data.get("backend_old"):
+                self._offer_backend_restart()
+                self._update_state("error", data.get("error", ""))
+                return
             if "error" in data and "status" not in data:
                 self._update_state("error", data.get("error", ""))
                 return
@@ -2182,6 +2195,143 @@ class AgentPanelWidget(QWidget):
             self._update_timer.setInterval(6000)
             self._update_timer.timeout.connect(lambda: self._check_updates(silent=True))
             self._update_timer.start()
+        except BaseException:  # noqa: BLE001
+            pass
+
+    # ---------------------------------------------- 后端过旧时的自动重启（更新接口 404）
+    def _offer_backend_restart(self):
+        """检测到后端缺更新接口（版本过旧）时，主动提出一键重启后端。
+
+        只在每次面板会话里问一次；重启会中断进行中的对话/仿真，所以必须确认。
+        """
+        try:
+            if getattr(self, "_backend_restart_offered", False):
+                return
+            self._backend_restart_offered = True
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("后端版本过旧")
+            box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            box.setText("检测到正在运行的后端是旧版本（没有更新检查接口）。")
+            box.setInformativeText(
+                "可以让面板自动重启后端来启用新功能。\n\n"
+                "注意：重启会中断正在进行的对话和仿真任务；"
+                "也可以稍后自己关闭后端窗口并重新运行 start_backend.bat。")
+            yes = box.addButton("自动重启后端", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("稍后再说", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(yes)
+            box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            box.buttonClicked.connect(
+                lambda clicked: self._on_restart_choice(clicked is yes))
+            box.show()
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _on_restart_choice(self, confirmed: bool):
+        if not confirmed:
+            try:
+                self.status.setText("后端未重启：更新检查等新功能暂不可用，"
+                                    "可稍后手动重启 start_backend.bat。")
+            except BaseException:  # noqa: BLE001
+                pass
+            return
+        self._restart_backend_async()
+
+    def _restart_backend_async(self):
+        try:
+            self.status.setText("正在重启后端…（旧后端将被关闭，稍后自动重新检查更新）")
+        except BaseException:  # noqa: BLE001
+            pass
+        bridge = _ReviveBridge()
+        bridge.done.connect(self._on_backend_restarted)
+        thread = threading.Thread(target=self._restart_backend_work,
+                                  args=(bridge,), daemon=True)
+        thread.start()
+
+    def _restart_backend_work(self, bridge):
+        """线程体：核对身份 → 结束旧进程 → 重新拉起 start_backend.bat → 等健康。"""
+        ok, detail = False, ""
+        try:
+            import pathbridge
+
+            paths_mod = pathbridge.paths()
+            root = paths_mod.app_root()
+            bat = os.path.join(root, "start_backend.bat")
+            if not os.path.isfile(bat):
+                bridge.done.emit(False, "找不到 start_backend.bat（程序目录不完整）。")
+                return
+            base = _backend_base()
+            parsed = urllib.parse.urlsplit(base)
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or 8760
+            pid, install_id = 0, ""
+            try:
+                # /health 是开放端点：拿 pid 与身份，确认杀的是"本安装"的后端。
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}))
+                with opener.open(base + "/health", timeout=5) as resp:
+                    info = json.loads(resp.read().decode("utf-8"))
+                if str(info.get("service") or "") != "ads_agent_backend":
+                    bridge.done.emit(False, "端口上不是本插件的后端，请手动处理。")
+                    return
+                pid = int(info.get("pid") or 0)
+                install_id = str((info.get("identity") or {}).get("install_id") or "")
+            except BaseException:  # noqa: BLE001 — health 拿不到就只重启不校验 pid
+                pass
+            if install_id:
+                try:
+                    with open(paths_mod.install_state_path(),
+                              encoding="utf-8") as fh:
+                        state = json.load(fh)
+                    want = str(state.get("install_id") or "")
+                    if want and want != install_id:
+                        bridge.done.emit(
+                            False, "端口上运行的是另一份安装的后端，请手动关闭后重启。")
+                        return
+                except BaseException:  # noqa: BLE001
+                    pass
+            if pid > 0:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F", "/T"],
+                    capture_output=True, timeout=15)
+                # 等端口真正松开（旧进程完全退出），最多 15 秒
+                for _ in range(30):
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.5)
+                        if s.connect_ex((host, port)) != 0:
+                            break
+                    time.sleep(0.5)
+            subprocess.Popen(
+                ["cmd", "/c", "start", "ADS Agent 后端", "start_backend.bat"],
+                cwd=root, shell=False,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                close_fds=True)
+            # 等新后端健康检查通过，最多 40 秒
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}))
+            for _ in range(80):
+                time.sleep(0.5)
+                try:
+                    with opener.open(base + "/health", timeout=2) as resp:
+                        body = json.loads(resp.read().decode("utf-8"))
+                    if str(body.get("service") or "") == "ads_agent_backend":
+                        ok = True
+                        break
+                except BaseException:  # noqa: BLE001 — 还没起来，继续等
+                    continue
+            if not ok:
+                detail = "后端已重新启动但 40 秒内未通过健康检查，请查看后端窗口里的报错。"
+        except BaseException as exc:  # noqa: BLE001 — 重启失败也要给用户一句话
+            detail = f"{type(exc).__name__}: {exc}"
+        bridge.done.emit(ok, detail)
+
+    def _on_backend_restarted(self, ok: bool, detail: str):
+        try:
+            if ok:
+                self.status.setText("后端已重启，正在重新检查更新…")
+                QTimer.singleShot(800, lambda: self._check_updates(silent=True,
+                                                                   on_available=None))
+            else:
+                self.status.setText(f"后端重启失败：{detail or '原因未知'}")
         except BaseException:  # noqa: BLE001
             pass
 

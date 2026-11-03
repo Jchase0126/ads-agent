@@ -157,7 +157,8 @@ DEFAULTS = {
     # 总开关：false = 完全不生成报告、不写心跳、不弹窗
     "enabled": True,
     # true = 崩溃/卡死后直接打开浏览器预填页（无人值守）；false = 先弹窗问
-    "auto_open_browser": False,
+    # 默认开启（用户要求默认免勾选，出问题即自动上报）
+    "auto_open_browser": True,
     # 报告里是否附最近日志（关掉只留异常栈）
     "include_logs": True,
     # 附多少行日志

@@ -1,5 +1,16 @@
 # 更新记录
 
+## 1.3.4 — 2026-11-03（旧后端自动重启 + 反馈默认开启）
+
+- **更新检查自动恢复**：面板检测到正在运行的后端是旧版本（没有 /updates 接口）
+  时，主动弹出「自动重启后端」确认框——重启会中断对话与仿真，所以必须确认；
+  重启前核对 /health 的 service 与 install_id 防止误杀别的服务，重启成功后自动
+  重新检查更新。用户也可以选择稍后手动重启 start_backend.bat。
+- **崩溃反馈默认全开**：`[feedback] auto_open_browser` 默认改为 true（免勾选），
+  崩溃/卡死后直接打开预填 issue 页；三项开关仍可在设置页关闭。
+- **测试**：test_feedback 19、test_feedback_http 11、test_feedback_panel 13、
+  test_update_ui 18、test_ui_navigation 38 全部通过。
+
 ## 1.3.3 — 2026-11-03（更新推送）
 
 联网检测 GitHub Release 新版本：设置页新增「软件更新」，启动静默检查（可关），

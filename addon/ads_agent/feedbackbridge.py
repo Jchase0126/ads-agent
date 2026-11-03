@@ -45,7 +45,7 @@ HEARTBEAT_NAME = "ads_panel"
 #: 保持同名同义：后端读的是同一份 config.ini，键名对不上就等于开关失效。
 DEFAULTS = {
     "enabled": True,
-    "auto_open_browser": False,
+    "auto_open_browser": True,
     "include_logs": True,
     "max_log_lines": 120,
     "hang_seconds": 180,
