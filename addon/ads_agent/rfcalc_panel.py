@@ -106,6 +106,22 @@ LED_R = "#FF0000"
 _ERR = "#CC0000"
 RO_BG = "#EFEFEF"
 
+
+def _pal(key, fallback):
+    """uiscale.PALETTES['light'] 语义色读取（缺失时回退），供 chrome 统一口径。"""
+    v = _PAL.get(key) if isinstance(_PAL, dict) else None
+    return v if isinstance(v, str) and v else fallback
+
+
+# chrome 语义令牌（与 uiscale.PALETTES["light"] 对齐；灰阶回退保底）
+ACCENT = _pal("accent", "#246BDB")          # 键盘焦点环 / 选中强调
+ACCENT_DARK = _pal("accent_hover", "#1D5DBC")
+ACCENT_SOFT = "#CFE0F7"                     # 侧栏选中底（accent 浅色衍生）
+ACCENT_HOVERBG = "#E2ECFA"                  # 侧栏悬停底
+NAV_BG = _pal("sidebar_bg", "#E8E8E8")      # 侧栏底
+STATUS_FG = "#555555"                       # 状态栏提示文字（浅灰底对比度 6.5:1）
+TEXT_SUB = "#444444"                        # 只读框文字（RO_BG 上对比度 8.5:1）
+
 _LEN_ITEMS = ["mils", "mm", "cm", "µm", "inch"]
 _LEN_ALIAS = {"mils": "mil", "mm": "mm", "cm": "cm", "µm": "um",
               "um": "um", "inch": "inch", "m": "m"}
@@ -226,31 +242,35 @@ _ICON_CACHE = {}
 
 
 def _pix(kind, size):
-    if kind in _ICON_CACHE:
-        return _ICON_CACHE[kind]
+    key = (kind, int(size))
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
     pm = QtGui.QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QtGui.QPainter(pm)
     p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
     s = float(size)
     k = s / 32.0  # 统一按 32 逻辑坐标绘制
+    EDGE = "#1F1F1F"   # 统一描边色（比纯黑柔和，浅底上视觉权重一致）
+    LW = 1.4           # 统一线宽（32px 逻辑基准）
 
-    def poly(pts, fill, edge="#222222"):
-        _pen(p, edge, 1.2)
+    def poly(pts, fill, edge=EDGE):
+        _pen(p, edge, LW)
         p.setBrush(QtGui.QColor(fill) if fill else Qt.NoBrush)
         p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(x * k, y * k) for x, y in pts]))
 
-    def line(x1, y1, x2, y2, c="#222222", w=1.2):
+    def line(x1, y1, x2, y2, c=EDGE, w=LW):
         _pen(p, c, w)
         p.drawLine(QtCore.QLineF(x1 * k, y1 * k, x2 * k, y2 * k))
 
     def rect(x, y, w_, h_, fill):
-        _pen(p, "#222222", 1.0)
+        _pen(p, EDGE, LW)
         p.setBrush(QtGui.QColor(fill))
         p.drawRect(QtCore.QRectF(x * k, y * k, w_ * k, h_ * k))
 
     def circ(x, y, rr, fill):
-        _pen(p, "#222222", 1.0)
+        _pen(p, EDGE, LW)
         p.setBrush(QtGui.QColor(fill))
         p.drawEllipse(QtCore.QPointF(x * k, y * k), rr * k, rr * k)
 
@@ -271,13 +291,14 @@ def _pix(kind, size):
         rect(4, 4, 24, 24, SQUARE)
         circ(16, 16, 7, GOLD)
     elif kind == "twin":
-        line(12, 9, 26, 19, "#ABABAB", 8)
-        line(6, 13, 20, 23, "#ABABAB", 8)
-        circ(9, 11, 5, "#C8C8C8")
-        circ(23, 21, 5, "#C8C8C8")
+        # 双线：圆盘端子精确落在导线轴线上（圆盘盖住线端）
+        line(14, 10, 27, 18, "#ABABAB", 7)
+        line(7, 14, 20, 22, "#ABABAB", 7)
+        circ(14, 10, 5, "#C8C8C8")
+        circ(7, 14, 5, "#C8C8C8")
     elif kind == "wire_gnd":
-        line(7, 21, 25, 15, "#ABABAB", 6)
-        circ(8, 22, 4, "#C8C8C8")
+        line(9, 21, 26, 14, "#ABABAB", 6)
+        circ(9, 21, 4, "#C8C8C8")
         rect(3, 25, 26, 5, "#7B68EE")
     elif kind == "cpw":
         rect(4, 4, 7, 24, GOLD)
@@ -321,8 +342,26 @@ def _pix(kind, size):
         rect(3, 5, 26, 5, GRIDHEAD)
     elif kind == "spur":
         circ(16, 16, 11, "#FFFFFF")
-        line(9, 9, 23, 23, "#222222", 2)
-        line(23, 9, 9, 23, "#222222", 2)
+        line(10, 10, 22, 22, "#222222", 2)   # ✕ 内接于圆
+        line(22, 10, 10, 22, "#222222", 2)
+    elif kind == "thermal":
+        # 温度计：管身 + 汞柱 + 球泡 + 刻度
+        rect(13, 5, 6, 14, "#FFFFFF")
+        line(16, 12, 16, 22, "#E04848", 4)
+        circ(16, 23, 5, "#E04848")
+        line(22, 7, 24, 7)
+        line(22, 10, 24, 10)
+        line(22, 13, 24, 13)
+    elif kind == "spcs":
+        # IC 封装：本体 + 上下引脚 + pin-1 标记
+        rect(6, 9, 20, 14, DIEMED)
+        line(10, 5, 10, 9)
+        line(16, 5, 16, 9)
+        line(22, 5, 22, 9)
+        line(10, 23, 10, 27)
+        line(16, 23, 16, 27)
+        line(22, 23, 22, 27)
+        circ(12, 13, 2, "#FFFFFF")
     elif kind == "im":
         line(3, 26, 14, 14, "#3355aa", 1.6)
         line(3, 26, 29, 6, "#aa3333", 1.6)
@@ -331,8 +370,44 @@ def _pix(kind, size):
         rect(3, 18, 26, 5, SUBS)
         rect(5, 12, 22, 4, GOLD)
         rect(3, 6, 26, 4, DIEMED)
+    elif kind == "att":
+        # 衰减器 Pi 网络：串臂电阻 + 两端并联电阻 + 底部公共端
+        line(4, 14, 28, 14)
+        rect(13, 11, 7, 6, "#FFFFFF")
+        rect(5, 8, 4, 7, "#FFFFFF")
+        rect(23, 8, 4, 7, "#FFFFFF")
+        line(7, 8, 7, 14)
+        line(25, 8, 25, 14)
+        line(7, 21, 25, 21)
+        line(7, 21, 7, 14)
+        line(25, 21, 25, 14)
+    elif kind == "vswr":
+        # 驻波互算：负载板 + 入射（右向）/反射（左向）箭头对
+        line(25, 5, 25, 27, "#4a7a3a", 2.4)
+        line(3, 11, 17, 11)
+        poly([(17, 7.5), (24, 11), (17, 14.5)], EDGE)
+        line(24, 22, 15, 22)
+        poly([(15, 18.5), (8, 22), (15, 25.5)], EDGE)
+    elif kind == "skin":
+        # 趋肤效应：导体截面 + 表面电流层 + 深度 δ 箭头
+        rect(4, 8, 24, 16, "#D9A066")
+        line(4, 11, 28, 11, "#8A5A2B", 2)
+        line(16, 12, 16, 18, "#FFFFFF", 1.4)
+        poly([(13.8, 17), (16, 21), (18.2, 17)], "#FFFFFF")
+        line(6, 26, 26, 26, "#8A5A2B", 1)
+    elif kind == "lcres":
+        # 并联 LC 回路：上支路 3 匝线圈（半圆弧）+ 下支路电容板
+        line(10, 15, 10, 25)
+        line(26, 15, 26, 25)
+        for _cx in (10.0, 15.4, 20.8):
+            p.drawArc(QtCore.QRectF(_cx * k, 7 * k, 5.4 * k, 16 * k),
+                      0, 180 * 16)
+        line(10, 25, 15, 25)
+        line(21, 25, 26, 25)
+        line(15, 20, 15, 30)
+        line(21, 20, 21, 30)
     p.end()
-    _ICON_CACHE[kind] = pm
+    _ICON_CACHE[key] = pm
     return pm
 
 
@@ -347,6 +422,7 @@ def _icon(kind, size=32):
 def _pen(p, c="#000000", w=1.0):
     q = QtGui.QPen(QtGui.QColor(c))
     q.setWidthF(w)
+    q.setCosmetic(True)   # cosmetic：线宽不随 painter 变换缩放，视觉恒定
     p.setPen(q)
     return q
 
@@ -443,7 +519,11 @@ class _Diagram(QtWidgets.QWidget):
         le.setAlignment(Qt.AlignRight)
         if ro:
             le.setReadOnly(True)
-            le.setStyleSheet("background:%s;color:#555555;" % RO_BG)
+            le.setStyleSheet("QLineEdit{background:%s;color:#555555;"
+                             "padding:0px 3px;}" % RO_BG)
+        else:
+            # 右对齐值距右边框 3px（无内边距时数字贴边，似游离在框外）
+            le.setStyleSheet("QLineEdit{padding:0px 3px;}")
         le.setObjectName(obj or ("%s.%s" % (self._name, key)))
         self.fields[key] = le
         self._geom[key] = (lx, ly, w, h)
@@ -462,6 +542,7 @@ class _Diagram(QtWidgets.QWidget):
     def paintEvent(self, ev):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
         p.translate(-self.OX, -self.OY)
         # draw() 内部调用的 label() 每次重绘都会重新注册；
         # 先存下构建期标签，清空收集本次绘制标签，合并去重后只画一份。
@@ -915,23 +996,67 @@ def _page_css(name, bg):
         css = U.dialog_css(_PAL) or ""
     except Exception:
         css = ""
+    p1 = U.px(1)   # 输入框内边距
+    py = U.px(3)   # 按钮纵向内边距
+    px = U.px(12)  # 按钮横向内边距
+    mt = U.px(8)   # QGroupBox 顶部让位
     css += (
         " QWidget#%(n)spg { background: %(bg)s; }"
         " QWidget#%(n)spg QLineEdit { background: #FFFFFF; border: 1px solid #808080;"
-        "   border-top-color: #484848; border-left-color: #484848; padding: 1px 2px; }"
-        " QWidget#%(n)spg QLineEdit:read-only { background: #FFFFFF; color: #000000; }"
+        "   border-top-color: #484848; border-left-color: #484848;"
+        "   padding: %(p1)dpx %(p1)dpx; }"
+        " QWidget#%(n)spg QLineEdit:focus { border: 1px solid %(acc)s;"
+        "   border-top-color: %(acc)s; border-left-color: %(acc)s; }"
+        " QWidget#%(n)spg QLineEdit:read-only { background: %(ro)s; color: %(sub)s;"
+        "   border: 1px solid #A0A0A0; border-top-color: #A0A0A0;"
+        "   border-left-color: #A0A0A0; }"
         " QWidget#%(n)spg QPushButton { background: #ECECEC; border: 1px solid #808080;"
-        "   border-top-color: #FFFFFF; border-left-color: #FFFFFF; padding: 3px 12px; }"
+        "   border-top-color: #FFFFFF; border-left-color: #FFFFFF;"
+        "   padding: %(py)dpx %(px)dpx; }"
+        " QWidget#%(n)spg QPushButton:hover { background: #F5F5F5; }"
         " QWidget#%(n)spg QPushButton:pressed { background: #DBDBDB; }"
+        " QWidget#%(n)spg QPushButton:focus { border: 1px solid %(acc)s;"
+        "   border-top-color: %(acc)s; border-left-color: %(acc)s; }"
         " QWidget#%(n)spg QComboBox { background: #FFFFFF; border: 1px solid #808080;"
-        "   padding: 1px 4px; }"
-        " QWidget#%(n)spg QGroupBox { border: 1px solid #A0A0A0; margin-top: 8px; }"
+        "   padding: %(p1)dpx 4px; }"
+        " QWidget#%(n)spg QComboBox:focus { border: 1px solid %(acc)s; }"
+        " QWidget#%(n)spg QGroupBox { border: 1px solid #A0A0A0; margin-top: %(mt)dpx; }"
+        " QWidget#%(n)spg QGroupBox::title { subcontrol-origin: margin;"
+        "   subcontrol-position: top left; left: 6px; padding: 0 3px;"
+        "   color: #172234; font-weight: bold; }"
         " QWidget#%(n)spg QTableWidget { background: #FFFFFF; gridline-color: %(gl)s; }"
         " QLabel#pgtitle { font-family: 'Times New Roman'; font-size: 22pt;"
         "   font-weight: bold; color: #000000; }"
-        % {"n": name, "bg": bg, "gl": GRIDLINE}
+        % {"n": name, "bg": bg, "gl": GRIDLINE, "acc": ACCENT, "ro": RO_BG,
+           "sub": TEXT_SUB, "p1": p1, "py": py, "px": px, "mt": mt}
     )
+    if _is_spec_canvas(name):
+        css += _SPEC_FONT_CSS
     return css
+
+
+# 1:1 复刻页统一字体：实机 VB6 窗体用 Microsoft Sans Serif 8pt。Qt 中设置页面
+# 样式表后，子控件用 setFont() 设的字体会被样式解析覆盖（回退到应用字体，
+# 文字变宽 → "min" 被裁成 "mif"），因此这里把字体写进页面 QSS，保证
+# 度量与渲染同源。标题用 id 选择器保留 Times 18pt 粗体。
+_SPEC_FONT_CSS = (
+    " QLabel { font-family:'Microsoft Sans Serif'; font-size:8pt; }"
+    " QLineEdit { font-family:'Microsoft Sans Serif'; font-size:8pt; }"
+    " QComboBox { font-family:'Microsoft Sans Serif'; font-size:8pt; }"
+    " QPushButton { font-family:'Microsoft Sans Serif'; font-size:8pt; }"
+    " QTableWidget { font-family:'Microsoft Sans Serif'; font-size:8pt; }"
+    " QHeaderView::section { font-family:'Microsoft Sans Serif'; font-size:8pt; }"
+    " QLabel#pgtitle { font-family:'Times New Roman'; font-size:18pt;"
+    "   font-weight:bold; }"
+)
+
+
+def _is_spec_canvas(name):
+    """该页是否为 966×669 的 1:1 实测画布（TL 规格页或电路规格页）。"""
+    try:
+        return (name in _TL_SPEC.PAGES) or (name in _CIRC_SPEC.PAGES)
+    except Exception:
+        return False
 
 
 def _ql(text, align_right=False, w=None):
@@ -969,8 +1094,13 @@ def _res_row(page, key, label, unit="", combo=None, combo_name=None, editable=Fa
     le.setReadOnly(not editable)
     le.setFixedSize(box_w, box_h)
     le.setAlignment(Qt.AlignRight)
-    le.setStyleSheet("QLineEdit{background:#FFFFFF;border:1px solid #696969;"
-                     "padding:0px 2px;}")
+    if editable:
+        le.setStyleSheet("QLineEdit{background:#FFFFFF;border:1px solid #696969;"
+                         "padding:0px 2px;}")
+    else:
+        # 只读结果框统一口径：RO_BG 底 + 弱化文字（对比度 8.5:1）
+        le.setStyleSheet("QLineEdit{background:%s;color:%s;border:1px solid #808080;"
+                         "padding:0px 2px;}" % (RO_BG, TEXT_SUB))
     le.setObjectName("%s.result.%s" % (page.name, key))
     page.results[key] = le
     h.addWidget(le)
@@ -1006,38 +1136,68 @@ def _mid_row(widgets, label=None, lw=0):
 
 def _spec_chrome(page, name):
     """AppCAD 页面公共 chrome：菜单条、底带、链接条、窗框（实测坐标）。"""
+    # 顶部三段（参考图像素剖面）：灰菜单条 0..8 / 白色菜单面板 9..26 /
+    # 浅灰压边 27..28，再下才是 SEP_Y 的深灰分隔线。
     bar = QtWidgets.QLabel(page)
     bar.setStyleSheet("background:#F3F3F3;")
-    bar.setGeometry(0, 0, _CHROME.PAGE_W, 29)
+    bar.setGeometry(0, 0, _CHROME.PAGE_W, _CHROME.MENU_Y - 6)
     bar.show()
-    mf = QtGui.QFont("MS Sans Serif", 8)
-    for tx, word in ((20, "File"), (47, "Calculate"), (113, "Select Parameters"),
-                     (231, "Options"), (292, "Help")):
+    panel = QtWidgets.QLabel(page)
+    panel.setStyleSheet("background:#FFFFFF;")
+    panel.setGeometry(0, _CHROME.MENU_Y - 6, _CHROME.PAGE_W,
+                      _CHROME.SEP_Y - (_CHROME.MENU_Y - 6) - 2)
+    panel.show()
+    edge = QtWidgets.QLabel(page)
+    edge.setStyleSheet("background:#F0F0F0;")
+    edge.setGeometry(0, _CHROME.SEP_Y - 2, _CHROME.PAGE_W, 2)
+    edge.show()
+    mf = QtGui.QFont("Microsoft Sans Serif", 8)
+    mfm = QtGui.QFontMetrics(mf)
+    menu = _CHROME.MENUS.get(name) or _CHROME.DEFAULT_MENU
+    for tx, word in menu:
         mw = QtWidgets.QLabel(word, page)
-        mw.setFont(mf)
-        mw.setStyleSheet("background:transparent; color:#000000;")
-        mw.setGeometry(tx, 11, 140, 16)
+        mw.setStyleSheet("background:transparent; color:#000000;"
+                         " font-family:'Microsoft Sans Serif'; font-size:8pt;")
+        # 菜单项宽度按墨迹宽定，避免相邻项 140px 宽盒互相叠压
+        mw.setGeometry(tx, _CHROME.MENU_Y,
+                       min(140, mfm.horizontalAdvance(word) + 10), 16)
         mw.show()
     sep = QtWidgets.QFrame(page)
     sep.setFrameShape(QtWidgets.QFrame.HLine)
     sep.setStyleSheet("color:#696969;")
-    sep.setGeometry(0, 29, _CHROME.PAGE_W, 1)
+    sep.setGeometry(0, _CHROME.SEP_Y, _CHROME.PAGE_W, 1)
     sep.show()
     band = QtWidgets.QLabel(page)
     band.setStyleSheet("background:#F0F0F0;")
     band.setGeometry(*_CHROME.WEBBAR)
     band.show()
-    wc = _CHROME.WEB_COLORS.get(name)
-    if wc:
+    bl = _CHROME.WEBBLEND.get(name)
+    if bl:
+        bgc, fgc = bl
         wb = QtWidgets.QLabel(_CHROME.WEB_TEXT, page)
         wb.setAlignment(Qt.AlignCenter)
-        wb.setFont(QtGui.QFont("MS Sans Serif", 8))
-        wb.setStyleSheet("background:%s; color:#000000;" % wc)
+        # 规格矩形仅 503px 宽，8pt 文字超宽会两端截断；逐级降字号直至装下
+        # （下限 6pt，跨 PySide2/6 用 horizontalAdvance）。
+        fw = _CHROME.WEBLINK[2] - 12
+        wf = QtGui.QFont("Microsoft Sans Serif", 8)
+        wfm = QtGui.QFontMetrics(wf)
+        while wfm.horizontalAdvance(_CHROME.WEB_TEXT) > fw and wf.pointSize() > 6:
+            wf.setPointSize(wf.pointSize() - 1)
+            wfm = QtGui.QFontMetrics(wf)
+        wb.setFont(wf)
+        wb.setStyleSheet("background:%s; color:%s;"
+                         " border:1px solid #A0A0A0;"
+                         " font-family:'Microsoft Sans Serif'; font-size:%dpt;"
+                         % (bgc, fgc, wf.pointSize()))
         wb.setGeometry(*_CHROME.WEBLINK)
         wb.show()
-    for fr in ((0, 0, 7, 662), (959, 0, 7, 662), (0, 662, 966, 7)):
+    # 窗框（实测）：左右黑框 x0..5 / x960..965，自 y=9 起；底部 y663..668 黑框，
+    # 其上 y661..662 为 VB6 3D 高光边（浅灰 + 白）。
+    for fr, sty in (((0, 9, 6, 654), "#000000"), ((960, 9, 6, 654), "#000000"),
+                    ((0, 663, 966, 6), "#000000"), ((0, 661, 966, 1), "#E3E3E3"),
+                    ((0, 662, 966, 1), "#FFFFFF")):
         f = QtWidgets.QLabel(page)
-        f.setStyleSheet("background:#000000;")
+        f.setStyleSheet("background:%s;" % sty)
         f.setGeometry(*fr)
         f.lower()
         f.show()
@@ -1095,7 +1255,7 @@ def _spec_shell(win, name, title, diagram, mids_fn=None, buttons_fn=None,
     page.dg = diagram
     page.setFixedSize(_CHROME.PAGE_W, _CHROME.PAGE_H)
     bgc = diagram.spec.get("bg") or bg
-    page.setStyleSheet("background:%s;" % bgc)
+    page.setStyleSheet("background:%s;%s" % (bgc, _SPEC_FONT_CSS))
 
     diagram.setParent(page)
     diagram.move(0, 0)
@@ -1108,13 +1268,27 @@ def _spec_shell(win, name, title, diagram, mids_fn=None, buttons_fn=None,
     tf = QtGui.QFont("Times New Roman", 18)
     tf.setBold(True)
     lab = QtWidgets.QLabel(ttext, page)
+    lab.setObjectName("pgtitle")
     lab.setFont(tf)
-    lab.setStyleSheet("background:transparent; color:#000000;")
+    lab.setStyleSheet("background:transparent; color:#000000;"
+                      " font-family:'Times New Roman'; font-size:18pt;"
+                      " font-weight:bold;")
     lab.setGeometry(tx, 46, 560, 30)
     mm = QtWidgets.QPushButton("Main Menu [F8]", page)
     mm.setObjectName(name + ".mainmenu")
     mm.clicked.connect(win.toggle_sidebar)
     mm.setGeometry(*_CHROME.MAINMENU)
+    # 实测按钮框 78×16：8pt 下文字略宽会两端裁切，逐级降字号直至装下。
+    mf2 = QtGui.QFont("Microsoft Sans Serif", 8)
+    while (QtGui.QFontMetrics(mf2).horizontalAdvance(mm.text())
+           > _CHROME.MAINMENU[2] - 8 and mf2.pointSize() > 6):
+        mf2.setPointSize(mf2.pointSize() - 1)
+    mm.setFont(mf2)
+    # 页面 QSS 会覆盖 setFont，因此再落一条控件级规则固化自适应字号
+    mm.setStyleSheet("font-family:'Microsoft Sans Serif'; font-size:%dpt;"
+                     % mf2.pointSize())
+    if not mm.toolTip():
+        mm.setToolTip("打开/收起侧栏菜单（F8）")
 
     lay = _CHROME.TL_LAYOUT.get(name) or _CHROME.CIRC_LAYOUT.get(name) or {}
     btns = list(buttons_fn(page)) if buttons_fn else []
@@ -1142,9 +1316,14 @@ def _spec_shell(win, name, title, diagram, mids_fn=None, buttons_fn=None,
     if mids:
         cx, cy, cw, ch = lay.get("combo", (78, 323, 231, 18))
         # 实机行距（相对 substrate 组合框 y）：εr -29 / combo 0 / freq +37 / units +68
+        # 五行的页（cpw 多一个「基片高度模式」下拉）等距压缩，避免行间互相压叠
+        if len(mids) <= 4:
+            yoffs = (cy - 29, cy, cy + 37, cy + 68)
+        else:
+            yoffs = (cy - 29, cy, cy + 31, cy + 62, cy + 93)
         for i, w in enumerate(mids):
             w.setParent(page)
-            my = (cy - 29, cy, cy + 37, cy + 68)[min(i, 3)]
+            my = yoffs[min(i, len(yoffs) - 1)]
             w.setGeometry(max(8, cx - 2), my, 300, 24)
             w.show()
 
@@ -1242,21 +1421,43 @@ def _calc_btn(page, text, fn, obj):
     return b
 
 
+def _page_label(name):
+    """侧栏中文页名（状态栏统一口径）；未知页名回退原名。"""
+    try:
+        for _key, _label, members in _GROUPS:
+            for page_key, text, _ic in members:
+                if page_key == name:
+                    return text
+    except Exception:
+        pass
+    return name
+
+
+def _page_tag(page):
+    """状态栏统一页面口径：「中文名（页名）」。"""
+    n = getattr(page, "name", "") or ""
+    label = _page_label(n)
+    if label and label != n:
+        return "%s（%s）" % (label, n)
+    return n or "RF 计算器"
+
+
 def _run_calc(page, fn, ok_msg=""):
     try:
         page.err.hide()
         msg = fn()
         if ok_msg or msg:
-            page.window().status().showMessage("%s：%s" % (page.name, msg or ok_msg), 8000)
+            page.window().status().showMessage(
+                "%s：计算完成 —— %s" % (_page_tag(page), msg or ok_msg), 8000)
     except _InputError as exc:
         page.err.setText("✗ " + str(exc))
         page.err.show()
-        page.window().status().showMessage("%s：失败——%s" % (page.name, exc))
+        page.window().status().showMessage("%s：失败——%s" % (_page_tag(page), exc))
     except Exception as exc:  # UI 解析层兜底，绝不崩
         page.err.setText("✗ 界面错误：%s: %s" % (type(exc).__name__, exc))
         page.err.show()
         page.window().status().showMessage(
-            "%s：失败——%s: %s" % (page.name, type(exc).__name__, exc))
+            "%s：失败——%s: %s" % (_page_tag(page), type(exc).__name__, exc))
 
 
 # --- 中列（Dielectric / 基片 / Freq / Length Units）--------------------------
@@ -1518,6 +1719,54 @@ def _calc_ms_syn(page):
 
 # --- 带状线 ------------------------------------------------------------------
 
+def _spec_clean(dg, drop=(), outline=(), lines=()):
+    """按参考图纠偏逐像素描摹出的示意图规格（只改本页实例）。
+
+    规格由截图轮廓矢量化得到，其中「细线墨迹围成的闭环」会被当成实心
+    多边形填黑，于是基片/正面被整块黑矩形盖住。这里按实测索引做规范化：
+
+    * ``drop``    ：删掉填充型黑块（正面/嵌入导体被整块填黑的那几个）。
+    * ``outline`` ：改为只描边（fill=None），保留轮廓墨迹。
+    * ``lines``   ：补回被黑块吞掉的尺寸线，(x1, y1, x2, y2) 为实测像素。
+
+    注意 dg.spec 直接引用 appcad_tl.PAGES，必须重建 dict/list，否则二次
+    构建时形状索引会错位。
+    """
+    shapes = list(dg.spec.get("shapes", []))
+    out = []
+    for i, s in enumerate(shapes):
+        if i in drop:
+            continue
+        if i in outline:
+            s = dict(s, fill=None)
+            s.setdefault("edge", "#000000")
+            s.setdefault("w", 1)
+        out.append(s)
+    for x1, y1, x2, y2 in lines:
+        out.append({"k": "line", "pts": [[x1, y1], [x2, y2]],
+                    "fill": None, "edge": "#000000", "w": 1})
+
+    # 标注字：参考图里 L/H/T/W/G 是加粗无衬线大字（约 13.5pt），εr 是衬线斜体，
+    # 而规格里统一按 8pt Times 斜体记录，实测偏小近一半，这里按页内标签重设。
+    labels = []
+    for lb in dg.spec.get("labels", []):
+        lb = dict(lb)
+        txt = str(lb.get("text", ""))
+        if "ε" in txt:
+            lb.update(font="Times New Roman", italic=True, bold=True, pt=14)
+        elif txt.startswith("D"):   # 板线 D1/D2 实测比 L 小一号
+            lb.update(font="Microsoft Sans Serif", italic=False, bold=True, pt=12)
+        else:
+            lb.update(font="Microsoft Sans Serif", italic=False, bold=True, pt=13.5)
+        labels.append(lb)
+    dg.spec = dict(dg.spec, shapes=out, labels=labels)
+
+    # 参考图里的标注输入框是 VB6 文本框（左对齐、垂直居中）；规格按右对齐
+    # 记录，实测值在框内明显偏右，这里统一改回左对齐。
+    for _e in getattr(dg, "fields", {}).values():
+        _e.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+
+
 def _mk_stripline(win):
     dg = _spec_diagram("stripline")
     if dg is None:  # 规格缺失时回退手绘
@@ -1527,6 +1776,16 @@ def _mk_stripline(win):
         dg.box("T", 329, 248, "0.01", w=44, h=15, ro=True)
         dg.box("L", 146, 160, "1000", w=46, h=15)
         dg.finalize()
+    if dg is not None:
+        # 实测纠偏：231/279 保留外框线，251/284/33 为描摹出的填充黑块；
+        # 尺寸线按参考图逐像素补回（T 延长线 199/205、正面上下边 188/218）。
+        _spec_clean(
+            dg, drop=(251, 284, 33),
+            outline=(231, 279, 238, 305, 306, 307),
+            lines=[(224, 198.5, 364, 198.5), (224, 204.5, 364, 204.5),
+                   (124, 187.5, 272, 187.5), (124, 217.5, 271, 217.5),
+                   (170.5, 211, 170.5, 243), (217.5, 211, 217.5, 243),
+                   (270.5, 184, 270.5, 218), (377.5, 134, 377.5, 162)])
 
     def calc(page):
         e = _e()
@@ -1587,9 +1846,19 @@ def _mk_coax_round(win):
         r = e.coax_analysis(d2 / 2.0, d1 / 2.0, er, 0.0, f)
         if not r.get("ok"):
             raise _InputError(r.get("error", "引擎返回失败"))
-        out = {"Z0": r.get("Z0"), "d1d2": r.get("b_over_a"),
-               "fc": (r.get("fc_te11") or 0.0) / 1e9}
+        out = {"Z0": r.get("Z0"), "d1d2": r.get("b_over_a")}
         out.update(_lam_rows(page, r.get("lambda_g"), L, er, delay=True))
+        # TE11 高次模（Pozar 工程近似）：截止 / 建议上限 / 单模判定。
+        # 工作频率 f 未填（=0）时不判定单模（键为 None → 显示 "-"）。
+        te = e.coax_te11_cutoff(d2 / 2.0, d1 / 2.0, er, f if f > 0 else None)
+        if not te.get("ok"):
+            raise _InputError("TE11：%s" % te.get("error", "引擎返回失败"))
+        fc = te.get("fc_te11")
+        fm = te.get("f_max_advised")
+        ok1 = te.get("single_mode_ok")
+        out["fc_te11"] = (fc / 1e9) if fc is not None else None
+        out["fmax_te11"] = (fm / 1e9) if fm is not None else None
+        out["te11_ok"] = ("是" if ok1 else "否") if ok1 is not None else None
         _setr(page, out)
         return "Z0=%s Ω" % _g(r.get("Z0"))
 
@@ -1613,7 +1882,10 @@ def _mk_coax_round(win):
          ("@deg", "Elect Length", None), ("elen_len", "Elect Length", None),
          ("@time", "Delay", None), ("wavelength", "1.0 Wavelength", None),
          ("vp", "Vp", "fraction of c"), ("d1d2", "D1/D2", None),
-         ("fc", "fc TE11", "GHz")])
+         # TE11 高次模组（引擎 coax_te11_cutoff：Pozar 工程近似）
+         ("fc_te11", "TE11 截止 fc", "GHz"),
+         ("fmax_te11", "TE11 建议上限", "GHz"),
+         ("te11_ok", "TE11 单模工作", None)])
 
 
 # --- 方同轴 ------------------------------------------------------------------
@@ -1668,9 +1940,11 @@ def _mk_coax_square(win):
                           "coax_square.calc2")]
 
     def rows(page):
-        out = [_ql("注：Z0 由引擎方同轴等效半径模型（b_eq = 0.539038·s，常数按 "
-                   "AppCAD 4.00 实机定标）解出；结果行 D1/D2 为几何比 "
-                   "s/(2a)=D1/D2，与引擎的等效外径比 b_eq/a 不同。")]
+        _note = _ql("注：Z0 由引擎方同轴等效半径模型（b_eq = 0.539038·s，常数按 "
+                    "网上公开资料定标）解出；结果行 D1/D2 为几何比 "
+                    "s/(2a)=D1/D2，与引擎的等效外径比 b_eq/a 不同。")
+        _note.setWordWrap(True)   # 长注释换行，避免溢出页缘截断
+        out = [_note]
         out += _tl_rows(page, [("Z0", "Z0", "Ω"),
                                ("elen_lambda", "Elect Length", "λ"),
                                ("@deg", "Elect Length", None),
@@ -1812,9 +2086,20 @@ def _mk_cpw(win):
         dg.box("G", 266, 291, "5", w=40, h=15)
         dg.box("T", 324, 233, "0.1", w=47, h=15, ro=True)
         dg.finalize()
+    if dg is not None:
+        # 实测纠偏：463（尺寸线+边框连通域）与 599（W/G 延长线实心条）整块填黑，
+        # 559/595 是正面与金色底带的轮廓 → 保留墨迹改为只描边；尺寸线补回。
+        _spec_clean(
+            dg, drop=(463, 599), outline=(559, 595),
+            lines=[(108, 220.5, 256, 220.5), (108, 225.5, 258, 225.5),
+                   (154, 245.5, 175, 245.5), (193, 245.5, 227, 245.5),
+                   (177.5, 226, 177.5, 257), (190.5, 226, 190.5, 284),
+                   (213.5, 226, 213.5, 284), (363.5, 123, 363.5, 153)])
 
     def mids(page):
         page.len_fields = ["W", "G", "H", "L"]
+        # 参考图中列是实测的 4 行（εr / 基片 / 频率 / 长度单位）；
+        # 「基片高度模式」是本页额外一行，独立放在单位行下方，不挤动这 4 行。
         rows = _er_mid(page) + _freq_mid(page)
         # 实机 06 号截图标题右侧单选（With/No Groundplane）→ 语义映射：
         # 无限厚基片（引擎默认，h 不可编辑）/ 有限厚 h（可编辑，Ɛeff 修正）
@@ -1828,35 +2113,60 @@ def _mk_cpw(win):
             dg.fields["H"].setEnabled(idx == 1)
 
         combo.currentIndexChanged.connect(mode_changed)
-        rows.insert(2, _mid_row([combo], label="基片:", lw=40))
+        hmode = _mid_row([combo], label="基片:", lw=40)
+        hmode.setParent(page)
+        hmode.setGeometry(74, 448, 300, 24)
+        hmode.show()
+        # 参考图标题右侧的底地板单选组。引擎（backend/rfcalc.py cpw_analysis）
+        # 没有 gnd 参数，故只做版式复刻：控件存在但禁用，并给出说明。
+        for key, txt, x, chk in (("cpw.gnd_with", "With Groundplane", 313, True),
+                                 ("cpw.gnd_none", "No Groundplane", 445, False)):
+            rb = QtWidgets.QRadioButton(txt)
+            rb.setObjectName(key)
+            rb.setParent(page)
+            rb.setGeometry(x, 43, 150, 21)
+            rb.setChecked(chk)
+            rb.setEnabled(False)
+            rb.setStyleSheet("color:#000000;")
+            rb.setToolTip("底地板选项：本页引擎为无底部地板 CPW 模型，未建模。")
+            rb.show()
         return rows
 
     def buttons(page):
         return [_calc_btn(page, "Calculate Z0 [F4]", lambda: _cpw_calc(page), "cpw.calc")]
 
     def rows(page):
-        out = [_ql("注：本页为引擎的无底部地板标准 CPW 模型；实机 AppCAD 的 "
-                   "With/No Groundplane 指底地板选项，引擎未建模。下方「基片高度"
-                   "模式」仅切换基片高度对 Ɛeff 的修正（有限 h 可编辑 / 厚基片 h→∞）。")]
-        out.append(_res_row(page, "Z0", "Z0", "Ω"))
-        out.append(_res_row(page, "elen_lambda", "Elect Length", "λ"))
+        # 说明文字不能进右列行序：作为 rows[0] 会被放到 (426,200) 并把 Z0
+        # 顶到第二行、整列下移 51px。改放页面空白区（不压图/不压控件）。
+        _note = _ql("注：本页为引擎的无底部地板标准 CPW 模型；同类工具的 "
+                    "With/No Groundplane 指底地板选项，引擎未建模。「基片高度"
+                    "模式」下拉仅切换基片高度对 Ɛeff 的修正（有限 h 可编辑 / 厚基片 h→∞）。")
+        _note.setWordWrap(True)
+        _note.setParent(page)
+        _note.setGeometry(300, 546, 400, 66)
+        _note.show()
+        out = []
+        # 结果框实测：Z0 行 70×21（参考 515..585），其余行 90×17（515..605）
+        out.append(_res_row(page, "Z0", "Z0", "Ω", box_w=70, box_h=21))
+        out.append(_res_row(page, "elen_lambda", "Elect Length", "λ",
+                            box_w=90, box_h=17))
         out.append(_res_row(page, "elen_deg", "Elect Length", combo=["degrees", "radians"],
-                            combo_name="cpw.degunit"))
-        tmp = _res_row(page, "elen_len", "Elect Length")
+                            combo_name="cpw.degunit", box_w=90, box_h=17))
+        tmp = _res_row(page, "elen_len", "Elect Length", box_w=90, box_h=17)
         ul = _ql(_LEN_ITEMS[0])
         page.unit_labels.append(ul)
         tmp.layout().insertWidget(3, ul)
         out.append(tmp)
         out.append(_res_row(page, "delay", "Delay", combo=list(_TIME_ITEMS),
-                            combo_name="cpw.timeunit"))
-        tmp2 = _res_row(page, "wavelength", "1.0 Wavelength")
+                            combo_name="cpw.timeunit", box_w=90, box_h=17))
+        tmp2 = _res_row(page, "wavelength", "1.0 Wavelength", box_w=90, box_h=17)
         ul2 = _ql(_LEN_ITEMS[0])
         page.unit_labels.append(ul2)
         tmp2.layout().insertWidget(3, ul2)
         out.append(tmp2)
-        out.append(_res_row(page, "vp", "Vp", "fraction of c"))
-        out.append(_res_row(page, "eeff", "Ɛeff"))
-        tmp3 = _res_row(page, "shape", "Shape factor")
+        out.append(_res_row(page, "vp", "Vp", "fraction of c", box_w=90, box_h=17))
+        out.append(_res_row(page, "eeff", "Ɛeff", box_w=90, box_h=17))
+        tmp3 = _res_row(page, "shape", "Shape factor", box_w=90, box_h=17)
         page.results["shape"].setStyleSheet("background:%s;color:#777777;" % RO_BG)
         out.append(tmp3)
         return out
@@ -1876,6 +2186,9 @@ def _mk_trough(win):
         dg.box("D1", 342, 211, "100", w=46, h=15)
         dg.box("L", 136, 134, "1000", w=47, h=15)
         dg.finalize()
+    if dg is not None:
+        # 实测纠偏：39/40 是顶面棱线与外框（保留为描边），70 是正面整块填黑。
+        _spec_clean(dg, drop=(70,), outline=(39, 40))
 
     def calc(page):
         e = _e()
@@ -1918,8 +2231,15 @@ def _mk_trough(win):
                           "trough.calc2")]
 
     def rows(page):
-        out = [_ql("注：结果行 D1/D2 为几何比（槽宽 D1 / 线径 D2）；Z0 由引擎"
-                   "圆杆-平行板模型解出。")]
+        # 说明文字不参与右列行序（参与会把 Z0 顶到第二行、整列下移 51px），
+        # 放在示意图下方的空白区。
+        _note = _ql("注：结果行 D1/D2 为几何比（槽宽 D1 / 线径 D2）；Z0 由引擎"
+                    "圆杆-平行板模型解出。")
+        _note.setWordWrap(True)
+        _note.setParent(page)
+        _note.setGeometry(300, 470, 400, 50)
+        _note.show()
+        out = []
         out += _tl_rows(page, [("Z0", "Z0", "Ω"),
                                ("elen_lambda", "Elect Length", "λ"),
                                ("@deg", "Elect Length", None),
@@ -2143,7 +2463,7 @@ def _mk_bjt(win):
         "1. 输入 Vcc、Ic、VCE（图中白框，Ic 单位 mA）。",
         "2. 输入器件参数（β、VBE、VRE%、分压电流倍数）。",
         "3. 点击 Calculate [F4] 解出偏置电阻 R1/R2/RC/RE 并填入图中与分析表。",
-        "注：实机 AppCAD 的 Base Bias Network 为 R_B 单偏置（基极经一只电阻接 Vcc、"
+        "注：同类工具的 Base Bias Network 为 R_B 单偏置（基极经一只电阻接 Vcc、"
         "发射极直接接地、无 RE），拓扑与此页不同；本页按引擎的分压偏置模型"
         "（R1/R2 分压 + RE 稳定）计算，图示即引擎真实电路。"]))
     b = QtWidgets.QPushButton("Calculate [F4]")
@@ -2296,11 +2616,28 @@ def _abs(page, w, x, y, ww, hh):
 
 
 def _abs_text(page, text, x, y, w, h, align="l"):
-    """静态文本标签；(x,y,w,h) 为实测墨迹框，向外扩 2px 容纳行盒。"""
+    """静态文本标签；(x,y,w,h) 为实测墨迹框，向外扩 2px 容纳行盒。
+
+    参考图标签按 8pt Microsoft Sans Serif 排版；固定宽度小于文字宽时整词会被
+    裁成「mif」「no」这类残字，因此这里按实测文字宽扩展（对齐方式决定
+    向左/右/居中扩展），保证字体回退时也不裁字。
+    """
     lab = QtWidgets.QLabel(text, page)
+    # 控件级 QSS 优先级高于页面 QSS：无论页面/卡片样式如何，本标签都按
+    # 实机 8pt Microsoft Sans Serif 渲染，度量与渲染同源，才不会裁字。
+    lab.setStyleSheet("background:transparent; color:#000000;"
+                      " font-family:'Microsoft Sans Serif'; font-size:8pt;")
+    lab.ensurePolished()
     al = {"l": Qt.AlignLeft, "r": Qt.AlignRight,
           "c": Qt.AlignCenter}[align] | Qt.AlignVCenter
     lab.setAlignment(al)
+    need = lab.fontMetrics().horizontalAdvance(text) + 4
+    if need > w:
+        if align == "r":
+            x -= (need - w)
+        elif align == "c":
+            x -= (need - w) // 2
+        w = need
     lab.setGeometry(int(x) - 2, int(y) - 2, int(w) + 4, int(h) + 4)
     lab.show()
     return lab
@@ -2310,7 +2647,7 @@ def _grey_abs(page, obj, val, x, y, w, h):
     """右卡灰参数框（引擎未建模，仅版式复刻；值左对齐与实机一致）。"""
     bx = _num_box(obj, val, w=w)
     bx.setStyleSheet("color:#777777;")
-    bx.setToolTip("引擎未建模，仅版式复刻")
+    bx.setToolTip("引擎未建模，数值仅供参考")
     bx.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
     return _abs(page, bx, x, y, w, h)
 
@@ -2396,10 +2733,13 @@ def _style_title(page, name, title):
     if lab is None:
         lab = QtWidgets.QLabel(title, page)
         lab.setObjectName("pgtitle")
-    lab.setStyleSheet("font-family:'Times New Roman'; font-size:20pt;"
+    lab.setStyleSheet("font-family:'Times New Roman'; font-size:18pt;"
                       " font-weight:bold;")
     lab.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-    _abs(page, lab, tx, 40, 600, 26)
+    lab.ensurePolished()
+    # 标题盒按墨迹宽收窄：固定 600px 会与右侧「FET Parameters」等卡片标题相交
+    tw = min(600, lab.fontMetrics().horizontalAdvance(lab.text()) + 10)
+    _abs(page, lab, tx, 40, tw, 26)
     return lab
 
 
@@ -2488,10 +2828,10 @@ def _mk_bjt_base(win):
     b2.clicked.connect(lambda: _run_calc(page, calc2))
     if is_spec:
         # === 实机 AppCAD 固定坐标：按钮/右卡/底表全部绝对定位 ===
-        _abs(page, b, 260, 333, 81, 23)      # Calculate [F4]
-        _abs(page, b2, 346, 333, 90, 23)     # Calculate RB [F3]
+        _abs(page, b, 254, 333, 106, 23)     # Calculate [F4]（原图 81px 装不下文字）
+        _abs(page, b2, 364, 333, 122, 23)    # Calculate RB [F3]
         # -- Transistor Parameters --
-        _abs_text(page, "Transistor Parameters", 462, 88, 101, 12)
+        _abs_text(page, "Transistor Parameters", 462, 88, 130, 12)
         _abs_text(page, "hFE =", 465, 109, 28, 16, "r")
         _grey_abs(page, "bjt_base.hfemin", "50", 504, 109, 43, 16)
         _abs_text(page, "min", 552, 109, 14, 16)
@@ -2511,11 +2851,11 @@ def _mk_bjt_base(win):
         _grey_abs(page, "bjt_base.tcmin", "-25", 501, 164, 43, 18)
         _abs_text(page, "min", 549, 164, 14, 18)
         _grey_abs(page, "bjt_base.tc", "25", 579, 164, 46, 18)
-        _abs_text(page, "nom", 631, 164, 12, 18)
+        _abs_text(page, "nom", 624, 164, 12, 18)
         _grey_abs(page, "bjt_base.tcmax", "65", 652, 164, 43, 18)
         _abs_text(page, "max °C", 702, 164, 31, 18)
         # -- Design Rules（引擎未建模，仅版式复刻）--
-        _abs_text(page, "Design Rules", 535, 205, 62, 12)
+        _abs_text(page, "Design Rules", 535, 205, 76, 12)
         _abs_text(page, "VBE =", 535, 230, 83, 16, "r")
         page.vbe_box = _num_box("bjt_base.vbe", "0.78")
         page.vbe_box.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -2527,7 +2867,7 @@ def _mk_bjt_base(win):
         _abs_text(page, "ΔVbe/ΔT =", 535, 285, 83, 16, "r")
         _grey_abs(page, "bjt_base.dr_dvbe", "-2", 626, 285, 38, 16)
         _abs_text(page, "mV/°C", 674, 285, 29, 16)
-        _abs_text(page, "ΔIcbo/ΔT factor =", 535, 312, 83, 16, "r")
+        _abs_text(page, "ΔIcbo/ΔT factor =", 518, 312, 100, 16, "r")
         _grey_abs(page, "bjt_base.dr_dicbo", "2", 626, 312, 38, 16)
         _abs_text(page, "/10°C", 674, 312, 29, 16)
         # -- 底表左 Collector Current（表标题由 circ spec labels 绘制）--
@@ -2544,10 +2884,10 @@ def _mk_bjt_base(win):
         _tset(page.stab, 4, 1, "Delta Ic, Total =",
               Qt.AlignLeft | Qt.AlignVCenter, "#BEBEBE")
         # -- 表下两组 --
-        _abs_text(page, "Ic max/min ratio =", 55, 467, 83, 16)
+        _abs_text(page, "Ic max/min ratio =", 55, 467, 91, 16)
         page.icratio = _num_box("bjt_base.icratio", "", w=49, ro=True)
-        _abs(page, page.icratio, 144, 467, 49, 16)
-        _abs_text(page, "Tj max =", 213, 467, 31, 16)
+        _abs(page, page.icratio, 148, 467, 49, 16)
+        _abs_text(page, "Tj max =", 213, 467, 42, 16)
         page.tjmax = _num_box("bjt_base.tjmax", "", w=49, ro=True)
         _abs(page, page.tjmax, 261, 467, 49, 16)
         _abs_text(page, "°C", 316, 467, 12, 16)
@@ -2566,7 +2906,7 @@ def _mk_bjt_base(win):
     def _grey_row(lay, lab, obj, val, unit=""):
         bx = _num_box(obj, val)
         bx.setStyleSheet("color:#777777;")
-        bx.setToolTip("引擎未建模，仅版式复刻")
+        bx.setToolTip("引擎未建模，数值仅供参考")
         lay.addWidget(_grow(lab, bx, unit))
 
     _grey_row(l1, "Icbo =", "bjt_base.icbo", "0.1", "µA")
@@ -2576,7 +2916,7 @@ def _mk_bjt_base(win):
     _grey_row(l1, "Tc max =", "bjt_base.tcmax", "65", "°C")
     page._right.addWidget(gb1)
 
-    gb2, l2 = _grp("Design Rules（引擎未建模，仅版式复刻）")
+    gb2, l2 = _grp("Design Rules（引擎未建模，数值仅供参考）")
     for lab, key, val, unit in (("VBE =", "dr_vbe", "0.78", "V"),
                                 ("ΔhFE/ΔT =", "dr_dhfe", "0.5", "%/°C"),
                                 ("ΔVbe/ΔT =", "dr_dvbe", "-2", "mV/°C"),
@@ -2751,27 +3091,29 @@ class _DgFet(_Diagram):
             _zig_v(p, 78, 255, 280)                    # R2
             _line(p, 78, 280, 78, 292, "#000000", 2.0)
             _gnd4(p, 78, 293, 5.5)
-            self.label(24, 136, "R1")
+            self.label(84, 150, "R1")
             self.label(24, 272, "R2")
+            self.label(52, 310, "Vg =")
+            self.label(52, 336, "I2 =")
         # --- 标注文字与弧形箭头（spec §1.1 标注） ---
-        self.label(265, 105, "Vdd =")
-        self.label(270, 124, "Idd = Id")
-        self.label(89, 134, "Rd =")
-        self.label(178, 134, "[Ohms]")
-        self.label(64, 180, "I d =")
-        self.label(161, 168, "mA (target)")
-        self.label(161, 194, "mA (calc)")
-        self.label(107, 261, "Vgs =")
-        self.label(185, 261, "V")
-        self.label(251, 236, "Vds =")
-        self.label(340, 222, "V (target)")
-        self.label(341, 251, "V (calc)")
-        self.label(237, 312, "Rs =")
-        pf = QtGui.QFont("Times New Roman", 30)
+        self.label(258, 105, "Vdd =")
+        self.label(262, 128, "Idd = Id")
+        self.label(118, 134, "Rd =")
+        self.label(166, 156, "[Ohms]")
+        self.label(24, 180, "I d =")
+        self.label(232, 168, "mA (target)")
+        self.label(232, 192, "mA (calc)")
+        self.label(94, 236, "Vgs =")
+        self.label(183, 235, "V")
+        self.label(238, 236, "Vds =")
+        self.label(348, 222, "V (target)")
+        self.label(349, 251, "V (calc)")
+        self.label(232, 312, "Rs =")
+        pf = QtGui.QFont("Times New Roman", 36)
         pf.setItalic(True)
         p.setFont(pf)
-        p.drawText(84, 198, "{")                       # Id 大括号
-        p.drawText(278, 250, "{")                      # Vds 大括号
+        p.drawText(58, 201, "{")                       # Id 大括号
+        p.drawText(274, 252, "{")                      # Vds 大括号
         p.setFont(QtGui.QFont(self.font()))
         # Vgs 弧形箭头（指向栅极引线）
         path = QtGui.QPainterPath()
@@ -2783,10 +3125,10 @@ class _DgFet(_Diagram):
         _head(p, 191, 241, -0.85, -0.53)
         # Vds 弧形箭头（指向漏极输出线下方）
         path2 = QtGui.QPainterPath()
-        path2.moveTo(256, 258)
-        path2.quadTo(250, 225, 241, 206)
+        path2.moveTo(230, 262)
+        path2.quadTo(227, 232, 234, 206)
         p.drawPath(path2)
-        _head(p, 239, 202, -0.42, -0.91)
+        _head(p, 236, 202, -0.3, -0.95)
 
 def _mk_fet(win, name, title, divider):
     dg = None if divider else _spec_diagram(name)
@@ -2794,28 +3136,23 @@ def _mk_fet(win, name, title, divider):
         dg = _DgFet(divider=divider)
         # 框坐标 = spec 18 §1.2；默认值取分压合法工作点（VDD=10/ID=10mA/VDS=5）
         dg.box("vdd", 300, 93, "10" if divider else "3", w=45, h=17, obj=name + ".vdd")
-        dg.box("rd", 118, 121, "", w=57, h=19, ro=True, obj=name + ".result.rd")
+        dg.box("rd", 156, 121, "", w=55, h=19, ro=True, obj=name + ".result.rd")
         dg.box("id", 98, 156, "10" if divider else "20", w=57, h=17, obj=name + ".id")
         dg.box("idc", 98, 183, "", w=57, h=18, ro=True, obj=name + ".result.id")
-        dg.box("vgs", 136, 247, "-0.5" if divider else "", w=43, h=18,
+        dg.box("vgs", 134, 226, "-0.5" if divider else "", w=43, h=18,
                obj=name + ".vgs")
-        dg.box("vds", 299, 210, "5" if divider else "2", w=35, h=18, obj=name + ".vds")
-        dg.box("vdsc", 292, 239, "", w=43, h=19, ro=True, obj=name + ".result.vds")
-        dg.box("rs", 264, 300, "", w=57, h=18, ro=True, obj=name + ".result.rs")
-        dg.label(307, 105, "=")   # （Vdd 标签已在 draw 内）
+        dg.box("vds", 305, 210, "5" if divider else "2", w=35, h=18, obj=name + ".vds")
+        dg.box("vdsc", 298, 239, "", w=43, h=19, ro=True, obj=name + ".result.vds")
+        dg.box("rs", 270, 300, "", w=57, h=18, ro=True, obj=name + ".result.rs")
         if divider:
-                dg.box("vg", 136, 275, "1.5", w=43, h=18, obj=name + ".vg")
-                dg.box("i2", 136, 300, "1", w=43, h=18, obj=name + ".i2")
-                dg.box("r1", 100, 126, "", w=57, h=18, ro=True, obj=name + ".result.r1")
-                dg.box("r2", 100, 259, "", w=57, h=18, ro=True, obj=name + ".result.r2")
+                dg.box("vg", 94, 296, "1.5", w=43, h=18, obj=name + ".vg")
+                dg.box("i2", 94, 322, "1", w=43, h=18, obj=name + ".i2")
+                dg.box("r1", 10, 122, "", w=57, h=18, ro=True, obj=name + ".result.r1")
+                dg.box("r2", 92, 259, "", w=57, h=18, ro=True, obj=name + ".result.r2")
         dg.finalize()
     else:
-        # 实机 spec 无图内 Rs 框（Rs 只在 Bias Analysis 表）→ 隐藏框兜底
-        _rs = QtWidgets.QLineEdit(dg)
-        _rs.setReadOnly(True)
-        _rs.hide()
-        _rs.setObjectName(name + ".result.rs")
-        dg.fields["rs"] = _rs
+        # 规格页已含 rs 只读框（appcad_circ 阴影位 (263,279,56,17)），无需兜底
+        pass
 
 
     page = _b_shell(win, name, title)
@@ -2900,44 +3237,44 @@ def _mk_fet(win, name, title, divider):
     b.clicked.connect(lambda: _run_calc(page, calc))
     if is_spec:
         # === 实机 AppCAD 固定坐标：右卡/按钮/底表全部绝对定位 ===
-        _abs_text(page, "FET Parameters", 423, 64, 76, 12)
-        _abs_text(page, "V'p =", 425, 88, 24, 18)
+        _abs_text(page, "FET Parameters", 423, 64, 110, 12)
+        _abs_text(page, "V'p =", 425, 88, 28, 18)
         _grey_abs(page, name + ".vpmin", "-0.65", 459, 88, 43, 18)
         _grey_abs(page, name + ".vptyp", "-0.5", 546, 88, 43, 18)
         _grey_abs(page, name + ".vpmax", "-0.35", 630, 88, 43, 18)
         _abs_text(page, "min", 510, 88, 16, 18)
         _abs_text(page, "typ", 596, 88, 14, 18)
-        _abs_text(page, "max", 679, 88, 19, 18)
-        _abs_text(page, "V", 703, 88, 8, 18)
-        _abs_text(page, "V'p spec'd at =", 425, 115, 68, 18, "r")
+        _abs_text(page, "max", 676, 88, 19, 18)
+        _abs_text(page, "V", 707, 88, 8, 18)
+        _abs_text(page, "V'p spec'd at =", 411, 115, 82, 18, "r")
         _grey_abs(page, name + ".vp10", "10", 499, 115, 42, 18)
-        _abs_text(page, "% Idss", 551, 115, 30, 18)
-        _abs_text(page, "ΔVp/ΔT =", 589, 115, 46, 18, "r")
+        _abs_text(page, "% Idss", 547, 115, 30, 18)
+        _abs_text(page, "2Vp/Tc =", 588, 115, 48, 18, "r")
         _grey_abs(page, name + ".dvpt", "0", 640, 115, 52, 18)
         _abs_text(page, "mV/°C", 695, 115, 26, 18)
-        _abs_text(page, "Vp =", 425, 142, 23, 18)
+        _abs_text(page, "Vp =", 425, 142, 27, 18)
         _grey_abs(page, name + ".vpmn", "", 458, 142, 46, 18)
         _grey_abs(page, name + ".vp", "", 545, 142, 46, 18)
         _grey_abs(page, name + ".vpmx", "", 629, 142, 46, 18)
         _abs_text(page, "min", 510, 142, 16, 18)
         _abs_text(page, "typ", 600, 142, 14, 18)
-        _abs_text(page, "max", 685, 142, 19, 18)
-        _abs_text(page, "V", 709, 142, 8, 18)
-        _abs_text(page, "Idss =", 424, 185, 28, 18)
+        _abs_text(page, "max", 681, 142, 19, 18)
+        _abs_text(page, "V", 712, 142, 8, 18)
+        _abs_text(page, "Idss =", 424, 185, 32, 18)
         _grey_abs(page, name + ".idssmin", "58", 458, 185, 52, 18)
         _grey_abs(page, name + ".idss", "65", 542, 185, 52, 18)
         _grey_abs(page, name + ".idssmax", "72", 624, 185, 52, 18)
         _abs_text(page, "min", 515, 185, 16, 18)
         _abs_text(page, "typ", 600, 185, 14, 18)
-        _abs_text(page, "max", 680, 185, 19, 18)
-        _abs_text(page, "mA", 705, 185, 15, 18)
-        _abs_text(page, "ΔIdss/ΔT =", 424, 211, 56, 18, "r")
+        _abs_text(page, "max", 676, 185, 19, 18)
+        _abs_text(page, "mA", 708, 185, 15, 18)
+        _abs_text(page, "ΔIdss/ΔT =", 424, 211, 62, 18, "r")
         _grey_abs(page, name + ".didsst", "-0.13", 487, 211, 43, 18)
-        _abs_text(page, "% Idss/°C", 536, 211, 46, 18)
-        _abs_text(page, "θJC =", 604, 211, 25, 18, "r")
+        _abs_text(page, "% Idss/°C", 536, 211, 52, 18)
+        _abs_text(page, "θJC =", 604, 211, 29, 18, "r")
         _grey_abs(page, name + ".tjc", "300", 635, 211, 46, 18)
         _abs_text(page, "°C/W", 685, 211, 29, 18)
-        _abs_text(page, "Analysis Temperatures", 422, 259, 106, 12)
+        _abs_text(page, "Analysis Temperatures", 422, 259, 124, 12)
         _grey_abs(page, name + ".tcmin", "-25", 464, 278, 43, 18)
         _grey_abs(page, name + ".tc", "25", 542, 278, 46, 18)
         _grey_abs(page, name + ".tcmax", "65", 623, 278, 43, 18)
@@ -2945,7 +3282,7 @@ def _mk_fet(win, name, title, divider):
         _abs_text(page, "min", 512, 278, 16, 18)
         _abs_text(page, "nom", 592, 278, 20, 18)
         _abs_text(page, "max °C", 672, 278, 33, 18)
-        _abs(page, b, 413, 330, 81, 22)     # Calculate [F4]
+        _abs(page, b, 405, 330, 108, 22)    # Calculate [F4]（81px 装不下文字）
         # 底表 Bias Analysis（表标题由 circ spec labels 绘制，勿加 QLabel）
         page.table = _abs_table(page, name + ".table", 41, 418, 331, 66,
                                 4, 4, (67, 88, 88, 86), 16)
@@ -2961,8 +3298,8 @@ def _mk_fet(win, name, title, divider):
 
     if not divider:
         # audit blocker 5：右列恢复真实输入框（预填原图默认值；引擎未建模 →
-        # 灰字样式 + tooltip「引擎未建模，仅版式复刻」，仍可编辑）
-        _TIP = "引擎未建模，仅版式复刻"
+        # 灰字样式 + tooltip「引擎未建模，数值仅供参考」，仍可编辑）
+        _TIP = "引擎未建模，数值仅供参考"
 
         def _grey(obj, val):
             bx = _num_box(obj, val)
@@ -3047,15 +3384,15 @@ class _DgPae(_Diagram):
 
 def _mk_pae(win):
     dg = _DgPae()
-    dg.box("pin", 30, 176, "-30", obj="pae.pin")
+    dg.box("pin", 46, 176, "-30", obj="pae.pin")
     dg.label(0, 178, "Pin =")
-    dg.label(88, 178, "dBm")
+    dg.label(112, 178, "dBm")
     dg.box("pout", 300, 100, "40", obj="pae.pout")
     dg.label(252, 102, "Pout =")
     dg.label(360, 102, "dBm")
-    dg.box("pdc", 300, 140, "10", obj="pae.pdc")
-    dg.label(252, 142, "PDC =")
-    dg.label(360, 142, "W")
+    dg.box("pdc", 300, 126, "10", obj="pae.pdc")
+    dg.label(252, 128, "PDC =")
+    dg.label(360, 128, "W")
     dg.box("gain", 300, 180, "", ro=True, obj="pae.result.gain")
     dg.label(252, 182, "Gain =")
     dg.label(360, 182, "dB")
@@ -3562,20 +3899,21 @@ def _mk_noisecalc(win):
 
 def _nc_calc_wrap(page, fn):
     """NoiseCalc 计算兜底：坏格/异常 → LED 红 + ✗ + 状态栏，绝不崩。"""
+    tag = _page_tag(page)
     try:
         msg = fn()
-        page.window().status().showMessage("noisecalc：%s" % msg, 8000)
+        page.window().status().showMessage("%s：计算完成 —— %s" % (tag, msg), 8000)
     except _InputError as exc:
         page.led.set_state(False, "错误")
         page.err.setText("✗ " + str(exc))
         page.err.show()
-        page.window().status().showMessage("noisecalc：失败——%s" % exc)
+        page.window().status().showMessage("%s：失败——%s" % (tag, exc))
     except Exception as exc:
         page.led.set_state(False, "错误")
         page.err.setText("✗ 界面错误：%s: %s" % (type(exc).__name__, exc))
         page.err.show()
         page.window().status().showMessage(
-            "noisecalc：失败——%s: %s" % (type(exc).__name__, exc))
+            "%s：失败——%s: %s" % (tag, type(exc).__name__, exc))
 
 
 def _nc_clear(page):
@@ -3637,7 +3975,7 @@ class _DgReflection(_Diagram):
         self.label(420, 181, "Load")
         # 大括号（罩住右列 |Γ|/ZI/YI 三行）
         p.setFont(QtGui.QFont("Times New Roman", 40))
-        p.drawText(514, 224, "{")
+        p.drawText(510, 224, "{")
         p.setFont(QtGui.QFont(self.font()))
         # 前向绿缎带箭头（尾部 V 形缺口 + 三角头）
         _poly(p, [(253, 252), (436, 252), (436, 244), (459, 269), (436, 293),
@@ -3664,10 +4002,10 @@ def _mk_reflection(win):
     dg.box("gdeg", 568, 177, "", w=64, h=21, obj="refl.gdeg")
     dg.label(526, 191, "Γ∠°")
     dg.box("zl", 568, 202, "", w=64, h=21, obj="refl.zl")
-    dg.label(526, 216, "ZI =")
+    dg.label(532, 216, "ZI =")
     dg.label(638, 216, "Ω")
     dg.box("yl", 568, 227, "", w=64, h=21, obj="refl.yl")
-    dg.label(526, 241, "YI =")
+    dg.label(532, 241, "YI =")
     dg.label(637, 241, "mho")
     # 功率行（绿箭头区，spec 21 原位）：Pi / Pt / Pr 任填两个回车算第三个
     dg.box("pt", 117, 262, "", w=64, h=21, obj="refl.pt")
@@ -3711,6 +4049,12 @@ def _mk_reflection(win):
         page.pt2_box = dg.fields["pt2"]
         page.pr_box = dg.fields["pr"]
         out.append(_res_row(page, "vswr", "SwR", ": 1"))
+        return out
+
+    def mids(page):
+        # RL/Lmn/T 结果行 + 灰显附加组放图下方（左列）：右列行最小宽 ~370，
+        # 加左图 660 超出页宽 950，HBox 挤压致右列压入图内（几何碰撞自查证实）。
+        out = []
         out.append(_res_row(page, "rl", "Return Loss, RL", "dB"))
         out.append(_res_row(page, "lmn", "Mismatch Loss, Lmn", "dB"))
         out.append(_res_row(page, "t_ratio", "Transmission Coefficient, T",
@@ -3783,7 +4127,7 @@ def _mk_reflection(win):
         return out
 
     page = _a_shell(win, "reflection", "反射计算器 Reflection Calculator", dg,
-                    mids_fn=None, buttons_fn=None, rows_fn=rows)
+                    mids_fn=mids, buttons_fn=None, rows_fn=rows)
 
     # Enter 驱动：任一编辑框 editingFinished → 链式重算（实机此页无 Calculate 钮）
     src_map = {"refl.gamma": "gamma", "refl.zl": "zl", "refl.yl": "yl",
@@ -4090,6 +4434,7 @@ class _IMGraph(QtWidgets.QWidget):
     def paintEvent(self, ev):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
         p.translate(-self.OX, -self.OY)
         INK = "#1F1A17"
         _pen(p, INK, 2.0)
@@ -4169,6 +4514,7 @@ class _AmpGlyph(QtWidgets.QWidget):
     def paintEvent(self, ev):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
         w, h = self.width(), self.height()
         # audit blocker 4：浅青矩形放大器（#DAECEE 黑边）+ 进出箭头线
         x0, x1 = w * 0.3, w * 0.82
@@ -4302,17 +4648,27 @@ def _mk_intermod(win):
     page.gsig_box = _sbox("intermod.gsig")
     page.gim_box = _sbox("intermod.gim")
     page.gimdbc_box = _sbox("intermod.gimdbc")
-    for col, lab in enumerate(("IP3 =", "Sig =", "IM =", "IM (dBc) =")):
-        sg.addWidget(_ql(lab, align_right=True), 0, col * 2)
-    sg.addWidget(page.gip3_box, 0, 1)
-    sg.addWidget(_ql("dBm"), 0, 2)
-    sg.addWidget(page.gsig_box, 0, 3)
-    sg.addWidget(_ql("dBm"), 0, 4)
-    sg.addWidget(page.gim_box, 0, 5)
-    sg.addWidget(_ql("dBm"), 0, 6)
-    sg.addWidget(page.gimdbc_box, 0, 7)
-    sg.addWidget(_ql("dBc"), 0, 8)
-    right.addWidget(side)
+    # 标签/单位给定宽：QLabel hint 按样式表生效前的默认字体计算（约 7px），
+    # 实际绘制 ~12px，靠 hint 布局必然挤压互叠（offscreen 与实机同病）。
+    # 每组占 3 列（标签|输入框|单位），共 12 列——旧版 9 列里下一组标签
+    # 与上一组单位挤进同一列，是顶行互叠的根源。
+    _side_boxes = (page.gip3_box, page.gsig_box, page.gim_box, page.gimdbc_box)
+    for col, (lab, lab_w) in enumerate((("IP3 =", 48), ("Sig =", 48),
+                                        ("IM =", 44), ("IM (dBc) =", 84))):
+        c = col * 3
+        sg.addWidget(_ql(lab, align_right=True, w=lab_w), 0, c)
+        sg.addWidget(_side_boxes[col], 0, c + 1)
+    sg.addWidget(_ql("dBm", w=36), 0, 2)
+    sg.addWidget(_ql("dBm", w=36), 0, 5)
+    sg.addWidget(_ql("dBm", w=36), 0, 8)
+    sg.addWidget(_ql("dBc", w=32), 0, 11)
+    # audit blocker 4：整行移出右列放标题下——本行最小宽 ~730 > 右列 ~500，
+    # 挤压致标签互叠且溢出页缘（子件排到 x>1180）；整行右对齐与原版位置
+    # 一致，独立成行与 body 各列零相交。
+    side_row = QtWidgets.QHBoxLayout()
+    side_row.addStretch(1)
+    side_row.addWidget(side)
+    v.addLayout(side_row)
     graph = _IMGraph()
     page.graph = graph
     right.addWidget(graph, 1)
@@ -4522,15 +4878,15 @@ class _DgThermal(_Diagram):
         # ---- 左：3D 封装插画（AC 源 → IC → 负载电阻 → 地） ----
         p.setBrush(Qt.NoBrush)
         _pen(p)
-        p.drawEllipse(QtCore.QRectF(66, 228, 30, 30))
+        p.drawEllipse(QtCore.QRectF(56, 228, 30, 30))
         f = QtGui.QFont("Times New Roman", 13)
         f.setItalic(True)
         p.setFont(f)
-        p.drawText(74, 249, "~")
-        _line(p, 66, 262, 96, 262)
-        _line(p, 72, 268, 90, 268)
-        _line(p, 77, 274, 85, 274)
-        _line(p, 96, 243, 122, 243)                       # 源 → 封装左引脚
+        p.drawText(64, 249, "~")
+        _line(p, 56, 262, 86, 262)
+        _line(p, 62, 268, 80, 268)
+        _line(p, 67, 274, 75, 274)
+        _line(p, 86, 243, 122, 243)                       # 源 → 封装左引脚
         # 等距 IC 封装（顶/左/右三面）
         _poly(p, [(122, 230), (196, 206), (244, 222), (170, 247)], "#3D3D3D")
         _poly(p, [(122, 230), (170, 247), (170, 297), (122, 279)], "#8A8A8A")
@@ -4552,8 +4908,7 @@ class _DgThermal(_Diagram):
         _line(p, 254, 312, 270, 312)
         _line(p, 257, 317, 267, 317)
         # ---- 右：五层热阻剖面 ----
-        _line(p, 430, 135, 468, 135, "#404040", 1.0, dash=[2, 2])
-        _head(p, 474, 135, 1.0, 0.0, "#404040")
+        # （顶部悬空虚线箭头已删：与任何元素都不相连，属冗余装饰）
         # 行标签（右对齐 + →）
         rows = (("Semiconductor", 196), ("Lead frame", 214),
                 ("Package material", 244), ("PCB", 292), ("Heatsink", 322))
@@ -4812,6 +5167,7 @@ def _mk_comp_values(win):
         bt.setObjectName("comp_values." + nm)
         bt.setIcon(_cmv_icon(kind))
         bt.setFixedSize(72, 38)
+        bt.setIconSize(QtCore.QSize(56, 28))   # 不设则 Qt 默认 ~16px，glyph 过小
         bt.setCheckable(True)
         irow.addWidget(bt)
     irow.addStretch(1)
@@ -5513,6 +5869,7 @@ class _SpcsFrame(QtWidgets.QFrame):
     def paintEvent(self, ev):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing)
         w, h = self.width(), self.height()
         pen = _pen(p, "#817800", 3.0)
         p.drawRoundedRect(10, 10, w - 20, h - 20, 14, 14)
@@ -5556,7 +5913,7 @@ def _mk_spcs(win):
     fv = QtWidgets.QVBoxLayout(frame)
     fv.setContentsMargins(30, 180, 30, 24)
     fv.addSpacing(150)
-    wel = _ql("欢迎 Welcome！这里是半导体保护协会（clean-room 幽默复刻页，"
+    wel = _ql("欢迎 Welcome！这里是半导体保护协会（clean-room 幽默页，"
               "文案自拟，与原应用无文案派生关系）。")
     wel.setWordWrap(True)
     fv.addWidget(wel)
@@ -5747,8 +6104,11 @@ class _DgSmith(_Diagram):
                     p.drawText(QtCore.QRectF(lx - 12, ly - 8, 34, 14),
                                Qt.AlignLeft | Qt.AlignVCenter, "%g" % val)
         # 实轴刻度数字（右行在轴上方、左行在轴下方）
-        for rv, lx in self.R_LABEL_X.items():
-            p.drawText(QtCore.QRectF(lx - 8, cy - 17, 30, 13),
+        # 正实轴 r 标签：间距随 r 压缩（右端 13-22px），单行会互相叠字——
+        # 奇偶交替上（cy-17）/下（cy+5）错行，下排走轴线下方空带。
+        for i, (rv, lx) in enumerate(self.R_LABEL_X.items()):
+            ly = cy - 17 if i % 2 == 0 else cy + 5
+            p.drawText(QtCore.QRectF(lx - 8, ly, 30, 13),
                        Qt.AlignLeft | Qt.AlignVCenter, "%g" % rv)
         for rv, lx in self.AX_LABEL_X.items():
             p.drawText(QtCore.QRectF(lx - 10, cy + 5, 32, 13),
@@ -6058,10 +6418,10 @@ class _DgBalun(_Diagram):
         p.drawText(QtCore.QPointF(38, 449), "Solution 2:   4-element Balun")
         f2 = QtGui.QFont("Times New Roman", 10)
         p.setFont(f2)
-        p.drawText(QtCore.QPointF(362, 233), "- 90?")
-        p.drawText(QtCore.QPointF(362, 349), "+ 90?")
-        p.drawText(QtCore.QPointF(362, 467), "- 90?")
-        p.drawText(QtCore.QPointF(362, 583), "+ 90?")
+        p.drawText(QtCore.QPointF(362, 233), "- 90°")
+        p.drawText(QtCore.QPointF(362, 349), "+ 90°")
+        p.drawText(QtCore.QPointF(362, 467), "- 90°")
+        p.drawText(QtCore.QPointF(362, 583), "+ 90°")
         p.drawText(QtCore.QPointF(560, 235), "Zload = R + jX")
         p.drawText(QtCore.QPointF(560, 466), "Zload = R + jX")
         p.drawText(QtCore.QPointF(684, 152), "MHz")
@@ -6148,10 +6508,14 @@ def _mk_balun(win):
     dg.box("rg1", 55, 257, "50", w=36, obj="balun.rg1")
     dg.box("r1", 606, 257, "50", w=54, obj="balun.r1")
     dg.box("x1", 616, 299, "0", w=50, obj="balun.x1")
+    dg.label(606, 253, "R =")
+    dg.label(606, 295, "jX =")
     dg.box("cp1", 298, 365, "0", w=47, obj="balun.cp1")
     dg.box("rg2", 55, 491, "", w=36, obj="balun.rg2")
     dg.box("r2", 606, 491, "", w=54, obj="balun.r2")
     dg.box("x2", 616, 533, "", w=50, obj="balun.x2")
+    dg.label(606, 487, "R =")
+    dg.label(606, 529, "jX =")
     dg.box("cp2", 298, 599, "", w=47, obj="balun.cp2")
     dg.finalize()
     page.dg = dg
@@ -6201,10 +6565,13 @@ def _mk_balun(win):
     page.results["zi"] = le
     grid.addWidget(le, 3, 1)
     grid.addWidget(_ql("Ohm"), 3, 3)
+    # 结果栅格下移到底部：图中 Zload 输入框（spec bbox x≈606-676）伸入右栏，
+    # 网格紧跟按钮会与 Solution 1/2 的 R/jX 框重叠；先 stretch 把网格压到
+    # 图下部之下，再接错误提示。
+    page._right.addStretch(1)
     page._right.addLayout(grid)
     page._right.addSpacing(6)
     page._right.addWidget(page.err, 0, Qt.AlignLeft)
-    page._right.addStretch(1)
 
     def _pick(a, b_, default, name):
         if a.text().strip():
@@ -6243,148 +6610,325 @@ def _mk_balun(win):
 
 # ---- 3) RFIC 电压偏置（spec_ac2 §1）---------------------------------------
 
-class _DgRficV(_Diagram):
-    """Voltage-Biased RFIC：传输链 Cin-AMP-Cout + 输出侧偏置 T（Cb/RFC）。"""
+class _CanvasDg(_Diagram):
+    """手工版式页画布：966×669，绘制坐标 = 页面坐标（OX/OY = 0）。
+
+    参考图的标注是 8pt 正体（VB6 位图字体），因此这里不用基类的
+    Times 11pt 斜体，改在 paintEvent 里按 Microsoft Sans Serif 8pt 绘制。
+    """
+
+    LW, LH = 966.0, 669.0
+    OX, OY = 0.0, 0.0
+    BG = "#E5ECEF"
+
+    def __init__(self, name=None):
+        _Diagram.__init__(self, name)
+        self.spec = {"bg": self.BG}
+
+    def paintEvent(self, ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+        base = self._labels
+        self._labels = []
+        try:
+            self.draw(p)
+        except Exception:
+            pass
+        dyn = self._labels
+        self._labels = base
+        seen = set()
+        p.setFont(QtGui.QFont("Microsoft Sans Serif", 8))
+        p.setPen(_pen(p))
+        for lx, ly, txt, ang in base + dyn:
+            k = (round(lx, 2), round(ly, 2), txt, round(ang, 2))
+            if k in seen:
+                continue
+            seen.add(k)
+            p.save()
+            p.translate(lx, ly)
+            if ang:
+                p.rotate(ang)
+            p.drawText(0, 0, txt)
+            p.restore()
+        p.end()
+
+
+def _dg_label(dg, txt, by, x=None, rx=None):
+    """示意图标注：给 rx 时右端对齐（8pt 正体比参考位图字宽，须贴框排版）。"""
+    if x is None:
+        fm = QtGui.QFontMetrics(QtGui.QFont("Microsoft Sans Serif", 8))
+        x = int(rx) - fm.horizontalAdvance(txt)
+    dg.label(int(x), int(by), txt)
+
+
+# 手工版式页标题：参考图里是 MS Sans 正体，各页字号不同（实测字冠高度）
+_TITLE_FONT = {
+    "rfic_v": ("Microsoft Sans Serif", 18, 0),
+    "rfic_i": ("Microsoft Sans Serif", 18, 0),
+    "det_large": ("Microsoft Sans Serif", 20, -6),
+}
+
+
+def _canvas_page(win, name, title, dg):
+    """手工版式页外壳：966×669 固定画布 + 1:1 chrome，并注册进页面栈。"""
+    page = _spec_shell(win, name, title, dg)
+    win._pages[name] = page
+    win._order.append(name)
+    win._stack.addWidget(page)
+    # 标题文案/字号按本页参考图（chrome 里的 TITLES 是别的页名或用 Times）
+    tlab = page.findChild(QtWidgets.QLabel, "pgtitle")
+    if tlab is not None:
+        tlab.setText(title)
+        fam, pt, dx = _TITLE_FONT.get(name,
+                                      ("Microsoft Sans Serif", 18, 0))
+        tf = QtGui.QFont(fam, pt)
+        tlab.setFont(tf)
+        tlab.setStyleSheet("background:transparent; color:#000000;"
+                           " font-family:'%s'; font-size:%dpt;" % (fam, pt))
+        tlab.ensurePolished()
+        # 标题只占文字宽度，避免 560px 的标签框压到右侧原理图输入框
+        tw = tlab.fontMetrics().horizontalAdvance(title) + 8
+        tlab.setGeometry(tlab.x() + dx, tlab.y(),
+                         max(120, tw), tlab.height())
+    # 错误行锚在页面左下空白处，避免压住原理图与结果区
+    page.err.setGeometry(30, 604, 700, 18)
+    return page
+
+
+def _abs_bold(page, text, x, y, w, h, align="l"):
+    """粗体静态标注：按文字宽自动扩宽，避免 8pt 回退时裁字。"""
+    lab = QtWidgets.QLabel(text, page)
+    lab.setStyleSheet("background:transparent; color:#000000;"
+                      " font-family:'Microsoft Sans Serif'; font-size:8pt;"
+                      " font-weight:bold;")
+    lab.ensurePolished()
+    lab.setAlignment({"l": Qt.AlignLeft, "r": Qt.AlignRight,
+                      "c": Qt.AlignCenter}[align] | Qt.AlignVCenter)
+    need = lab.fontMetrics().horizontalAdvance(text) + 4
+    if need > w:
+        if align == "r":
+            x -= (need - w)
+        elif align == "c":
+            x -= (need - w) // 2
+        w = need
+    lab.setGeometry(int(x) - 2, int(y) - 2, int(w) + 4, int(h) + 4)
+    lab.show()
+    return lab
+
+
+def _abs_box(dg, page, key, x, y, w, h, value="", obj=None, ro=False, left=False):
+    """图形内输入框：页面绝对坐标摆放，并注册进 dg.fields（控件契约）。"""
+    le = QtWidgets.QLineEdit(page)
+    le.setText(value)
+    le.setAlignment(Qt.AlignLeft if left else Qt.AlignRight)
+    if ro:
+        le.setReadOnly(True)
+        le.setStyleSheet("QLineEdit{background:%s;color:#555555;"
+                         "padding:0px 3px;}" % RO_BG)
+    else:
+        le.setStyleSheet("QLineEdit{padding:0px 3px;}")
+    le.setObjectName(obj or ("%s.%s" % (dg._name, key)))
+    le.setGeometry(int(x), int(y), int(w), int(h))
+    le.show()
+    dg.fields[key] = le
+    return le
+
+
+def _abs_result(page, obj, x, y, w=70, h=19):
+    """只读结果框：页面绝对坐标摆放，并登记到 page.results。"""
+    le = QtWidgets.QLineEdit(page)
+    le.setReadOnly(True)
+    le.setAlignment(Qt.AlignRight)
+    le.setObjectName(obj)
+    le.setStyleSheet("background:%s;color:#555555;padding:0px 3px;" % RO_BG)
+    le.setGeometry(int(x), int(y), int(w), int(h))
+    le.show()
+    page.results[obj.rsplit(".", 1)[-1]] = le
+    return le
+
+
+def _abs_num(page, obj, value, x, y, w, h=19, left=False):
+    """页面坐标的数值输入框（_num_box 不带父控件，绝对版式必须显式设父）。"""
+    le = QtWidgets.QLineEdit(str(value), page)
+    le.setObjectName(obj)
+    le.setAlignment(Qt.AlignLeft if left else Qt.AlignRight)
+    le.setStyleSheet("QLineEdit{padding:0px 3px;}")
+    le.setGeometry(int(x), int(y), int(w), int(h))
+    le.show()
+    return le
+
+
+def _abs_btn(page, text, obj, x, y, w, h, tip=""):
+    b = QtWidgets.QPushButton(text, page)
+    b.setObjectName(obj)
+    b.setGeometry(int(x), int(y), int(w), int(h))
+    if tip:
+        b.setToolTip(tip)
+    b.show()
+    return b
+
+
+def _abs_radio(parent, text, x, y, w=160, checked=False):
+    rb = QtWidgets.QRadioButton(text, parent)
+    rb.setGeometry(int(x), int(y), int(w), 18)
+    rb.setChecked(bool(checked))
+    rb.show()
+    return rb
+
+
+class _DgRficV(_CanvasDg):
+    """Voltage-Biased RFIC：频率响应示意 + Cin-AMP-Cout 链 + Cb/RFC 偏置。
+
+    坐标全部按参考图（966×669）实测：主链 y=181，放大器盒 (451,157)-(528,209)，
+    偏置支路 x=560，Cb 支路 y=104。
+    """
 
     NAME = "rfic_v"
-    LW, LH = 720.0, 340.0
-    OX, OY = 280.0, 80.0
 
     def draw(self, p):
-        # 主传输链 y=205
-        _line(p, 322, 205, 338, 205)
-        _port_node(p, 322, 205, 3.0)
-        _cap_h(p, 345, 205, 16, 4.5)
-        _line(p, 350, 205, 452, 205)
-        # 放大器矩形 + 内三角
-        _poly(p, [(452, 176), (537, 176), (537, 235), (452, 235)], "#CFE6DE")
-        _poly(p, [(462, 186), (523, 205), (462, 224)], "#CFE6DE")
-        _line(p, 537, 205, 565, 205)
-        _line(p, 489, 235, 489, 246)
-        _gnd4(p, 489, 246)
-        _port_node(p, 565, 205, 3.0, filled=True)
-        _line(p, 565, 205, 596, 205)
-        _cap_h(p, 604, 205, 16, 4.5)
-        _line(p, 609, 205, 665, 205)
-        _port_node(p, 665, 205, 3.0)
-        _line(p, 665, 205, 675, 205)
-        _line(p, 675, 205, 675, 236)
-        # 左右端口源/负载
-        _line(p, 322, 205, 322, 238)
-        _port_node(p, 322, 244, 9.0)
-        _gnd4(p, 322, 258)
-        _port_node(p, 675, 244, 9.0)
-        _gnd4(p, 675, 258)
-        # 偏置支路：Vs 节点 → RFC → N2；Vs → Cb → 地
-        _port_node(p, 567, 105, 3.0)
-        _line(p, 567, 105, 567, 138)
-        _coil_v(p, 567, 138, 176, n=3, r=7)
-        _line(p, 567, 176, 567, 205)
-        _line(p, 567, 105, 596, 122)
-        _line(p, 596, 122, 596, 122)
-        _line(p, 596, 116, 596, 132, "#000000", 1.8)
-        _line(p, 604, 116, 604, 132, "#000000", 1.8)
-        _line(p, 604, 122, 610, 122)
-        _line(p, 610, 122, 610, 132)
-        _gnd4(p, 610, 132)
-        # 图形区标注
-        self.label(299, 222, "Z0")
-        self.label(686, 230, "Z0")
-        self.label(356, 236, "Cin =")
-        self.label(428, 270, "Gain =")
-        self.label(527, 270, "dB")
-        self.label(560, 234, "Cout =")
-        self.label(334, 152, "Z0 =")
-        self.label(424, 152, "Ω")
-        self.label(540, 108, "Vs")
-        self.label(598, 108, "Cb =")
-        self.label(566, 178, "RFC =")
+        # ---- 频率响应示意（纵轴 x=55，横轴 y=214，通带梯形 78..175）----
+        _line(p, 55, 134, 55, 214)
+        _line(p, 55, 214, 202, 214)
+        _poly(p, [(55, 214), (78, 163), (175, 163), (198, 214)], None)
+        _line(p, 79, 163, 79, 214, "#000000", 1.0, dash=(2, 3))
+        _line(p, 165, 163, 165, 214, "#000000", 1.0, dash=(2, 3))
+        _line(p, 82, 168, 96, 214, "#000000", 1.0, dash=(1, 3))
+        _line(p, 100, 170, 118, 214, "#000000", 1.0, dash=(1, 3))
+        _line(p, 161, 168, 147, 214, "#000000", 1.0, dash=(1, 3))
+        _line(p, 143, 170, 125, 214, "#000000", 1.0, dash=(1, 3))
+        _dg_label(self, "F1", 230, x=72)
+        _dg_label(self, "F2", 230, x=173)
+        # ---- 主传输链 y=181 ----
+        _line(p, 321, 181, 348, 181)
+        _port_node(p, 350, 181, 2.5)
+        _line(p, 353, 181, 390, 181)
+        _cap_h(p, 396.5, 181, 18, 2.5)
+        _line(p, 401, 181, 451, 181)
+        _poly(p, [(451, 157), (528, 157), (528, 209), (451, 209)], "#CFE6DE")
+        _poly(p, [(472, 168), (512, 181), (472, 194)], "#CFE6DE")
+        _line(p, 528, 181, 557, 181)
+        _port_node(p, 560, 181, 2.5, filled=True)
+        _line(p, 562, 181, 612, 181)
+        _cap_h(p, 617.5, 181, 18, 2.5)
+        _line(p, 622, 181, 645, 181)
+        _port_node(p, 648, 181, 2.5)
+        _line(p, 650, 181, 677, 181)
+        # ---- 左端 Z0 阻抗 + 源 + 地；右端 Z0 负载 ----
+        _line(p, 321, 181, 321, 196)
+        _zig_v(p, 321, 196, 216, w=4.0, n=4)
+        _line(p, 321, 216, 321, 222)
+        _port_node(p, 321, 229, 7.0)
+        _line(p, 321, 236, 321, 244)
+        _gnd4(p, 321, 244)
+        _line(p, 677, 181, 677, 206)
+        _zig_v(p, 677, 206, 226, w=4.0, n=4)
+        _line(p, 677, 226, 677, 244)
+        _gnd4(p, 677, 244)
+        # ---- 偏置支路：Vs(561,81) → 节点(560,104) → Cb → 地；节点 → RFC → 干线 ----
+        _port_node(p, 561, 81, 2.0)
+        _line(p, 560, 81, 560, 104)
+        _port_node(p, 560, 104, 2.5, filled=True)
+        _line(p, 560, 104, 584, 104)
+        _cap_h(p, 589.5, 104, 18, 2.5)
+        _line(p, 592, 104, 614, 104)
+        _line(p, 614, 104, 614, 118)
+        _gnd4(p, 614, 118)
+        _line(p, 560, 104, 560, 118)
+        _coil_v(p, 560, 118, 143, n=4, r=3.5)
+        _line(p, 560, 143, 560, 181)
+        # ---- 放大器接地 ----
+        _line(p, 489, 209, 489, 224)
+        _gnd4(p, 489, 224)
+        # ---- 标注：左于框者右端贴框，右于框者左端让位 ----
+        _dg_label(self, "Z0", 201, x=297)
+        _dg_label(self, "Z0", 216, x=684)
+        _dg_label(self, "Cin =", 213, rx=367)
+        _dg_label(self, "Cout =", 213, rx=584)
+        _dg_label(self, "Gain =", 244, rx=467)
+        _dg_label(self, "dB", 244, x=525)
+        _dg_label(self, "Z0 =", 128, rx=363)
+        _dg_label(self, "Ω", 128, x=415)
+        _dg_label(self, "Vs", 85, x=537)
+        _dg_label(self, "Cb =", 86, rx=607)
+        _dg_label(self, "RFC =", 149, rx=607)
 
 
 def _mk_rfic_v(win):
-    page = _b_shell(win, "rfic_v", "电压偏置 RFIC Voltage-Biased Circuit")
-    page.setStyleSheet(_page_css("rfic_v", "#ECECEC"))
-    dg = _DgRficV()
-    dg.box("cin", 394, 222, "", w=31, obj="rfic_v.cin")
-    dg.box("cout", 601, 222, "", w=47, obj="rfic_v.cout")
-    dg.box("gain", 474, 254, "17", w=48, obj="rfic_v.gain")
-    dg.box("z0", 366, 136, "50", w=54, obj="rfic_v.z0")
-    dg.box("cb", 632, 94, "", w=36, obj="rfic_v.cb")
-    dg.box("rfc", 604, 164, "", w=46, obj="rfic_v.rfc")
+    dg = _DgRficV("rfic_v")
+    page = _canvas_page(win, "rfic_v", "Voltage-Biased Circuit", dg)
+    # 图形内输入框（实测框位）：Z0 / Cin / Cout / Gain / Cb / RFC
+    _abs_box(dg, page, "z0", 366, 115, 44, 19, "50")
+    _abs_box(dg, page, "cin", 370, 199, 50, 18)
+    _abs_box(dg, page, "cout", 587, 199, 50, 18)
+    _abs_box(dg, page, "gain", 470, 230, 51, 19, "17")
+    _abs_box(dg, page, "cb", 610, 74, 50, 18)
+    _abs_box(dg, page, "rfc", 610, 137, 50, 18)
     dg.finalize()
-    page._left.addWidget(dg)
-    frow = QtWidgets.QHBoxLayout()
-    page.f1 = _num_box("rfic_v.f1", "834", 58)
-    page.f2 = _num_box("rfic_v.f2", "1910", 58)
-    frow.addWidget(_ql("F1 =", align_right=True))
-    frow.addWidget(page.f1)
-    frow.addWidget(_ql("MHz"))
-    frow.addSpacing(12)
-    frow.addWidget(_ql("F2 =", align_right=True))
-    frow.addWidget(page.f2)
-    frow.addWidget(_ql("MHz"))
-    frow.addStretch(1)
-    page._left.addLayout(frow)
-    page._left.addWidget(_instructions([
-        "Note: Click on Cin, Cout to toggle in/out or use Menu Alt-S",
-        "填 F1/F2/Z0/Gain 后点 Calculate [F4]：Cin/Cout/RFC/Cb 留空则由"
-        "引擎按 Design Rule 综合，填入则按填入值算损耗。"]))
-    page._left.addStretch(1)
-    page.dg = dg
-
-    calc_b = QtWidgets.QPushButton("Calculate [F4]")
-    calc_b.setObjectName("rfic_v.calc")
-    page._right.addWidget(calc_b, 0, Qt.AlignLeft)
-    rule, rl = _grp("Design Rule")
-    page.rule = QtWidgets.QComboBox()
+    # 左列：频率响应标题、F1/F2 边界、单位下拉
+    _abs_text(page, "Frequency", 56, 124, 49, 11)
+    page.f1 = _abs_num(page, "rfic_v.f1", "834", 34, 236, 55, left=True)
+    _abs_text(page, "MHz", 92, 241, 23, 9)
+    page.f2 = _abs_num(page, "rfic_v.f2", "1910", 147, 237, 55, left=True)
+    _abs_text(page, "MHz", 204, 241, 23, 9)
+    page.funit = QtWidgets.QComboBox(page)
+    page.funit.setObjectName("rfic_v.freq_unit")
+    page.funit.addItems(["MHz", "GHz"])
+    page.funit.setGeometry(88, 270, 87, 19)
+    page.funit.show()
+    # Design Rule：参考图为 4 个单选；page.rule 仍保留隐藏组合框（计算接口不变）
+    gr = QtWidgets.QGroupBox("Design Rule", page)
+    gr.setGeometry(52, 331, 180, 128)
+    gr.show()
+    page.rule = QtWidgets.QComboBox(gr)
     page.rule.setObjectName("rfic_v.rule.loss")
     page.rule.addItems(["0.01 dB", "0.1 dB (default)", "0.25 dB", "0.5 dB"])
     page.rule.setCurrentIndex(1)
-    rl.addWidget(page.rule)
-    page._right.addWidget(rule, 0, Qt.AlignLeft)
-    page._right.addSpacing(6)
-
-    grid = QtWidgets.QGridLayout()
-    grid.setHorizontalSpacing(8)
-    grid.setVerticalSpacing(4)
-    for c, head in enumerate(("", "Band 1 (F1)", "Band 2 (F2)")):
-        lab = _ql(head)
-        fnt = QtGui.QFont()
-        fnt.setBold(True)
-        lab.setFont(fnt)
-        grid.addWidget(lab, 0, c)
+    page.rule.setGeometry(8, 8, 120, 18)
+    page.rule.hide()
+    _abs_text(gr, "Loss per bias element:", 28, 25, 103, 9)
+    for i, (txt, dy) in enumerate((("0.01 dB", 38), ("0.1 dB (default)", 59),
+                                   ("0.25 dB", 79), ("0.5 dB", 100))):
+        rb = _abs_radio(gr, txt, 10, dy, 160, checked=(i == 1))
+        rb.toggled.connect(
+            (lambda idx: lambda on: on and page.rule.setCurrentIndex(idx))(i))
+    # 结果区：Band 1 / Band 2 两列 + dB 单位 + f-3dB 单框
+    _abs_bold(page, "Band 1 (F1)", 493, 321, 54, 11)
+    _abs_bold(page, "Band 2 (F2)", 586, 321, 54, 11)
     rows = (("Loss due to Caps =", "caps1", "caps2", "dB"),
             ("Loss due to RFC + Cb =", "rfc1", "rfc2", "dB"),
             ("Total Loss =", "total1", "total2", "dB"),
             ("Overall Gain =", "overall1", "overall2", "dB"),
-            ("f-3dB (low freq) =", "f3db", None, ""))
+            ("f -3dB (low freq) =", "f3db", None, ""))
+    rys = (340, 367, 393, 420, 447)
     for i, (label, k1, k2, unit) in enumerate(rows):
-        grid.addWidget(_ql(label, align_right=True), i + 1, 0)
-        for j, key in enumerate((k1, k2)):
-            if not key:
-                continue
-            le = QtWidgets.QLineEdit()
-            le.setReadOnly(True)
-            le.setFixedWidth(88)
-            le.setAlignment(Qt.AlignRight)
-            le.setObjectName("rfic_v.result." + key)
-            le.setStyleSheet("background:%s;color:#555555;" % RO_BG)
-            page.results[key] = le
-            grid.addWidget(le, i + 1, j + 1)
+        y = rys[i]
+        _abs_text(page, label, 359, y + 5, 110, 9, align="r")
+        if k2:
+            for j, key in enumerate((k1, k2)):
+                _abs_result(page, "rfic_v.result." + key, 483 + j * 93, y, 73, 19)
+        else:
+            _abs_result(page, "rfic_v.result." + k1, 530, y, 73, 19)
         if unit:
-            grid.addWidget(_ql(unit), i + 1, 3)
-    page._right.addLayout(grid)
-    page._right.addSpacing(4)
-    page._right.addWidget(page.err, 0, Qt.AlignLeft)
-    page._right.addStretch(1)
+            _abs_text(page, unit, 660, y + 5, 12, 9)
+    # 操作区与说明
+    calc_b = _abs_btn(page, "Calculate [F4]", "rfic_v.calc", 288, 288, 97, 27)
+    _abs_btn(page, "Cb Read Me", "rfic_v.cb_readme", 639, 98, 73, 22,
+             tip="Cb 取值说明：按 Design Rule 与 f-3dB 要求综合隔直电容")
+    _abs_text(page, "Note: Click on Cin, Cout to toggle in/out or use Menu Alt-S",
+              54, 470, 185, 11)
+    _abs_text(page, "留空 Cin/Cout/RFC/Cb 时按 Design Rule 综合，填入则按填入值算损耗。",
+              54, 486, 300, 11)
 
     def _loss_rule():
         return float(page.rule.currentText().split()[0])
 
     def calc():
         eng = _e()
-        f1 = _f(page.f1, "F1")
-        f2 = _f(page.f2, "F2")
+        f1 = _f(page.f1, "F1") * (1e3 if page.funit.currentText() == "GHz"
+                                  else 1.0)
+        f2 = _f(page.f2, "F2") * (1e3 if page.funit.currentText() == "GHz"
+                                  else 1.0)
         z0 = _fopt(dg.fields["z0"], 50.0, "Z0")
         gain = _fopt(dg.fields["gain"], 17.0, "Gain")
         cin = _fopt(dg.fields["cin"], None, "Cin") if \
@@ -6434,182 +6978,205 @@ def _mk_rfic_v(win):
 
 # ---- 4) RFIC 电流偏置（spec_ac2 §2）---------------------------------------
 
-class _DgRficI(_Diagram):
-    """Current-Biased RFIC：传输链 + Rbias/Vs/Cb/RFC 偏置 + Id/Vd 标注。"""
+class _DgRficI(_CanvasDg):
+    """Current-Biased RFIC：频率响应 + 传输链（y=165）+ Rbias/Vs/Cb/RFC 偏置。
+
+    参考图实测：链 273..674，放大盒 (403,141)-(485,193)，偏置母线 y=88，
+    节点 (606,88)，Cb 并联极板 x 595..617，RFC 线圈 x=514 y 105..127。
+    """
 
     NAME = "rfic_i"
-    LW, LH = 730.0, 330.0
-    OX, OY = 225.0, 78.0
+    BG = "#E5ECEF"
 
     def draw(self, p):
-        # 主传输链 y=185
-        _line(p, 283, 185, 330, 185)
-        _port_node(p, 283, 185, 3.0)
-        _cap_h(p, 336, 185, 16, 4.5)
-        _line(p, 341, 185, 405, 185)
-        _poly(p, [(405, 158), (490, 158), (490, 214), (405, 214)], "#CCDCF0")
-        _poly(p, [(415, 168), (480, 185), (415, 202)], "#CCDCF0")
-        _line(p, 490, 185, 520, 185)
-        _line(p, 438, 214, 438, 226)
-        _gnd4(p, 438, 226)
-        _port_node(p, 520, 185, 3.0, filled=True)
-        _line(p, 520, 185, 556, 185)
-        _cap_h(p, 564, 185, 16, 4.5)
-        _line(p, 569, 185, 665, 185)
-        _port_node(p, 665, 185, 3.0)
-        _line(p, 665, 185, 675, 185)
-        _line(p, 675, 185, 675, 230)
-        _line(p, 283, 185, 283, 230)
-        _port_node(p, 283, 236, 9.0)
-        _gnd4(p, 283, 252)
-        _port_node(p, 675, 236, 9.0)
-        _gnd4(p, 675, 252)
-        # 电源侧：Rbias → B(612,100) → Cb → 地；B → RFC(520) → N2
-        _zig_v(p, 515, 92, 108, w=0.0, n=1)   # 占位（实际用水平锯齿）
+        # ---- 频率响应示意 ----
+        _line(p, 62, 128, 62, 203)
+        _line(p, 62, 203, 160, 203)
+        _line(p, 62, 203, 78, 152)
+        _line(p, 78, 152, 112, 150)
+        _line(p, 112, 150, 118, 163)
+        _line(p, 118, 163, 124, 150)
+        _line(p, 124, 150, 158, 203)
+        _line(p, 83, 148, 83, 203, "#000000", 1.0, dash=(2, 3))
+        _dg_label(self, "F low", 221, x=81)
+        # ---- 主传输链 y=165 ----
+        _line(p, 274, 165, 299, 165)
+        _port_node(p, 302, 165, 2.5)
+        _line(p, 305, 165, 330, 165)
+        _port_node(p, 333, 165, 2.5, filled=True)
+        _line(p, 336, 165, 347, 165)
+        _cap_h(p, 353, 165, 20, 3.0)
+        _line(p, 356, 165, 365, 165)
+        _port_node(p, 368, 165, 2.5, filled=True)
+        _line(p, 371, 165, 403, 165)
+        _poly(p, [(403, 141), (485, 141), (485, 193), (403, 193)], "#CCDCF0")
+        _poly(p, [(413, 151), (475, 167), (413, 183)], "#CCDCF0")
+        _line(p, 485, 165, 504, 165)
+        _port_node(p, 507, 165, 2.5, filled=True)
+        _line(p, 510, 165, 554, 165)
+        _port_node(p, 557, 165, 2.5, filled=True)
+        _line(p, 560, 165, 570, 165)
+        _cap_h(p, 573.5, 165, 20, 3.0)
+        _line(p, 577, 165, 647, 165)
+        _port_node(p, 650, 165, 2.5)
+        _line(p, 653, 165, 674, 165)
+        # ---- 左端 Z0：锯齿阻抗 + 交流源 + 地 ----
+        _line(p, 274, 165, 274, 180)
+        _zig_v(p, 274, 180, 198, w=4.0, n=4)
+        _port_node(p, 273, 208, 10.0)
+        _pen(p, "#2244CC", 1.3)
+        p.setBrush(Qt.NoBrush)
+        wave = QtGui.QPainterPath()
+        wave.moveTo(267, 208)
+        wave.cubicTo(269, 203, 271, 213, 273, 208)
+        wave.cubicTo(275, 203, 277, 213, 279, 208)
+        p.drawPath(wave)
+        _line(p, 273, 218, 273, 227)
+        _gnd4(p, 273, 227)
+        # ---- 右端 Z0 负载 ----
+        _line(p, 674, 165, 674, 187)
+        _zig_v(p, 674, 187, 207, w=4.0, n=4)
+        _line(p, 674, 207, 674, 226)
+        _gnd4(p, 674, 226)
+        # ---- 偏置母线 y=88：Rbias 锯齿 → 节点 → Vs 端口；节点 → Cb → 地 ----
+        _line(p, 513, 88, 553, 88)
+        rpts = [(553, 88)]
+        for i in range(4):
+            rpts.append((553 + 4.5 * (i + 1), 88 + (4 if i % 2 == 0 else -4)))
+        rpts.append((571, 88))
+        _poly(p, rpts, None)
+        _line(p, 571, 88, 604, 88)
+        _port_node(p, 606, 88, 2.5, filled=True)
+        _line(p, 608, 88, 668, 88)
+        _port_node(p, 671, 88, 2.5)
+        _line(p, 606, 88, 606, 107)
+        _cap_shunt(p, 606, 112, w=22, gap=4.5)
+        _line(p, 606, 117, 606, 130)
+        _gnd4(p, 606, 130)
+        _line(p, 514, 88, 514, 105)
+        _coil_v(p, 514, 105, 127, n=4, r=6.0)
+        _line(p, 514, 127, 514, 165)
+        # ---- 放大器接地 + Id 箭头 ----
+        _line(p, 445, 193, 445, 205)
+        _gnd4(p, 445, 205)
+        _arrow(p, 538, 96, 532, 116)
+        # ---- 标注 ----
+        _dg_label(self, "Z0 =", 133, rx=272)
+        _dg_label(self, "Ω", 132, x=330)
+        _dg_label(self, "Z0", 185, x=253)
+        _dg_label(self, "Z0", 201, x=654)
+        _dg_label(self, "Cin =", 196, rx=321)
+        _dg_label(self, "Cout =", 151, rx=580)
+        _dg_label(self, "RFC =", 120, rx=423)
+        _dg_label(self, "nH", 119, x=481)
+        _dg_label(self, "Rbias =", 78, rx=516)
+        _dg_label(self, "[Ohm]", 78, x=579)
+        _dg_label(self, "Vs =", 78, rx=651)
+        _dg_label(self, "V", 78, x=712)
+        _dg_label(self, "Cb =", 113, rx=647)
+        _dg_label(self, "Id", 113, x=545)
+        _dg_label(self, "Vd =", 205, x=486)
+        _dg_label(self, "V Max =", 215, x=591)
+        _dg_label(self, "V Typ =", 239, x=591)
+        _dg_label(self, "V Min =", 263, x=591)
+        # Vd 花括号：把三行电压框括成一组
         _pen(p, "#000000", 1.0)
         p.setBrush(Qt.NoBrush)
-        pts = [(498, 100)]
-        for i in range(4):
-            pts.append((498 + 8.5 * (i + 1), 100 + (7 if i % 2 == 0 else -7)))
-        pts.append((532, 100))
-        p.drawPolyline(QtGui.QPolygonF(
-            [QtCore.QPointF(a, b) for a, b in pts]))
-        _line(p, 532, 100, 606, 100)
-        _port_node(p, 612, 100, 3.0, filled=True)
-        _line(p, 612, 100, 612, 126)
-        _cap_shunt(p, 612, 131)
-        _line(p, 612, 137, 612, 145)
-        _gnd4(p, 612, 145)
-        _line(p, 612, 100, 520, 100)
-        _line(p, 520, 100, 520, 116)
-        _coil_v(p, 520, 116, 162, n=3, r=7)
-        _line(p, 520, 162, 520, 185)
-        # Id ↓ / Vd ↑ 标注
-        _arrow(p, 551, 118, 551, 140)
-        _arrow(p, 486, 212, 486, 196)
-        self.label(545, 152, "Id")
-        self.label(484, 228, "Vd")
-        self.label(252, 222, "Z0")
-        self.label(677, 216, "Z0")
-        self.label(227, 154, "Z0 =")
-        self.label(314, 154, "Ω")
-        self.label(343, 142, "RFC =")
-        self.label(431, 142, "nH")
-        self.label(312, 216, "Cin =")
-        self.label(560, 168, "Cout =")
-        self.label(477, 100, "Rbias =")
-        self.label(605, 100, "Ohm")
-        self.label(630, 100, "Vs =")
-        self.label(716, 100, "V")
-        self.label(592, 142, "Cb =")
+        brace = QtGui.QPainterPath()
+        brace.moveTo(532, 199)
+        brace.cubicTo(524, 202, 524, 226, 518, 234)
+        brace.cubicTo(524, 242, 524, 266, 532, 269)
+        p.drawPath(brace)
+        # Design Rule 框线：标题是长串，画在图上才不会被框宽裁字
+        _line(p, 36, 340, 46, 340)
+        _line(p, 212, 340, 228, 340)
+        _line(p, 36, 340, 36, 450)
+        _line(p, 228, 340, 228, 450)
+        _line(p, 36, 450, 228, 450)
+        _dg_label(self, "Design Rule (loss per blocking cap)", 354, x=46)
 
 
 def _mk_rfic_i(win):
-    page = _b_shell(win, "rfic_i",
-                    "电流偏置 RFIC Current-Biased Circuit")
-    page.setStyleSheet(_page_css("rfic_i", "#ECECEC"))
-    dg = _DgRficI()
-    dg.box("z0", 258, 139, "50", w=52, obj="rfic_i.z0")
-    dg.box("rfc", 381, 128, "350", w=46, obj="rfic_i.rfc")
-    dg.box("cin", 350, 203, "", w=50, obj="rfic_i.cin")
-    dg.box("cout", 601, 174, "", w=49, obj="rfic_i.cout")
-    dg.box("rbias", 521, 85, "", w=79, obj="rfic_i.rbias")
-    dg.box("vs", 662, 85, "12", w=50, obj="rfic_i.vs")
-    dg.box("cb", 623, 128, "", w=49, obj="rfic_i.cb")
-    dg.box("vd_max", 543, 224, "6.6", w=47, obj="rfic_i.vd_max")
-    dg.box("vd_typ", 543, 250, "5.5", w=47, obj="rfic_i.vd_typ")
-    dg.box("vd_min", 543, 275, "4.4", w=47, obj="rfic_i.vd_min")
+    dg = _DgRficI("rfic_i")
+    page = _canvas_page(win, "rfic_i", "Current-Biased Circuit", dg)
+    # 图形内输入框（实测框位）
+    _abs_box(dg, page, "z0", 276, 120, 44, 19, "50", left=True)
+    _abs_box(dg, page, "rfc", 427, 106, 50, 19, "350", left=True)
+    _abs_box(dg, page, "cin", 324, 182, 50, 18, left=True)
+    _abs_box(dg, page, "cout", 583, 137, 50, 18, left=True)
+    _abs_box(dg, page, "rbias", 520, 62, 50, 18, left=True)
+    _abs_box(dg, page, "vs", 654, 61, 54, 21, "12", left=True)
+    _abs_box(dg, page, "cb", 650, 101, 50, 18, left=True)
+    _abs_box(dg, page, "vd_max", 538, 201, 44, 19, "6.6", left=True)
+    _abs_box(dg, page, "vd_typ", 538, 225, 44, 19, "5.5", left=True)
+    _abs_box(dg, page, "vd_min", 539, 249, 44, 19, "4.4", left=True)
     dg.finalize()
-    page._left.addWidget(dg)
-    row = QtWidgets.QHBoxLayout()
-    page.flow = _num_box("rfic_i.f_low", "450", 58)
-    row.addWidget(_ql("F low =", align_right=True))
-    row.addWidget(page.flow)
-    row.addWidget(_ql("MHz"))
-    row.addSpacing(14)
-    row.addWidget(_ql("θjc =", align_right=True))
-    page.tjc = _num_box("rfic_i.theta_jc", "125", 56)
-    row.addWidget(page.tjc)
-    row.addWidget(_ql("°C/W"))
-    row.addSpacing(14)
-    row.addWidget(_ql("∂Vd/∂T =", align_right=True))
-    page.dvdt = _num_box("rfic_i.dvd_dt", "-8", 50)
-    row.addWidget(page.dvdt)
-    row.addWidget(_ql("mV/°C"))
-    row.addStretch(1)
-    page._left.addLayout(row)
-    row2 = QtWidgets.QHBoxLayout()
-    row2.addWidget(_ql("Vd =", align_right=True))
-    row2.addWidget(_ql("{ V Max / V Typ / V Min }"))
-    row2.addSpacing(14)
-    row2.addWidget(_ql("Id Design Goal =", align_right=True))
-    page.id_goal = _num_box("rfic_i.id_goal", "80", 44)
-    row2.addWidget(page.id_goal)
-    row2.addWidget(_ql("mA"))
-    row2.addSpacing(14)
-    row2.addWidget(_ql("Tcse =", align_right=True))
-    page.t1 = _num_box("rfic_i.tcse_1", "-25", 38)
-    page.t2 = _num_box("rfic_i.tcse_2", "25", 38)
-    page.t3 = _num_box("rfic_i.tcse_3", "85", 38)
-    for bx in (page.t1, page.t2, page.t3):
-        row2.addWidget(bx)
-    row2.addWidget(_ql("°C"))
-    row2.addStretch(1)
-    page._left.addLayout(row2)
-    page._left.addWidget(_instructions([
-        "Note: Click on Cin, Cout to toggle in/out or use Menu Alt-S",
-        "Rbias 留空由引擎按 Id Design Goal 综合；填入则按填入值算。"]))
-    page._left.addStretch(1)
-    page.dg = dg
-
-    calc_b = QtWidgets.QPushButton("Calculate [F4]")
-    calc_b.setObjectName("rfic_i.calc")
-    page._right.addWidget(calc_b, 0, Qt.AlignLeft)
-    rule, rlg = _grp("Design Rule (loss per blocking cap)")
-    page.rule = QtWidgets.QComboBox()
+    # 左列：频率响应 + F low 与单位
+    _abs_text(page, "Frequency", 55, 114, 49, 11)
+    page.flow = _abs_num(page, "rfic_i.f_low", "450", 45, 227, 55, left=True)
+    page.funit = QtWidgets.QComboBox(page)
+    page.funit.setObjectName("rfic_i.freq_unit")
+    page.funit.addItems(["MHz", "GHz"])
+    page.funit.setGeometry(107, 226, 86, 19)
+    page.funit.show()
+    # 热阻/温度系数
+    page.tjc = _abs_num(page, "rfic_i.theta_jc", "125", 350, 217, 44, left=True)
+    _abs_text(page, "θjc =", 316, 221, 32, 11, align="r")
+    _abs_text(page, "°C/W", 400, 222, 27, 11)
+    page.dvdt = _abs_num(page, "rfic_i.dvd_dt", "-8", 350, 241, 44, left=True)
+    _abs_text(page, "∂Vd/∂T =", 285, 243, 53, 11, align="r")
+    _abs_text(page, "mV/°C", 402, 245, 35, 11)
+    # Id 设计目标 + 三个 Tcse
+    page.id_goal = _abs_num(page, "rfic_i.id_goal", "80", 364, 291, 56, left=True)
+    _abs_text(page, "Id Design Goal =", 275, 293, 76, 11, align="r")
+    _abs_text(page, "mA", 422, 293, 15, 11)
+    _abs_text(page, "Tcase =", 468, 293, 43, 11, align="r")
+    page.t1 = _abs_num(page, "rfic_i.tcse_1", "-25", 523, 291, 56, left=True)
+    page.t2 = _abs_num(page, "rfic_i.tcse_2", "25", 583, 291, 52, left=True)
+    page.t3 = _abs_num(page, "rfic_i.tcse_3", "85", 642, 290, 54, left=True)
+    _abs_text(page, "°C", 707, 295, 14, 11)
+    # Design Rule：框线画在示意图里；page.rule 仍是隐藏组合框（计算接口不变）
+    page.rule = QtWidgets.QComboBox(page)
     page.rule.setObjectName("rfic_i.rule.loss")
     page.rule.addItems(["0.01 dB", "0.1 dB (default)", "0.25 dB", "0.5 dB"])
     page.rule.setCurrentIndex(1)
-    rlg.addWidget(page.rule)
-    page._right.addWidget(rule, 0, Qt.AlignLeft)
-    page._right.addSpacing(6)
-
-    ttl = _ql("Id and Thermal Analysis:")
-    fnt = QtGui.QFont()
-    fnt.setBold(True)
-    ttl.setFont(fnt)
-    page._right.addWidget(ttl, 0, Qt.AlignLeft)
+    page.rule.setGeometry(40, 344, 120, 18)
+    page.rule.hide()
+    for i, (txt, ry) in enumerate((("0.01 dB", 360), ("0.1 dB (default)", 381),
+                                   ("0.25 dB", 403), ("0.5 dB", 424))):
+        rb = _abs_radio(page, txt, 49, ry, 170, checked=(i == 1))
+        rb.toggled.connect(
+            (lambda idx: lambda on: on and page.rule.setCurrentIndex(idx))(i))
+    calc_b = _abs_btn(page, "Calculate [F4]", "rfic_i.calc", 133, 274, 97, 27)
+    _abs_btn(page, "Cb Read Me", "rfic_i.cb_readme", 663, 123, 71, 22,
+             tip="Cb 取值说明：按最低工作频率与 Z0 综合旁路电容，越大偏置越稳")
+    _abs_text(page, "Note: Click on Cin, Cout to toggle in/out or use Menu Alt-S",
+              37, 460, 200, 11)
+    _abs_text(page, "留空 Rbias 时按 Id Design Goal 综合电阻，填入则按填入值算偏置损耗。",
+              37, 476, 300, 11)
+    # Id / 热分析表（5 列：行标签 + 3 个 Tcse 值 + 单位），行高按实测 16px
+    _abs_bold(page, "Id and Thermal Analysis:", 366, 324, 113, 11)
     page.table = _btable(["Tcse =", "Tj =", "Pd =", "Id max =", "Id typ =",
                           "Id min ="], "rfic_i.table",
                          ["-25", "25", "85", "unit"])
-    page.table.setFixedWidth(330)
-    page._right.addWidget(page.table, 0, Qt.AlignLeft)
-    brow = QtWidgets.QHBoxLayout()
-    brow.addWidget(_ql("Bias loss =", align_right=True))
-    le = QtWidgets.QLineEdit()
-    le.setReadOnly(True)
-    le.setFixedWidth(70)
-    le.setAlignment(Qt.AlignRight)
-    le.setObjectName("rfic_i.result.biasloss")
-    le.setStyleSheet("background:%s;color:#555555;" % RO_BG)
-    page.results["biasloss"] = le
-    brow.addWidget(le)
-    brow.addWidget(_ql("dB"))
-    brow.addSpacing(16)
-    brow.addWidget(_ql("Pd of Rbias =", align_right=True))
-    le2 = QtWidgets.QLineEdit()
-    le2.setReadOnly(True)
-    le2.setFixedWidth(76)
-    le2.setAlignment(Qt.AlignRight)
-    le2.setObjectName("rfic_i.result.pdrbias")
-    le2.setStyleSheet("background:%s;color:#555555;" % RO_BG)
-    page.results["pdrbias"] = le2
-    brow.addWidget(le2)
-    brow.addWidget(_ql("mW"))
-    brow.addStretch(1)
-    page._right.addLayout(brow)
-    page._right.addWidget(page.err, 0, Qt.AlignLeft)
-    page._right.addStretch(1)
+    page.table.setParent(page)
+    page.table.setMinimumHeight(0)
+    page.table.setGeometry(364, 340, 298, 104)
+    vh = page.table.verticalHeader()
+    vh.setMinimumSectionSize(12)
+    vh.setDefaultSectionSize(16)
+    for c, cw in enumerate((64, 64, 64, 64, 33)):
+        page.table.setColumnWidth(c, cw)
+    page.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    page.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    page.table.show()
+    # 结果行
+    _abs_text(page, "Bias loss =", 371, 459, 50, 11, align="r")
+    _abs_result(page, "rfic_i.result.biasloss", 428, 454, 52, 19)
+    _abs_text(page, "dB", 487, 459, 12, 11)
+    _abs_text(page, "Pd of Rbias =", 511, 459, 65, 11, align="r")
+    _abs_result(page, "rfic_i.result.pdrbias", 580, 454, 52, 19)
+    _abs_text(page, "mW", 640, 459, 18, 11)
 
     def calc():
         eng = _e()
@@ -6665,175 +7232,162 @@ def _mk_rfic_i(win):
 
 # ---- 5) 大信号检波器（spec_ac2 §3）----------------------------------------
 
-class _DgDetLarge(_Diagram):
-    """Large Signal Detector：输入段框 + Rm + 二极管 + C + RI + Rg + Vo。"""
+class _DgDetLarge(_CanvasDg):
+    """Large Signal Detector：输入匹配 + Rm + 二极管 + C + Vo + RI 示意。
+
+    参考图实测：上下导轨 y=118 / y=188（x 400..646），Rm 支路 x=453，
+    参考面虚线 x=537，二极管 546..571（cy=128），C 极板 y 149/154，
+    Vo 空心节点 x=617，RI 支路 x=647。
+    """
 
     NAME = "det_large"
-    LW, LH = 700.0, 330.0
-    OX, OY = 380.0, 100.0
+    BG = "#FFF0F0"
 
     def draw(self, p):
-        # 输入段框 (412,140)-(533,240)
-        _poly(p, [(412, 140), (533, 140), (533, 240), (412, 240)], None)
-        _line(p, 412, 140, 412, 240)
-        _line(p, 412, 155, 412, 148)
-        # 源
-        _port_node(p, 412, 158, 10.0)
-        _line(p, 412, 168, 412, 236)
-        _gnd4(p, 412, 240)
-        # Rm 竖直跨接 x=462
-        _zig_v(p, 462, 145, 175, w=8.0, n=4)
-        _line(p, 462, 140, 462, 145)
-        _line(p, 462, 175, 462, 240)
-        # 二极管 + 竖直虚线参考面
-        _line(p, 540, 118, 540, 250, "#000000", 1.0, dash=(4, 3))
-        _line(p, 533, 140, 549, 140)
-        _diode(p, 549, 583, 140, h=15)
-        _line(p, 583, 140, 648, 140)
-        # 输出竖线 x=648
-        _line(p, 648, 140, 648, 240)
-        _port_node(p, 648, 150, 2.5, filled=True)
-        # C 并 + 地
-        _line(p, 648, 190, 587, 190)
-        _cap_shunt(p, 587, 200)
-        _line(p, 587, 205, 587, 216)
-        _gnd4(p, 587, 216)
-        # RI 竖直跨接
-        _zig_v(p, 656, 172, 214, w=8.0, n=4)
-        _line(p, 656, 150, 656, 172)
-        _line(p, 656, 214, 656, 236)
-        _gnd4(p, 656, 240)
-        # Rg 竖直 + 地（二极管下方）
-        _zig_v(p, 535, 172, 206, w=7.0, n=4)
-        _line(p, 535, 162, 535, 172)
-        _line(p, 535, 206, 535, 214)
-        _gnd4(p, 535, 218)
-        # Vo 弧箭头
+        # ---- 上下导轨 ----
+        _line(p, 400, 118, 646, 118)
+        _line(p, 400, 188, 646, 188)
+        # ---- 输入端口 + 源内阻 Z0（锯齿 + 交流源）----
+        _port_node(p, 430, 118, 3.0)
+        _port_node(p, 430, 188, 3.0)
+        _line(p, 400, 118, 400, 131)
+        _zig_v(p, 400, 131, 145, w=3.0, n=4)
+        _line(p, 400, 145, 400, 158)
+        _port_node(p, 401, 169, 11.0)
+        _pen(p, "#2244CC", 1.2)
+        p.setBrush(Qt.NoBrush)
+        wave = QtGui.QPainterPath()
+        wave.moveTo(394, 169)
+        wave.cubicTo(396, 163, 398, 175, 401, 169)
+        wave.cubicTo(404, 163, 406, 175, 408, 169)
+        p.drawPath(wave)
+        _pen(p, "#000000", 1.0)
+        _line(p, 401, 180, 401, 188)
+        _line(p, 400, 188, 401, 188)
+        # ---- Rm 并联支路 ----
+        _port_node(p, 453, 118, 3.0, filled=True)
+        _line(p, 453, 118, 453, 142)
+        _zig_v(p, 453, 142, 161, w=7.0, n=4)
+        _line(p, 453, 161, 453, 188)
+        _port_node(p, 453, 188, 3.0, filled=True)
+        # ---- 输入参考面虚线 + 双箭头 ----
+        _line(p, 537, 104, 537, 200, "#000000", 1.0, dash=(3, 3))
+        _arrow(p, 534, 104, 515, 104)
+        _arrow(p, 534, 200, 515, 200)
+        # ---- 二极管（尖端朝左，阴极条贴参考面）----
+        _diode(p, 571, 546, 128, h=19, fill="#7FBCA8")
+        # ---- C 并联支路 ----
+        _port_node(p, 590, 118, 3.0, filled=True)
+        _line(p, 590, 118, 590, 149)
+        _cap_shunt(p, 592, 151.5, w=18, gap=2.5)
+        _line(p, 592, 154, 592, 188)
+        # ---- 输出端 Vo 两个空心节点 ----
+        _port_node(p, 617, 118, 3.0)
+        _port_node(p, 617, 188, 3.0)
+        # ---- RI 负载支路 ----
+        _line(p, 647, 118, 647, 140)
+        _zig_v(p, 647, 140, 162, w=7.0, n=4)
+        _line(p, 647, 162, 647, 188)
+        # ---- Vo 虚线弧 + 箭头（跨接两个节点）----
         _pen(p, "#000000", 1.0)
         p.setBrush(Qt.NoBrush)
-        p.drawArc(QtCore.QRectF(598, 178, 18, 22), 0, 120 * 16)
-        _head(p, 616, 186, 0.8, -0.6)
-        # Pin ->
-        self.label(393, 236, "Pin ->")
-        _arrow(p, 440, 236, 452, 236)
-        self.label(612, 196, "Vo")
-        self.label(410, 128, "Z0 =")
-        self.label(475, 128, "Ω")
-        self.label(503, 172, "Rm =")
-        self.label(565, 172, "Ω")
-        self.label(517, 190, "Rg =")
-        self.label(612, 190, "Ω")
-        self.label(662, 166, "RI =")
-        self.label(716, 166, "Ω")
-        self.label(248, 182, "C")
+        vo = QtGui.QPainterPath()
+        vo.moveTo(621, 126)
+        vo.cubicTo(645, 140, 645, 166, 621, 180)
+        p.drawPath(vo)
+        _arrow(p, 626, 133, 621, 125)
+        # ---- 标注 ----
+        _dg_label(self, "Z0 =", 104, rx=400)
+        _dg_label(self, "Ω", 101, x=448)
+        _dg_label(self, "Rm =", 147, rx=497)
+        _dg_label(self, "Ω", 165, x=516)
+        _dg_label(self, "RI =", 145, x=656)
+        _dg_label(self, "Ω", 164, x=699)
+        _dg_label(self, "Rg =", 216, x=520)
+        _dg_label(self, "Ω", 213, x=606)
+        _dg_label(self, "C", 154, x=571)
+        _dg_label(self, "Vo", 160, x=617)
+        _dg_label(self, "Pin ->", 215, x=406)
 
 
 def _mk_det_large(win):
-    page = _b_shell(win, "det_large", "大信号检波器 Large Signal Detector")
-    page.setStyleSheet(_page_css("det_large", "#FDF2F3"))
-    dg = _DgDetLarge()
-    dg.box("z0", 410, 112, "50", w=47, obj="det_large.z0")
-    dg.box("rm", 503, 160, "68", w=43, obj="det_large.rm")
-    dg.box("rg", 550, 177, "", w=44, obj="det_large.rg")
-    dg.box("ri", 652, 175, "5000", w=48, obj="det_large.ri")
+    dg = _DgDetLarge("det_large")
+    page = _canvas_page(win, "det_large", "Large Signal Detector", dg)
+    # 电路内的数值框（实测框位，全部左对齐）
+    _abs_box(dg, page, "z0", 404, 91, 40, 19, "50", left=True)
+    _abs_box(dg, page, "rm", 461, 152, 51, 19, "68", left=True)
+    _abs_box(dg, page, "rg", 546, 202, 56, 17, "", left=True)
+    _abs_box(dg, page, "ri", 653, 152, 44, 19, "5000", left=True)
     dg.finalize()
-    page._left.addWidget(dg)
-
-    gp, gl = _grp("Diode Parameters:")
-    gp.setFixedWidth(300)
-    r1 = QtWidgets.QHBoxLayout()
-    page.t = _num_box("det_large.t", "25", 68)
-    page.rs = _num_box("det_large.rs", "9", 50)
-    r1.addWidget(_ql("T =", align_right=True))
-    r1.addWidget(page.t)
-    r1.addWidget(_ql("°C"))
-    r1.addSpacing(20)
-    r1.addWidget(_ql("Rs =", align_right=True))
-    r1.addWidget(page.rs)
-    r1.addWidget(_ql("Ω"))
-    r1.addStretch(1)
-    gl.addLayout(r1)
-    r2 = QtWidgets.QHBoxLayout()
-    page.io = _num_box("det_large.io", "500", 68)
-    page.eg = _num_box("det_large.eg", "0.69", 46)
-    r2.addWidget(_ql("Io =", align_right=True))
-    r2.addWidget(page.io)
-    r2.addWidget(_ql("uA"))
-    r2.addSpacing(20)
-    r2.addWidget(_ql("EG =", align_right=True))
-    r2.addWidget(page.eg)
-    r2.addWidget(_ql("eV"))
-    r2.addStretch(1)
-    gl.addLayout(r2)
-    r3 = QtWidgets.QHBoxLayout()
-    page.iso = _num_box("det_large.iso", "0.03", 63)
-    page.n = _num_box("det_large.n", "1.08", 46)
-    r3.addWidget(_ql("Iso =", align_right=True))
-    r3.addWidget(page.iso)
-    r3.addWidget(_ql("uA"))
-    r3.addSpacing(20)
-    r3.addWidget(_ql("n =", align_right=True))
-    r3.addWidget(page.n)
-    r3.addStretch(1)
-    gl.addLayout(r3)
-    page._left.addWidget(gp, 0, Qt.AlignLeft)
-
-    steps = QtWidgets.QHBoxLayout()
-    steps.addWidget(_ql("1. Enter diode parameters and circuit values :"))
-    steps.addStretch(1)
-    page._left.addLayout(steps)
-    pr = QtWidgets.QHBoxLayout()
-    pr.addWidget(_ql("2. Enter Pin range:"))
-    page.pstart = _num_box("det_large.pin_start", "20", 50)
-    page.pstop = _num_box("det_large.pin_stop", "30", 53)
-    page.pstep = _num_box("det_large.pin_step", "5", 50)
-    pr.addWidget(_ql("Pin Start ="))
-    pr.addWidget(page.pstart)
-    pr.addWidget(_ql("Pin Stop ="))
-    pr.addWidget(page.pstop)
-    pr.addWidget(_ql("Pin Step ="))
-    pr.addWidget(page.pstep)
-    pr.addWidget(_ql("dBm"))
-    pr.addStretch(1)
-    page._left.addLayout(pr)
-    page._left.addStretch(1)
-    page.dg = dg
-
-    calc_b = QtWidgets.QPushButton("Calculate [F4]")
-    calc_b.setObjectName("det_large.calc")
-    page._right.addWidget(calc_b, 0, Qt.AlignLeft)
-    for key, label, unit in (("lambda", "Λ =", ""), ("is", "Is =", "uA"),
-                             ("vd0", "Vd(0) =", "V"), ("rv", "Rv =", "Ω")):
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(_ql(label, align_right=True))
-        le = QtWidgets.QLineEdit()
-        le.setReadOnly(True)
-        le.setFixedWidth(70)
-        le.setAlignment(Qt.AlignRight)
-        le.setObjectName("det_large.result." + key)
-        le.setStyleSheet("background:%s;color:#555555;" % RO_BG)
-        page.results[key] = le
-        row.addWidget(le)
+    # 1. 二极管参数卡
+    _abs_text(page, "1. Enter diode parameters and circuit values :",
+              26, 102, 214, 11)
+    gp = QtWidgets.QGroupBox("Diode Parameters:", page)
+    gp.setStyleSheet(
+        "QGroupBox{background:#F5F5F5; border:1px solid #909090;"
+        " margin-top:5px;}"
+        " QGroupBox::title{subcontrol-origin:margin; left:9px;"
+        " padding:0 2px;}")
+    gp.setGeometry(40, 128, 263, 90)
+    gp.show()
+    page.t = _abs_num(page, "det_large.t", "25", 87, 145, 58, left=True)
+    page.rs = _abs_num(page, "det_large.rs", "9", 217, 145, 52, left=True)
+    page.io = _abs_num(page, "det_large.io", "500", 86, 167, 58, left=True)
+    page.eg = _abs_num(page, "det_large.eg", "0.69", 217, 167, 52, left=True)
+    page.iso = _abs_num(page, "det_large.iso", "0.03", 86, 190, 58, left=True)
+    page.n = _abs_num(page, "det_large.n", "1.08", 218, 189, 52, left=True)
+    _abs_text(page, "T =", 56, 150, 23, 11, align="r")
+    _abs_text(page, "°C", 150, 150, 13, 11)
+    _abs_text(page, "Rs =", 182, 150, 30, 11, align="r")
+    _abs_text(page, "Ω", 272, 150, 10, 11)
+    _abs_text(page, "Io =", 58, 172, 21, 11, align="r")
+    _abs_text(page, "uA", 148, 172, 12, 11)
+    _abs_text(page, "EG =", 184, 172, 28, 11, align="r")
+    _abs_text(page, "eV", 274, 172, 12, 11)
+    _abs_text(page, "Iso =", 57, 194, 24, 11, align="r")
+    _abs_text(page, "uA", 149, 194, 12, 11)
+    _abs_text(page, "n =", 193, 194, 18, 11, align="r")
+    # 2. Pin 扫描范围
+    _abs_text(page, "2. Enter Pin range:", 26, 258, 118, 11)
+    _abs_text(page, "Pin Start =", 155, 258, 48, 11, align="r")
+    _abs_text(page, "Pin Stop =", 284, 258, 50, 11, align="r")
+    _abs_text(page, "Pin Step =", 413, 258, 49, 11, align="r")
+    _abs_text(page, "dBm", 535, 262, 20, 11)
+    page.pstart = _abs_num(page, "det_large.pin_start", "20", 207, 252, 58,
+                           left=True)
+    page.pstop = _abs_num(page, "det_large.pin_stop", "30", 338, 253, 58,
+                          left=True)
+    page.pstep = _abs_num(page, "det_large.pin_step", "5", 466, 253, 58,
+                          left=True)
+    # 3. 计算 + 结果列
+    _abs_text(page, "3.", 26, 304, 8, 11)
+    calc_b = _abs_btn(page, "Calculate [F4]", "det_large.calc", 42, 299, 81, 23)
+    for key, label, lx, lw, ry, ly, unit, ux in (
+            ("lambda", "Λ =", 550, 30, 309, 313, "", 0),
+            ("is", "Is =", 555, 28, 341, 345, "uA", 675),
+            ("vd0", "Vd(0) =", 535, 48, 372, 376, "V", 675),
+            ("rv", "Rv =", 555, 28, 403, 407, "Ω", 675)):
+        _abs_text(page, label, lx, ly, lw, 11, align="r")
+        _abs_result(page, "det_large.result." + key, 591, ry, 65, 18)
         if unit:
-            row.addWidget(_ql(unit))
-        row.addStretch(1)
-        page._right.addLayout(row)
-    page._right.addSpacing(8)
-    b1 = QtWidgets.QPushButton("Plot Vout vs. Pin")
-    b1.setObjectName("det_large.plot_vout")
-    b2 = QtWidgets.QPushButton("Plot Gamma vs. Pin")
-    b2.setObjectName("det_large.plot_gamma")
-    prow = QtWidgets.QHBoxLayout()
-    prow.addWidget(b1)
-    prow.addWidget(b2)
-    prow.addStretch(1)
-    page._right.addLayout(prow)
+            _abs_text(page, unit, ux, ly, 14, 11)
+    # 4. 绘图按钮
+    _abs_text(page, "4.", 25, 471, 8, 11)
+    _abs_btn(page, "Plot Vout vs. Pin", "det_large.plot_vout", 47, 463, 130, 23)
+    _abs_btn(page, "Plot Gamma vs. Pin", "det_large.plot_gamma", 214, 463,
+             130, 23)
+    # Pin 扫描结果表：参考页无此表，放在下方空白区并拉满列宽（无横向滚动条）
+    _abs_bold(page, "Pin sweep: Vout / Sensitivity", 402, 437, 160, 11)
     page.table = _scan_table(["Pin (dBm)", "Vout (V)", "Sens (mV/uW)"],
-                              "det_large.table", height=230)
-    page.table.setFixedWidth(300)
-    page._right.addWidget(page.table, 0, Qt.AlignLeft)
-    page._right.addWidget(page.err, 0, Qt.AlignLeft)
-    page._right.addStretch(1)
+                             "det_large.table", height=180)
+    page.table.setParent(page)
+    page.table.setMinimumHeight(0)
+    page.table.setGeometry(400, 452, 340, 180)
+    page.table.horizontalHeader().setSectionResizeMode(
+        QtWidgets.QHeaderView.Stretch)
+    page.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    page.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    page.table.show()
 
     def calc():
         eng = _e()
@@ -6926,9 +7480,9 @@ class _DgDetSmall(_Diagram):
         _head(p, 318, 204, 0.8, -0.6)
         self.label(160, 244, "Pin ->")
         _arrow(p, 202, 240, 212, 240)
-        self.label(310, 214, "Vo")
-        self.label(248, 190, "C")
-        self.label(29, 194, "Z0 =")
+        self.label(310, 236, "Vo")
+        self.label(246, 192, "C")
+        self.label(26, 170, "Z0 =")
         self.label(124, 194, "Ω")
         self.label(336, 186, "RI =")
         self.label(396, 186, "Ω")
@@ -7082,6 +7636,507 @@ def _mk_det_small(win):
     return page
 
 
+# --- 扩展工具：衰减器 / VSWR 换算 / 趋肤效应 / LC 谐振器 ---------------------
+# 示意图与图标一律 QPainter 矢量自绘（本节三个示意类是独立 widget，
+# 不触碰 _Dg*/_Diagram 体系）；引擎键名以 backend/rfcalc.py 实际返回为准。
+
+
+class _AttDiagram(QtWidgets.QWidget):
+    """衰减器四拓扑矢量框图：Pi / T / 桥T / L 各一列（纯 QPainter 自绘）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("attenuator.diagram")
+        self.setFixedSize(456, 170)
+
+    def paintEvent(self, ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+        w, h = self.width(), self.height()
+        edge = "#1F1F1F"
+        cw = w / 4.0
+        mid = 56
+        rail = 92          # 并联臂下公共端轨
+        f = QtGui.QFont(self.font())
+        f.setPointSize(8)
+        p.setFont(f)
+
+        def rbox(x, y, bw, bh, fill="#FFFFFF"):
+            _pen(p, edge, 1.4)
+            p.setBrush(QtGui.QColor(fill))
+            p.drawRect(QtCore.QRectF(x, y, bw, bh))
+
+        def wire(x1, y1, x2, y2):
+            _line(p, x1, y1, x2, y2, edge, 1.4)
+
+        captions = ("Pi 型（两端匹配）", "T 型（两端匹配）",
+                    "桥 T 型（两端匹配）", "L 型（仅入端匹配）")
+        for i, cap in enumerate(captions):
+            x0 = i * cw
+            p.drawText(QtCore.QRectF(x0, h - 26, cw, 22),
+                       Qt.AlignHCenter | Qt.AlignVCenter, cap)
+            inp = x0 + 10
+            outp = x0 + cw - 10
+            wire(inp, mid, outp, mid)          # 主通路
+            p.drawEllipse(QtCore.QPointF(inp, mid), 2.0, 2.0)
+            p.drawEllipse(QtCore.QPointF(outp, mid), 2.0, 2.0)
+            if i == 0:      # Pi：两端并联臂 + 中央串臂
+                rbox(inp + 18, mid - 16, 9, 32)
+                rbox((inp + outp) / 2 - 9, mid - 5, 18, 10)
+                rbox(outp - 27, mid - 16, 9, 32)
+                wire(inp + 22, mid + 16, inp + 22, rail)
+                wire(outp - 22, mid + 16, outp - 22, rail)
+                wire(inp + 22, rail, outp - 22, rail)
+            elif i == 1:    # T：两端串臂 + 中央并联臂
+                rbox(inp + 16, mid - 5, 18, 10)
+                rbox((inp + outp) / 2 - 5, mid + 8, 10, 22)
+                wire((inp + outp) / 2, mid + 30, (inp + outp) / 2, rail)
+                wire(inp + 16, rail, outp - 16, rail)
+            elif i == 2:    # 桥 T：串臂跨接桥臂 + 输出并联臂
+                rbox((inp + outp) / 2 - 10, mid - 5, 20, 10)
+                rbox((inp + outp) / 2 - 14, mid - 38, 28, 9)
+                bx = (inp + outp) / 2
+                wire(bx - 14, mid - 33, bx - 26, mid - 33)
+                wire(bx + 14, mid - 33, bx + 26, mid - 33)
+                wire(bx - 26, mid - 33, bx - 26, mid)
+                wire(bx + 26, mid - 33, bx + 26, mid)
+                rbox(outp - 30, mid + 8, 10, 22)
+                wire(outp - 25, mid + 30, outp - 25, rail)
+                wire(bx - 26, rail, outp - 25, rail)
+            else:           # L：入端串臂 + 出端并联臂（出端固有失配）
+                rbox(inp + 14, mid - 5, 18, 10)
+                rbox(outp - 28, mid - 16, 9, 32)
+                wire(outp - 23, mid + 16, outp - 23, rail)
+                wire(inp + 14, rail, outp - 23, rail)
+        p.end()
+
+
+class _SkinGlyph(QtWidgets.QWidget):
+    """趋肤效应示意：导体截面 + 表面电流层 + 趋肤深度 δ 箭头。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("skin.diagram")
+        self.setFixedSize(232, 104)
+
+    def paintEvent(self, ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+        w = self.width()
+        f = QtGui.QFont(self.font())
+        f.setPointSize(8)
+        p.setFont(f)
+        _pen(p, "#1F1F1F", 1.4)
+        p.setBrush(QtGui.QColor("#D9A066"))
+        p.drawRect(QtCore.QRectF(14, 40, w - 28, 40))
+        _line(p, 14, 40, w - 14, 40, "#8A5A2B", 2.2)     # 表面电流层
+        _line(p, 60, 40, 60, 70, "#FFFFFF", 1.4)
+        _head(p, 60, 76, 0.0, 1.0, "#FFFFFF")            # δ 方向箭头
+        p.drawText(QtCore.QRectF(14, 14, 130, 20),
+                   Qt.AlignLeft | Qt.AlignVCenter, "表面电流 Rs")
+        p.drawText(QtCore.QRectF(68, 52, 30, 18),
+                   Qt.AlignLeft | Qt.AlignVCenter, "δ")
+        p.drawText(QtCore.QRectF(14, 84, 120, 18),
+                   Qt.AlignLeft | Qt.AlignVCenter, "导体（厚度 ≥3δ）")
+        p.end()
+
+
+class _LcGlyph(QtWidgets.QWidget):
+    """LC 谐振器示意：上支路线圈 + 下支路电容的并联谐振回路。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("lcres.diagram")
+        self.setFixedSize(220, 96)
+
+    def paintEvent(self, ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        edge = "#1F1F1F"
+        ytop, ybot = 30, 62
+        lx, rx = 24, 196
+        _line(p, lx, ytop, lx, ybot, edge, 1.4)
+        _line(p, rx, ytop, rx, ybot, edge, 1.4)
+        _line(p, lx, ytop, 62, ytop, edge, 1.4)          # 线圈左引线
+        _line(p, 158, ytop, rx, ytop, edge, 1.4)         # 线圈右引线
+        for i in range(4):                               # 4 匝半圆线圈
+            x = 62 + i * 24
+            p.drawArc(QtCore.QRectF(x, ytop - 12, 24, 24), 0, 180 * 16)
+        _line(p, lx, ybot, 96, ybot, edge, 1.4)          # 电容左引线
+        _line(p, 108, ybot, rx, ybot, edge, 1.4)         # 电容右引线
+        _line(p, 96, ybot - 12, 96, ybot + 12, edge, 1.6)
+        _line(p, 108, ybot - 12, 108, ybot + 12, edge, 1.6)
+        p.end()
+
+
+def _mk_attenuator(win):
+    """衰减器设计：Z0/衰减 → Pi / T / 桥 T / L 四拓扑电阻（引擎 attenuator_*）。"""
+    dg = _AttDiagram()
+
+    def mids(page):
+        z0 = _num_box(page.name + ".z0", "50", w=72)
+        att = _num_box(page.name + ".att", "10", w=72)
+        page.z0_box = z0
+        page.att_box = att
+        z0.setAccessibleName("系统阻抗 Z0（Ω）")
+        att.setAccessibleName("目标衰减（dB）")
+        return [_mid_row([z0], label="系统阻抗 Z0 ="),
+                _mid_row([att], label="目标衰减 A =")]
+
+    def buttons(page):
+        return [_calc_btn(page, "Calculate [F4]", lambda: calc(page),
+                          page.name + ".calc")]
+
+    def rows(page):
+        out = []
+        specs = (
+            ("Pi 型（两端匹配）",
+             (("pi_r_series", "R 串", "Ω"), ("pi_r_shunt", "R 并（每侧）", "Ω"))),
+            ("T 型（两端匹配）",
+             (("t_r_series", "R 串（每侧）", "Ω"), ("t_r_shunt", "R 并", "Ω"))),
+            ("桥 T 型（两端匹配）",
+             (("bt_r_bridge", "R 桥", "Ω"), ("bt_r_shunt", "R 并", "Ω"),
+              ("bt_r_fixed", "R 固定（=Z0）", "Ω"))),
+            ("L 型（仅入端匹配）",
+             (("lp_r_series", "R 串", "Ω"), ("lp_r_shunt", "R 并", "Ω"),
+              ("lp_z_in", "Zin", "Ω"), ("lp_z_out", "Zout", "Ω"),
+              ("lp_vswr_in", "VSWR in", ": 1"), ("lp_vswr_out", "VSWR out", ": 1"))),
+        )
+        for title, keys in specs:
+            gb, l = _grp(title)
+            for key, lab, unit in keys:
+                l.addWidget(_res_row(page, key, lab, unit, box_w=92))
+            out.append(gb)
+        note = _ql("")
+        note.setObjectName(page.name + ".note")
+        note.setStyleSheet("color:#777777;font-size:8pt;")
+        note.setWordWrap(True)
+        note.hide()
+        page.note = note
+        out.append(note)
+        return out
+
+    def calc(page):
+        e = _e()
+        z0 = _f(page.z0_box, "系统阻抗 Z0")
+        att = _f(page.att_box, "目标衰减")
+        rp = e.attenuator_pi(z0, att)
+        rt = e.attenuator_t(z0, att)
+        rb = e.attenuator_bridged_t(z0, att)
+        rl = e.attenuator_lpad(z0, att)
+        for r in (rp, rt, rb, rl):
+            if not r.get("ok"):
+                raise _InputError(r.get("error", "引擎返回失败"))
+        _setr(page, {"pi_r_series": rp.get("r_series"),
+                     "pi_r_shunt": rp.get("r_shunt"),
+                     "t_r_series": rt.get("r_series"),
+                     "t_r_shunt": rt.get("r_shunt"),
+                     "bt_r_bridge": rb.get("r_bridge"),
+                     "bt_r_shunt": rb.get("r_shunt"),
+                     "bt_r_fixed": rb.get("r_fixed"),
+                     "lp_r_series": rl.get("r_series"),
+                     "lp_r_shunt": rl.get("r_shunt"),
+                     "lp_z_in": rl.get("z_in"),
+                     "lp_z_out": rl.get("z_out"),
+                     "lp_vswr_in": rl.get("vswr_in"),
+                     "lp_vswr_out": rl.get("vswr_out")})
+        warns = []
+        for src in (rp, rt, rb, rl):
+            warns.extend(src.get("warnings") or [])
+        note = getattr(page, "note", None)
+        if note is not None:
+            note.setText("\n".join(warns))
+            note.setVisible(bool(warns))
+        return "Pi R串=%s Ω / R并=%s Ω" % (_g(rp.get("r_series")),
+                                           _g(rp.get("r_shunt")))
+
+    return _a_shell(win, "attenuator", "衰减器设计 Attenuator Design",
+                    dg, mids, buttons, rows)
+
+
+def _mk_vswrconv(win):
+    """VSWR / |Γ| / 回波损耗互算：三入口任填其一（引擎 vswr_convert）。"""
+    page = _b_shell(win, "vswrconv", "VSWR 换算 VSWR / Return Loss")
+    left = page._left
+    head = _ql("任填一项入口（其余留空），Calculate 或 F4 互算全部口径：")
+    head.setWordWrap(True)
+    left.addWidget(head)
+    ins = {}
+    for key, lab, unit in (("vswr", "驻波比 VSWR = ", ": 1"),
+                           ("gamma", "反射系数模 |Γ| = ", ""),
+                           ("rl", "回波损耗 RL = ", "dB")):
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(_ql(lab, align_right=True))
+        bx = _num_box(page.name + "." + key, "", w=96)
+        bx.setAccessibleName(lab)
+        ins[key] = bx
+        row.addWidget(bx)
+        if unit:
+            row.addWidget(_ql(unit))
+        row.addStretch(1)
+        left.addLayout(row)
+    left.addSpacing(8)
+    b = QtWidgets.QPushButton("Calculate")
+    b.setObjectName(page.name + ".calc")
+    left.addWidget(b)
+    left.addStretch(1)
+
+    right = page._right
+    for key, lab, unit in (("vswr", "驻波比 VSWR", ": 1"),
+                           ("gamma_mag", "反射系数模 |Γ|", ""),
+                           ("rl_db", "回波损耗 RL", "dB"),
+                           ("mismatch_loss_db", "失配损耗 ML", "dB"),
+                           ("power_reflected_pct", "反射功率", "%"),
+                           ("power_transmitted_pct", "透射功率", "%")):
+        hh = QtWidgets.QHBoxLayout()
+        hh.setSpacing(4)
+        hh.addWidget(_ql(lab + " =", align_right=True))
+        bx = _num_box(page.name + ".result." + key, "", w=96, ro=True)
+        page.results[key] = bx
+        hh.addWidget(bx)
+        if unit:
+            hh.addWidget(_ql(unit))
+        hh.addStretch(1)
+        right.addLayout(hh)
+    right.addStretch(1)
+
+    def calc():
+        e = _e()
+
+        def val(bx, nm):
+            t = str(bx.text()).strip()
+            return None if t == "" else _f(bx, nm)
+
+        vs = val(ins["vswr"], "驻波比 VSWR")
+        gm = val(ins["gamma"], "反射系数模 |Γ|")
+        rdb = val(ins["rl"], "回波损耗 RL")
+        n = sum(1 for x in (vs, gm, rdb) if x is not None)
+        if n == 0:
+            raise _InputError("请填入 VSWR、|Γ|、RL(dB) 之一（当前三项均为空）")
+        if n > 1:
+            raise _InputError("只能填一个入口（检测到 %d 个），其余请留空" % n)
+        r = e.vswr_convert(vswr=vs, gamma_mag=gm, rl_db=rdb)
+        if not r.get("ok"):
+            raise _InputError(r.get("error", "引擎返回失败"))
+        _setr(page, {k: r.get(k) for k in
+                     ("vswr", "gamma_mag", "rl_db", "mismatch_loss_db",
+                      "power_reflected_pct", "power_transmitted_pct")})
+        return "VSWR=%s : 1" % _g(r.get("vswr"))
+
+    b.clicked.connect(lambda: _run_calc(page, calc))
+    return page
+
+
+def _mk_skin(win):
+    """趋肤效应：频率/材质/µr → 趋肤深度 δ 与表面电阻 Rs（引擎 skin_effect）。"""
+    page = _b_shell(win, "skin", "趋肤效应 Skin Effect")
+    left = page._left
+    left.addWidget(_SkinGlyph())
+    left.addSpacing(6)
+    frow = QtWidgets.QHBoxLayout()
+    frow.setSpacing(4)
+    frow.addWidget(_ql("频率 f = ", align_right=True))
+    fb = _num_box(page.name + ".freq", "1", w=96)
+    fb.setAccessibleName("频率")
+    fu = QtWidgets.QComboBox()
+    fu.setObjectName(page.name + ".funit")
+    fu.addItems(_FREQ_ITEMS)
+    fu.setFixedWidth(78)
+    page.combos[page.name + ".funit"] = fu
+    frow.addWidget(fb)
+    frow.addWidget(fu)
+    frow.addStretch(1)
+    left.addLayout(frow)
+    mrow = QtWidgets.QHBoxLayout()
+    mrow.setSpacing(4)
+    mrow.addWidget(_ql("导体材质 = ", align_right=True))
+    mkey = {"铜 Cu": "cu", "银 Ag": "ag", "金 Au": "au", "铝 Al": "al"}
+    mc = QtWidgets.QComboBox()
+    mc.setObjectName(page.name + ".material")
+    mc.addItems(list(mkey))
+    mc.setFixedWidth(96)
+    page.combos[page.name + ".material"] = mc
+    mrow.addWidget(mc)
+    mrow.addStretch(1)
+    left.addLayout(mrow)
+    urrow = QtWidgets.QHBoxLayout()
+    urrow.setSpacing(4)
+    urrow.addWidget(_ql("相对磁导率 µr = ", align_right=True))
+    urb = _num_box(page.name + ".mur", "1", w=72)
+    urb.setAccessibleName("相对磁导率 µr（可选）")
+    urrow.addWidget(urb)
+    urrow.addStretch(1)
+    left.addLayout(urrow)
+    left.addSpacing(8)
+    b = QtWidgets.QPushButton("Calculate")
+    b.setObjectName(page.name + ".calc")
+    left.addWidget(b)
+    left.addStretch(1)
+
+    right = page._right
+    for key, lab, unit in (("delta_um", "趋肤深度 δ", "µm"),
+                           ("rs_ohm_sq", "表面电阻 Rs", "Ω/□")):
+        hh = QtWidgets.QHBoxLayout()
+        hh.setSpacing(4)
+        hh.addWidget(_ql(lab + " =", align_right=True))
+        bx = _num_box(page.name + ".result." + key, "", w=110, ro=True)
+        page.results[key] = bx
+        hh.addWidget(bx)
+        hh.addWidget(_ql(unit))
+        hh.addStretch(1)
+        right.addLayout(hh)
+    note = _ql("")
+    note.setObjectName(page.name + ".note")
+    note.setStyleSheet("color:#777777;font-size:8pt;")
+    note.setWordWrap(True)
+    note.hide()
+    page.note = note
+    right.addWidget(note)
+    right.addStretch(1)
+
+    def calc():
+        e = _e()
+        f = _f(fb, "频率")
+        fu_k = page.combos[page.name + ".funit"].currentText()
+        fhz = e.to_si(f, fu_k, "freq")
+        mat = mkey[page.combos[page.name + ".material"].currentText()]
+        mur = _fopt(urb, 1.0, "相对磁导率 µr")
+        r = e.skin_effect(fhz, mat, mur)
+        if not r.get("ok"):
+            raise _InputError(r.get("error", "引擎返回失败"))
+        delta = r.get("delta_m")
+        _setr(page, {"delta_um": (delta * 1e6) if delta is not None else None,
+                     "rs_ohm_sq": r.get("rs_ohm_sq")})
+        txt = ["材质：%s · ρ = %g Ω·m"
+               % (page.combos[page.name + ".material"].currentText(),
+                  r.get("rho_ohm_m") or 0.0)]
+        txt.extend(r.get("warnings") or [])
+        page.note.setText("\n".join(txt))
+        page.note.setVisible(len(txt) > 1)
+        return "δ=%s µm" % _g((delta * 1e6) if delta is not None else None)
+
+    b.clicked.connect(lambda: _run_calc(page, calc))
+    return page
+
+
+def _mk_lcres(win):
+    """LC 谐振器：L/C/损耗/寄生 → f0、特性阻抗、Q、带宽、SRF（引擎 lc_resonator）。"""
+    page = _b_shell(win, "lcres", "LC 谐振器 LC Resonator")
+    left = page._left
+    left.addWidget(_LcGlyph())
+    left.addSpacing(6)
+    lrow = QtWidgets.QHBoxLayout()
+    lrow.setSpacing(4)
+    lrow.addWidget(_ql("电感 L = ", align_right=True))
+    lb = _num_box(page.name + ".l", "10", w=84)
+    lu = QtWidgets.QComboBox()
+    lu.setObjectName(page.name + ".lunit")
+    lu.addItems(["nH", "µH"])
+    lu.setFixedWidth(72)
+    page.combos[page.name + ".lunit"] = lu
+    lrow.addWidget(lb)
+    lrow.addWidget(lu)
+    lrow.addStretch(1)
+    left.addLayout(lrow)
+    crow = QtWidgets.QHBoxLayout()
+    crow.setSpacing(4)
+    crow.addWidget(_ql("电容 C = ", align_right=True))
+    cb = _num_box(page.name + ".c", "10", w=84)
+    cu = QtWidgets.QComboBox()
+    cu.setObjectName(page.name + ".cunit")
+    cu.addItems(["pF", "nF"])
+    cu.setFixedWidth(72)
+    page.combos[page.name + ".cunit"] = cu
+    crow.addWidget(cb)
+    crow.addWidget(cu)
+    crow.addStretch(1)
+    left.addLayout(crow)
+    esr = _num_box(page.name + ".esr", "0", w=84)
+    rp = _num_box(page.name + ".rp", "", w=84)
+    cpar = _num_box(page.name + ".cpar", "", w=84)
+    lpar = _num_box(page.name + ".lpar", "", w=84)
+    for bx, lab in ((esr, "串联损耗电阻 ESR（Ω，0 = 不计）"),
+                    (rp, "并联电阻 Rp（Ω，留空 = 不计）"),
+                    (cpar, "寄生电容 Cpar（pF，留空 = 不计）"),
+                    (lpar, "寄生电感 Lpar（nH，留空 = 不计）")):
+        bx.setAccessibleName(lab)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(_ql(lab + " = ", align_right=True))
+        row.addWidget(bx)
+        row.addStretch(1)
+        left.addLayout(row)
+    left.addSpacing(8)
+    b = QtWidgets.QPushButton("Calculate")
+    b.setObjectName(page.name + ".calc")
+    left.addWidget(b)
+    left.addStretch(1)
+
+    right = page._right
+    for key, lab, unit in (("f0_ghz", "谐振频率 f0", "GHz"),
+                           ("z0_char", "特性阻抗 √(L/C)", "Ω"),
+                           ("q_unloaded", "空载 Q", ""),
+                           ("bw_3db_mhz", "3 dB 带宽", "MHz"),
+                           ("srf_ghz", "自谐振频率（取小）", "GHz")):
+        hh = QtWidgets.QHBoxLayout()
+        hh.setSpacing(4)
+        hh.addWidget(_ql(lab + " =", align_right=True))
+        bx = _num_box(page.name + ".result." + key, "", w=96, ro=True)
+        page.results[key] = bx
+        hh.addWidget(bx)
+        if unit:
+            hh.addWidget(_ql(unit))
+        hh.addStretch(1)
+        right.addLayout(hh)
+    note = _ql("")
+    note.setObjectName(page.name + ".note")
+    note.setStyleSheet("color:#777777;font-size:8pt;")
+    note.setWordWrap(True)
+    note.hide()
+    page.note = note
+    right.addWidget(note)
+    right.addStretch(1)
+
+    def calc():
+        e = _e()
+        lv = _f(lb, "电感 L")
+        cv = _f(cb, "电容 C")
+        lh = lv * {"nH": 1e-9, "µH": 1e-6}[
+            page.combos[page.name + ".lunit"].currentText()]
+        cf = cv * {"pF": 1e-12, "nF": 1e-9}[
+            page.combos[page.name + ".cunit"].currentText()]
+        esr_v = _fopt(esr, 0.0, "串联电阻 ESR")
+
+        def opt(bx, nm):
+            t = str(bx.text()).strip()
+            return None if t == "" else _f(bx, nm)
+
+        rp_v = opt(rp, "并联电阻 Rp")
+        cpar_f = _fopt(cpar, 0.0, "寄生电容 Cpar") * 1e-12
+        lpar_h = _fopt(lpar, 0.0, "寄生电感 Lpar") * 1e-9
+        r = e.lc_resonator(lh, cf, esr_v, rp_v, cpar_f, lpar_h)
+        if not r.get("ok"):
+            raise _InputError(r.get("error", "引擎返回失败"))
+        f0 = r.get("f0")
+        q = r.get("q_unloaded")
+        bw = r.get("bw_3db_hz")
+        srf = r.get("srf_hz")
+        _setr(page, {"f0_ghz": (f0 / 1e9) if f0 else None,
+                     "z0_char": r.get("z0_char"),
+                     "q_unloaded": q,
+                     "bw_3db_mhz": (bw / 1e6) if bw else None,
+                     "srf_ghz": (srf / 1e9) if srf else None})
+        page.note.setText("\n".join(r.get("warnings") or []))
+        page.note.setVisible(bool(r.get("warnings")))
+        return "f0=%s GHz" % _g((f0 / 1e9) if f0 else None)
+
+    b.clicked.connect(lambda: _run_calc(page, calc))
+    return page
+
+
 _GROUPS = [
     ("tl", "传输线", [
         ("microstrip", "微带线", "microstrip"),
@@ -7122,11 +8177,74 @@ _GROUPS = [
         ("complex_math", "复数计算器", "subs"),
         ("substrate", "基片库", "subs"),
     ]),
+    ("xt", "扩展工具", [
+        ("attenuator", "衰减器设计", "att"),
+        ("vswrconv", "VSWR换算", "vswr"),
+        ("skin", "趋肤效应", "skin"),
+        ("lcres", "LC谐振器", "lcres"),
+    ]),
 ]
 
 
+class _NavItem(QtWidgets.QToolButton):
+    """侧栏图标项（键盘导航核心）：
+    ↑/↓ 在可见项间循环移动焦点；Home/End 跳首/尾；←/→ 跳到分组条；
+    回车/空格显式激活（跨 PySide2/6 行为一致）。"""
+
+    def __init__(self, bar, page_key):
+        super().__init__()
+        self._bar = bar
+        self._key = page_key
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def _siblings(self):
+        return list(self._bar._items.values())
+
+    def _hop(self, delta):
+        sib = self._siblings()
+        if not sib:
+            return
+        try:
+            i = sib.index(self)
+        except ValueError:
+            return
+        sib[(i + delta) % len(sib)].setFocus(Qt.OtherFocusReason)
+
+    def keyPressEvent(self, ev):
+        k = ev.key()
+        if k == Qt.Key_Up:
+            self._hop(-1)
+            ev.accept()
+        elif k == Qt.Key_Down:
+            self._hop(1)
+            ev.accept()
+        elif k == Qt.Key_Home:
+            sib = self._siblings()
+            if sib:
+                sib[0].setFocus(Qt.OtherFocusReason)
+            ev.accept()
+        elif k == Qt.Key_End:
+            sib = self._siblings()
+            if sib:
+                sib[-1].setFocus(Qt.OtherFocusReason)
+            ev.accept()
+        elif k in (Qt.Key_Left, Qt.Key_Right):
+            self._bar.focus_groups(k == Qt.Key_Left)
+            ev.accept()
+        elif k in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.click()
+            ev.accept()
+        else:
+            super().keyPressEvent(ev)
+
+
 class _OutlookBar(QtWidgets.QWidget):
-    """宽 ~115px：顶部=展开组的图标项（自绘 32px 缩略图），底部=分组条小钮。"""
+    """宽 ~118px：顶部=展开组的图标项（自绘 32px 缩略图），底部=分组条小钮。
+
+    三态可视：悬停=浅蓝底、选中=accent 浅底+左 accent 条+粗体、键盘焦点=1px
+    accent 环（颜色不是唯一通道：选中另有左条+粗体，焦点另有环）。
+    无障碍：每项带 tooltip / statusTip / accessibleName，objectName 为
+    "<页名>.nav"（测试锚点）。"""
 
     def __init__(self, win):
         super().__init__()
@@ -7134,15 +8252,32 @@ class _OutlookBar(QtWidgets.QWidget):
         self._expanded = _GROUPS[0][0]
         self.setObjectName("sidebar")
         self.setFixedWidth(118)
+        barw = max(3, U.px(4))
+        gpad = U.px(3)
+        gpadl = U.px(8)
+        ipd = U.px(2)
         self.setStyleSheet(
-            " QWidget#sidebar { background: #E8E8E8; }"
+            " QWidget#sidebar { background: %(nav)s; }"
             " QWidget#sidebar QPushButton { background: #FFFFFF;"
             "   border: 1px solid #808080; border-top-color: #FFFFFF;"
-            "   border-left-color: #FFFFFF; font-size: 8pt; padding: 3px; }"
-            " QWidget#sidebar QToolButton { border: 1px solid transparent;"
-            "   font-size: 8pt; padding: 2px; }"
-            " QWidget#sidebar QToolButton:hover { background: #DFE8F6; }"
-            " QWidget#sidebar QToolButton:checked { background: #CCE0F5; }")
+            "   border-left-color: #FFFFFF; font-size: 8pt; padding: %(gp)dpx;"
+            "   text-align: left; padding-left: %(gpl)dpx; }"
+            " QWidget#sidebar QPushButton:hover { background: #F5F7FA; }"
+            " QWidget#sidebar QPushButton:focus { border: 1px solid %(acc)s;"
+            "   border-top-color: %(acc)s; border-left-color: %(acc)s; }"
+            " QWidget#sidebar QToolButton { border-top: 1px solid transparent;"
+            "   border-bottom: 1px solid transparent;"
+            "   border-right: 1px solid transparent;"
+            "   border-left: %(bw)dpx solid transparent;"
+            "   font-size: 8pt; padding: %(ip)dpx; color: #1A1A1A; }"
+            " QWidget#sidebar QToolButton:hover { background: %(hov)s; }"
+            " QWidget#sidebar QToolButton:focus { border-color: %(acc)s;"
+            "   border-left-color: %(acc)s; }"
+            " QWidget#sidebar QToolButton:checked { background: %(chk)s;"
+            "   border-left-color: %(acc)s; font-weight: bold; }"
+            % {"nav": NAV_BG, "acc": ACCENT, "hov": ACCENT_HOVERBG,
+               "chk": ACCENT_SOFT, "bw": barw, "gp": gpad, "gpl": gpadl,
+               "ip": ipd})
         self._items = {}
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -7158,11 +8293,39 @@ class _OutlookBar(QtWidgets.QWidget):
         for key, btn in self._items.items():
             btn.setChecked(key == page_name)
 
+    def _group_buttons(self):
+        return [b for b in self.findChildren(QtWidgets.QPushButton)
+                if b.objectName().startswith("sidebar.group.")]
+
+    def focus_groups(self, to_first=True):
+        """项区 → 分组条：跳到首/末分组钮。"""
+        groups = self._group_buttons()
+        if groups:
+            (groups[0] if to_first else groups[-1]).setFocus(Qt.OtherFocusReason)
+
+    def _chev_icon(self, down):
+        # 分组展开/折叠指示：展开=向下 chevron，收起=向右（QPainter 矢量自绘）
+        pm = QtGui.QPixmap(10, 10)
+        pm.fill(Qt.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        _pen(p, "#444444", 1.6)
+        if down:
+            p.drawLine(QtCore.QLineF(3, 4, 5, 6))
+            p.drawLine(QtCore.QLineF(5, 6, 7, 4))
+        else:
+            p.drawLine(QtCore.QLineF(4, 3, 6, 5))
+            p.drawLine(QtCore.QLineF(6, 5, 4, 7))
+        p.end()
+        return QtGui.QIcon(pm)
+
     def rebuild(self):
-        # 重建 = 换内部容器（removeWidget 立即摘除旧容器；deleteLater 延迟销毁）
+        # 重建 = 换内部容器（removeWidget 摘除旧容器；setParent(None) 立即
+        # 脱离对象树——findChild 不再命中旧项；deleteLater 延迟销毁）
         if self._inner is not None:
             old = self._inner
             self.layout().removeWidget(old)
+            old.setParent(None)
             old.hide()
             old.deleteLater()
         self._items = {}
@@ -7174,13 +8337,16 @@ class _OutlookBar(QtWidgets.QWidget):
         for key, label, members in _GROUPS:
             if key == self._expanded:
                 for page_key, text, icon_kind in members:
-                    tb = QtWidgets.QToolButton()
+                    tb = _NavItem(self, page_key)
                     tb.setText(text)
                     tb.setIcon(_icon(icon_kind, 32))
                     tb.setIconSize(QtCore.QSize(32, 32))
                     tb.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
                     tb.setCheckable(True)
-                    tb.setObjectName("sidebar.item." + page_key)
+                    tb.setObjectName(page_key + ".nav")
+                    tb.setToolTip("%s（回车/空格打开；↑↓ 切换，F8 折叠侧栏）" % text)
+                    tb.setStatusTip("打开页面：" + text)
+                    tb.setAccessibleName(text)
                     tb.clicked.connect(lambda _c=False, k=page_key:
                                        self._win.show_page(k))
                     lay.addWidget(tb)
@@ -7189,10 +8355,36 @@ class _OutlookBar(QtWidgets.QWidget):
         for key, label, _members in _GROUPS:
             b = QtWidgets.QPushButton(label)
             b.setObjectName("sidebar.group." + key)
+            b.setIcon(self._chev_icon(key == self._expanded))
+            b.setToolTip("展开分组：%s" % label)
+            b.setStatusTip("展开分组：" + label)
             b.clicked.connect(lambda _c=False, k=key: self.expand(k))
+            b.installEventFilter(self)
             lay.addWidget(b)
         self._inner = inner
         self.layout().addWidget(inner)
+        # 换组后按当前页恢复选中高亮（不再丢一次 until 下次 show_page）
+        cur = self._win._stack.currentWidget() if hasattr(self._win, "_stack") else None
+        if cur is not None:
+            self.sync(cur.name)
+
+    def eventFilter(self, obj, ev):
+        # 分组条键盘导航：↑/↓ 在组间移动，←/→ 回到项区
+        if ev.type() == QtCore.QEvent.KeyPress and isinstance(obj, QtWidgets.QPushButton):
+            k = ev.key()
+            groups = self._group_buttons()
+            if k in (Qt.Key_Up, Qt.Key_Down) and obj in groups:
+                i = groups.index(obj)
+                step = 1 if k == Qt.Key_Down else -1
+                groups[(i + step) % len(groups)].setFocus(Qt.OtherFocusReason)
+                return True
+            if k in (Qt.Key_Left, Qt.Key_Right) and obj in groups:
+                items = list(self._items.values())
+                if items:
+                    (items[0] if k == Qt.Key_Right else items[-1]).setFocus(
+                        Qt.OtherFocusReason)
+                return True
+        return super().eventFilter(obj, ev)
 
 
 # ---------------------------------------------------------------------------
@@ -7200,26 +8392,42 @@ class _OutlookBar(QtWidgets.QWidget):
 # ---------------------------------------------------------------------------
 
 class _WebBar(QtWidgets.QFrame):
+    """Web 链接条：蓝字（WEBBLUE 令牌）、悬停下划线 + 手型光标 + tooltip。"""
+
     def __init__(self, win):
         super().__init__()
         self.setObjectName("webbar")
-        self.setFixedHeight(24)
+        self.setFixedHeight(max(24, U.px(24)))
         self.setStyleSheet(
             " QFrame#webbar { background: #FFFFFF; border: 1px solid #808080;"
             "   border-top-color: #FFFFFF; border-left-color: #FFFFFF; }"
             " QFrame#webbar QLabel { color: %s; border: none; }" % WEBBLUE)
         h = QtWidgets.QHBoxLayout(self)
-        h.setContentsMargins(2, 1, 2, 1)
+        h.setContentsMargins(U.px(2), U.px(1), U.px(2), U.px(1))
         h.addStretch(1)
         self._lab = QtWidgets.QLabel("Click for Web: APPLICATION NOTES · MODELS · "
                                      "DESIGN TIPS · DATA SHEETS · S-PARAMETERS")
+        self._lab.setCursor(Qt.PointingHandCursor)
+        self._lab.setToolTip("离线版：Web 链接未启用")
         h.addWidget(self._lab)
         h.addStretch(1)
+
+    def _set_underline(self, on):
+        f = self._lab.font()
+        f.setUnderline(on)
+        self._lab.setFont(f)
+
+    def enterEvent(self, ev):
+        # 基类 enter/leave 为空实现，不回传 event 以兼容 PySide2/6 两种签名
+        self._set_underline(True)
+
+    def leaveEvent(self, ev):
+        self._set_underline(False)
 
     def mousePressEvent(self, ev):
         w = self.window()
         if w is not None:
-            w.status().showMessage("离线版：无外部链接（clean-room 复刻，不含联网）")
+            w.status().showMessage("离线版：Web 链接未启用（不含联网）", 4000)
         super().mousePressEvent(ev)
 
 
@@ -7235,7 +8443,10 @@ class RfCalcWindow(QtWidgets.QMainWindow):
         if parent is not None:
             self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowTitle("RF 计算器")
-        self.resize(1000, 700)
+        # 页面固定 966×669（chrome 规格）+ 侧栏 118 + Web 条/状态栏，
+        # 默认尺寸按无裁剪完整可见取值（旧 1000×700 会裁掉页面右缘 84px）。
+        self.resize(1088, 728)
+        self.setMinimumSize(760, 540)
         self._pages = {}
         self._order = []
         self._last_sub = None
@@ -7252,7 +8463,11 @@ class RfCalcWindow(QtWidgets.QMainWindow):
         body.addWidget(self.sidebar)
         body.addWidget(self._stack, 1)
         v.addLayout(body, 1)
-        v.addWidget(_WebBar(self))
+        # 实机窗口没有第二条链接条：页内 1:1 chrome 已有黄/蓝底带，
+        # 窗口级 Web 条只保留对象（离线提示与测试锚点），默认隐藏。
+        self.webbar = _WebBar(self)
+        self.webbar.setVisible(False)
+        v.addWidget(self.webbar)
         self.setCentralWidget(central)
 
         # 页面构建（顺序 = 侧栏分组顺序）
@@ -7270,7 +8485,7 @@ class RfCalcWindow(QtWidgets.QMainWindow):
         _mk_det_small(self)
         _mk_bjt_base(self)
         _mk_bjt(self)
-        _mk_fet(self, "fet_self", "FET 自偏置 FET Bias - Source Resistor (self bias)",
+        _mk_fet(self, "fet_self", "FET Bias - Source Resistor (self bias)",
                 divider=False)
         _mk_fet(self, "fet_div", "FET 分压偏置 FET Bias - Divider", divider=True)
         _mk_pae(self)
@@ -7286,16 +8501,36 @@ class RfCalcWindow(QtWidgets.QMainWindow):
         _mk_constants(self)
         _mk_complex_math(self)
         _mk_substrate(self)
+        _mk_attenuator(self)
+        _mk_vswrconv(self)
+        _mk_skin(self)
+        _mk_lcres(self)
 
         self._shortcuts = []
         self._shortcut("F4", self._f4)
         self._shortcut("F3", self._f3)
         self._shortcut("F8", self.toggle_sidebar)
+        self._install_shortcut_hints()
         self.show_page("microstrip")
 
     # -- 基础设施 ------------------------------------------------------------
     def status(self):
         return self.statusBar()
+
+    def _install_shortcut_hints(self):
+        """F3/F4/F8 快捷键可见提示：状态栏右侧常驻标签 + 相关按钮 tooltip。"""
+        tip = QtWidgets.QLabel("F4 计算 · F3 副计算 · F8 侧栏")
+        tip.setObjectName("shortcut.hint")
+        tip.setStyleSheet("color:%s; padding: 0 6px;" % STATUS_FG)
+        self.statusBar().addPermanentWidget(tip)
+        for page in self._pages.values():
+            for suffix, label, key in ((".calc", "计算", "F4"),
+                                       (".calc2", "副计算", "F3"),
+                                       (".mainmenu", "Main Menu（折叠/展开侧栏）",
+                                        "F8")):
+                b = page.findChild(QtWidgets.QPushButton, page.name + suffix)
+                if b is not None:
+                    b.setToolTip("%s — 快捷键 %s" % (label, key))
 
     def _shortcut(self, key, cb):
         cls = getattr(QtWidgets, "QShortcut", None) or getattr(QtGui, "QShortcut", None)
@@ -7329,13 +8564,35 @@ class RfCalcWindow(QtWidgets.QMainWindow):
     def toggle_sidebar(self):
         self.sidebar.setVisible(not self.sidebar.isVisible())
 
+    def _focus_first(self, page):
+        """页切换后把键盘焦点落到页面首个可交互控件（_FocusSpy 机制入口）。"""
+        w = page
+        first_ro = None
+        for _ in range(500):  # nextInFocusChain 会绕全窗口一圈，需上限防卡
+            w = w.nextInFocusChain()
+            if w is None or w is page:
+                break
+            if not page.isAncestorOf(w) or not w.isEnabled():
+                continue
+            if not (w.focusPolicy() & Qt.TabFocus):
+                continue
+            if isinstance(w, QtWidgets.QLineEdit) and w.isReadOnly():
+                if first_ro is None:
+                    first_ro = w
+                continue
+            w.setFocus(Qt.OtherFocusReason)
+            return
+        if first_ro is not None:
+            first_ro.setFocus(Qt.OtherFocusReason)
+
     def show_page(self, name):
         page = self._pages.get(name)
         if page is None:
             return
         self._stack.setCurrentWidget(page)
         self.sidebar.sync(name)
-        self.status().showMessage("RF 计算器 — %s" % name, 4000)
+        self.status().showMessage("当前页：%s" % _page_tag(page), 4000)
+        self._focus_first(page)
 
     def _apply_substrate(self, sub):
         self._last_sub = sub
@@ -7343,8 +8600,9 @@ class RfCalcWindow(QtWidgets.QMainWindow):
         er = getattr(page, "er_box", None)
         if er is not None:
             er.setText(_g(sub["er"]))
-            self.status().showMessage("基片 %s：εr=%s 已回填 %s 页"
-                                      % (sub["name"], _g(sub["er"]), page.name), 8000)
+            self.status().showMessage("基片 %s：εr=%s 已回填 %s"
+                                      % (sub["name"], _g(sub["er"]),
+                                         _page_tag(page)), 8000)
         else:
             self.status().showMessage("基片 %s 已记录（当前页无 εr 框）" % sub["name"],
                                       8000)
@@ -7388,12 +8646,16 @@ def open_rfcalc_panel(parent=None):
 
 def _snapshot_main(outdir):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # offscreen 平台的 freetype 字体库默认扫描 Qt 安装目录下的 fonts/（不存在→
+    # 空字体库，中文全变豆腐块）；取证时指到系统字体目录，字形与实机一致。
+    if sys.platform == "win32" and os.path.isdir("C:/Windows/Fonts"):
+        os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
     app = QtWidgets.QApplication([])
     win = open_rfcalc_panel(None)
     if win is None:
         print("SNAP FAILED: window build failed")
         return 1
-    win.resize(1000, 720)
+    win.resize(1088, 728)  # 与默认窗宽一致，取证即默认视图
     win.show()
     app.processEvents()
     app.processEvents()

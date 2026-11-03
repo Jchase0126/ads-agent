@@ -805,6 +805,407 @@ def test_detector_appcad_scalars():
        "大信号表为已知差异（实机对输出做了压缩/钳位）")
 
 
+# ---------------------------------------------------------------------------
+# 新增能力：定阻衰减器 / VSWR 互算 / 趋肤效应 / 同轴 TE11 / LC 谐振器
+# 金标准值独立推导复核（2026-11-03），出处见各函数 docstring。
+# ---------------------------------------------------------------------------
+
+def test_attenuator_pi_t_golden_and_abcd():
+    """Pi/T 型衰减器金标准值 + ABCD 级联电学校验。
+
+    锚点口径 att = 20·lg2 = 6.0206 dB（k=2 精确）：
+      Pi@50Ω: R串=37.5、R并=150；T@50Ω: R串=16.6667、R并=66.6667。
+    精确 6 dB（k=10^(6/20)=1.9952623）@50Ω:
+      Pi: 37.35188/150.47601；T: 16.61394/66.93094。
+    电学校验：Pi 网络 ABCD A=1+Rs/Rp, B=Rs, C=2/Rp+Rs/Rp², D=A，
+    匹配条件 B/Z0 = C·Z0（代数恒等 x(x+2)²），|S21| = 1/k。
+    """
+    anchor = 20.0 * math.log10(2.0)
+    pi = r.attenuator_pi(50.0, anchor)
+    ok(pi["ok"] is True, "Pi 应计算成功")
+    _close(pi["r_series"], 37.5, 1e-9, "Pi k=2 R串")
+    _close(pi["r_shunt"], 150.0, 1e-9, "Pi k=2 R并")
+    t = r.attenuator_t(50.0, anchor)
+    ok(t["ok"] is True, "T 应计算成功")
+    _close(t["r_series"], 50.0 / 3.0, 1e-9, "T k=2 R串=Z0/3")
+    _close(t["r_shunt"], 200.0 / 3.0, 1e-9, "T k=2 R并=2Z0/3")
+    # 精确 6 dB
+    pi6 = r.attenuator_pi(50.0, 6.0)
+    _close(pi6["r_series"], 37.35188, 1e-4, "Pi 6dB R串")
+    _close(pi6["r_shunt"], 150.47601, 1e-4, "Pi 6dB R并")
+    t6 = r.attenuator_t(50.0, 6.0)
+    _close(t6["r_series"], 16.61394, 1e-4, "T 6dB R串")
+    _close(t6["r_shunt"], 66.93104, 1e-4, "T 6dB R并")
+    # 20 dB 金标准
+    pi20 = r.attenuator_pi(50.0, 20.0)
+    _close(pi20["r_series"], 247.5, 1e-6, "Pi 20dB R串")
+    _close(pi20["r_shunt"], 50.0 * 11.0 / 9.0, 1e-9, "Pi 20dB R并=61.1111")
+    # ABCD 电学校验（对 3/6/10/20 dB 全部成立）
+    for a_db in (3.0, 6.0, 10.0, 20.0):
+        k = 10.0 ** (a_db / 20.0)
+        for fn, z0 in ((r.attenuator_pi, 50.0), (r.attenuator_t, 50.0),
+                       (r.attenuator_pi, 75.0)):
+            out = fn(z0, a_db)
+            rs, rp = out["r_series"], out["r_shunt"]
+            if fn is r.attenuator_pi:
+                amat, bmat = 1.0 + rs / rp, rs
+                cmat = 2.0 / rp + rs / (rp * rp)
+            else:
+                amat, bmat = 1.0 + rs / rp, rs * (2.0 + rs / rp)
+                cmat = 1.0 / rp
+            s21 = 2.0 / (amat + bmat / z0 + cmat * z0 + amat)
+            _close(bmat / z0, cmat * z0, 1e-7 * z0,
+                   f"{fn.__name__} {a_db}dB 匹配条件 B/Z0=C·Z0")
+            _close(abs(s21), 1.0 / k, 1e-9,
+                   f"{fn.__name__} {a_db}dB |S21|=1/k")
+            _close(out["att_db"], a_db, 1e-12, "衰减回显")
+
+
+def test_attenuator_bridged_t_nodal():
+    """桥 T 型衰减器：金标准值 + 三节点导纳矩阵电学校验。
+
+    拓扑：串臂两只固定 Z0，R桥（Ra）跨接输入/输出，R并（Rb）从
+    串臂中点到地。节点方程（源 1V）：
+      (2/Z0+1/Rb)·n2 − (1/Z0)·n3 = 1/Z0
+      (2/Z0+1/Ra)·n3 − (1/Z0)·n2 = 1/Ra
+    精确 6 dB @50Ω：Ra=Rb=50 → n3 = 0.5 = 1/k 精确。
+    """
+    a6 = r.attenuator_bridged_t(50.0, 6.0)
+    ok(a6["ok"] is True, "桥T 应计算成功")
+    _close(a6["r_fixed"], 50.0, 1e-12, "串臂固定 Z0")
+    _close(a6["r_bridge"], 50.0 * (10 ** (6.0 / 20.0) - 1.0), 1e-9, "R桥 6dB")
+    _close(a6["r_shunt"], 50.0 / (10 ** (6.0 / 20.0) - 1.0), 1e-9, "R并 6dB")
+    a20 = r.attenuator_bridged_t(50.0, 20.0)
+    _close(a20["r_bridge"], 450.0, 1e-6, "R桥 20dB=450")
+    _close(a20["r_shunt"], 50.0 / 9.0, 1e-9, "R并 20dB=5.5556")
+    # 三节点导纳矩阵：对多组 (Z0, A) 验证 Vout/Vin = 1/k
+    for z0, a_db in ((50.0, 6.0), (50.0, 10.0), (75.0, 3.0), (50.0, 20.0)):
+        out = r.attenuator_bridged_t(z0, a_db)
+        ra, rb = out["r_bridge"], out["r_shunt"]
+        y = 1.0 / z0
+        # [ (2y+1/rb)  -y ] [n2]   [ y ]
+        # [   -y  (2y+1/ra) ] [n3] = [1/ra]
+        m11, m12, m22 = 2.0 * y + 1.0 / rb, -y, 2.0 * y + 1.0 / ra
+        det = m11 * m22 - m12 * m12
+        n3 = (m11 * (1.0 / ra) - m12 * y) / det
+        _close(n3, 10.0 ** (-a_db / 20.0), 1e-12,
+               f"桥T {a_db}dB@{z0}Ω 节点解 Vout/Vin=1/k")
+
+
+def test_attenuator_lpad_golden():
+    """L 型衰减器：金标准值 + 输入端严格匹配 / 输出端固有失配。
+
+    锚点 k=2（6.0206dB）@50Ω：R串=25、R并=50；10dB：34.1885/23.1238。
+    输入阻抗 Zin = Z0（L 型一端严格匹配）；Zout = R并‖(R串+Z0)，
+    10dB@50Ω → Zout=18.1409Ω、VSWR_out=2.7562。
+    """
+    lp = r.attenuator_lpad(50.0, 20.0 * math.log10(2.0))
+    ok(lp["ok"] is True, "L-Pad 应计算成功")
+    _close(lp["r_series"], 25.0, 1e-9, "L k=2 R串")
+    _close(lp["r_shunt"], 50.0, 1e-9, "L k=2 R并")
+    _close(lp["z_in"], 50.0, 1e-12, "Zin 严格匹配")
+    _close(lp["vswr_in"], 1.0, 1e-12, "VSWR_in=1")
+    lp10 = r.attenuator_lpad(50.0, 10.0)
+    _close(lp10["r_series"], 34.18861, 1e-4, "L 10dB R串")
+    _close(lp10["r_shunt"], 23.12376, 1e-4, "L 10dB R并")
+    # 恒等式：R并(L) = R并(桥T) = Z0/(k−1)
+    _close(lp10["r_shunt"], r.attenuator_bridged_t(50.0, 10.0)["r_shunt"],
+           1e-9, "L 与桥T 并臂恒等")
+    zout = 1.0 / (1.0 / lp10["r_shunt"] + 1.0 / (lp10["r_series"] + 50.0))
+    _close(lp10["z_out"], zout, 1e-12, "Zout=R并‖(R串+Z0)")
+    _close(lp10["z_out"], 18.1409, 1e-3, "L 10dB Zout=18.1409")
+    _close(lp10["vswr_out"], 2.7562, 1e-3, "L 10dB VSWR_out=2.7562")
+    g = abs((lp10["z_out"] - 50.0) / (lp10["z_out"] + 50.0))
+    _close(lp10["vswr_out"], (1.0 + g) / (1.0 - g), 1e-12, "VSWR_out 口径")
+
+
+def test_attenuator_rejects_bad():
+    """衰减器坏输入：负衰减 / 超大衰减 / 0 dB / 非正 Z0 全部优雅拒绝。"""
+    ok(r.attenuator_pi(50.0, -3.0)["ok"] is False, "负衰减应拒绝")
+    ok(r.attenuator_t(50.0, -3.0)["ok"] is False, "T 负衰减应拒绝")
+    ok(r.attenuator_pi(50.0, 250.0)["ok"] is False, ">200dB 应拒绝")
+    ok(r.attenuator_pi(50.0, 0.0)["ok"] is False, "0dB 低于浮点分辨率应拒绝")
+    ok(r.attenuator_bridged_t(0.0, 6.0)["ok"] is False, "Z0=0 应拒绝")
+    ok(r.attenuator_lpad(-50.0, 6.0)["ok"] is False, "负 Z0 应拒绝")
+    ok(r.attenuator_pi("abc", 6.0)["ok"] is False, "非数值应拒绝")
+    ok(r.attenuator_pi(50.0, float("nan"))["ok"] is False, "NaN 衰减应拒绝")
+    # 衰减 >60 dB 带 warning（合法输入）
+    big = r.attenuator_pi(50.0, 80.0)
+    ok(big["ok"] is True and any("多节" in w for w in big["warnings"]),
+       "80dB 应成功并提示多节级联")
+
+
+def test_vswr_convert_golden_and_roundtrip():
+    """VSWR 互算：三入口金标准 + 往返一致性 + 与 refl_from_z 交叉一致。
+
+    |Γ|=1/3 → VSWR=2、RL=9.5424dB、ML=0.5115dB；
+    与引擎 refl_from_z(100, 0, 50) 的 |Γ|=1/3 口径交叉核对。
+    """
+    v = r.vswr_convert(gamma_mag=1.0 / 3.0)
+    ok(v["ok"] is True, "应计算成功")
+    _close(v["vswr"], 2.0, 1e-12, "VSWR=2")
+    _close(v["rl_db"], 9.542425, 1e-4, "RL=9.5424dB")
+    _close(v["mismatch_loss_db"], 0.511525, 1e-4, "ML=0.5115dB")
+    _close(v["power_reflected_pct"], 100.0 / 9.0, 1e-9, "反射功率 11.11%")
+    _close(v["power_transmitted_pct"], 800.0 / 9.0, 1e-9, "透射功率 88.89%")
+    v2 = r.vswr_convert(vswr=2.0)
+    _close(v2["gamma_mag"], 1.0 / 3.0, 1e-12, "VSWR→|Γ| 往返")
+    v3 = r.vswr_convert(rl_db=20.0 * math.log10(3.0))
+    _close(v3["gamma_mag"], 1.0 / 3.0, 1e-12, "RL→|Γ| 往返（RL=20lg3 精确）")
+    v4 = r.vswr_convert(vswr=1.5)
+    _close(r.vswr_convert(gamma_mag=v4["gamma_mag"])["vswr"], 1.5, 1e-12,
+           "任意点往返 V→Γ→V")
+    # 与引擎既有 refl_from_z 交叉一致
+    rz = r.refl_from_z(100.0, 0.0, 50.0)
+    ok(rz["ok"] is True, "refl_from_z 应成功")
+    _close(rz["gamma_mag"], v["gamma_mag"], 1e-12, "与 refl_from_z |Γ| 一致")
+    # |Γ|=0 → RL=∞（与 refl_from_z 口径一致）
+    eq(r.vswr_convert(gamma_mag=0.0)["rl_db"], float("inf"), "g=0 → RL=∞")
+    # 坏输入
+    ok(r.vswr_convert()["ok"] is False, "无入口应拒绝")
+    ok(r.vswr_convert(vswr=2.0, rl_db=10.0)["ok"] is False, "多入口应拒绝")
+    ok(r.vswr_convert(vswr=0.9)["ok"] is False, "VSWR<1 应拒绝")
+    ok(r.vswr_convert(gamma_mag=1.0)["ok"] is False, "|Γ|=1 应拒绝")
+    ok(r.vswr_convert(gamma_mag=-0.2)["ok"] is False, "负 |Γ| 应拒绝")
+    ok(r.vswr_convert(rl_db=0.0)["ok"] is False, "RL=0 应拒绝")
+
+
+def test_skin_effect_copper_golden():
+    """趋肤效应铜金标准 + 频率标度自检。
+
+    δ=√(ρ/(πfµ))，ρ_cu=1.72e-8Ω·m：1GHz → δ=2.0873µm、Rs=8.2403mΩ/□；
+    60Hz → δ=8.5214mm（文献常用口径）；δ∝f^(−1/2)、Rs∝f^(+1/2)。
+    """
+    s = r.skin_effect(1e9, "cu")
+    ok(s["ok"] is True, "应计算成功")
+    _close(s["delta_m"], 2.0873e-6, 1e-10, "Cu 1GHz δ=2.0873µm")
+    _close(s["rs_ohm_sq"], 8.2403e-3, 1e-6, "Cu 1GHz Rs=8.2403mΩ/□")
+    _close(s["rho_ohm_m"], 1.72e-8, 1e-12, "电阻率回显")
+    # δ ∝ f^(−1/2)：10GHz 处 δ 缩小 √10 倍
+    s10 = r.skin_effect(10e9, "cu")
+    _close(s10["delta_m"] * math.sqrt(10.0), s["delta_m"], 1e-12,
+           "δ(10GHz)·√10 = δ(1GHz)")
+    _close(s10["rs_ohm_sq"] / math.sqrt(10.0), s["rs_ohm_sq"], 1e-12,
+           "Rs(10GHz)/√10 = Rs(1GHz)")
+    # 60Hz：δ = 8.52mm 且带低频提示
+    s60 = r.skin_effect(60.0, "copper")
+    _close(s60["delta_m"], 8.5214e-3, 1e-5, "Cu 60Hz δ=8.5214mm")
+    ok(any("厚度" in w for w in s60["warnings"]), "60Hz 应有厚度提示")
+    # Rs = ρ/δ 恒等
+    for f in (1e6, 1e9, 10e9):
+        sf = r.skin_effect(f, "cu")
+        _close(sf["rs_ohm_sq"], sf["rho_ohm_m"] / sf["delta_m"], 1e-15,
+               f"Rs=ρ/δ 恒等 @{f:.0e}Hz")
+
+
+def test_skin_effect_materials_and_rho():
+    """四种导体材料 + rho 覆盖 + µr 标度 + 坏材料拒绝。
+
+    1GHz δ：Ag 2.0069µm、Au 2.4861µm、Al 2.5912µm（20°C 电阻率口径）；
+    µr=100 → δ÷10、Rs×10；rho 参数覆盖 material 查表。
+    """
+    ref = {"ag": 2.0069e-6, "au": 2.4861e-6, "al": 2.5909e-6}
+    for mat, want in ref.items():
+        sm = r.skin_effect(1e9, mat)
+        _close(sm["delta_m"], want, 2e-10, f"{mat} 1GHz δ")
+    # 中文/英文别名等价
+    eq(r.skin_effect(1e9, "银")["delta_m"], r.skin_effect(1e9, "ag")["delta_m"],
+       "中文别名 银≡ag")
+    eq(r.skin_effect(1e9, "aluminium")["delta_m"],
+       r.skin_effect(1e9, "al")["delta_m"], "英文别名 aluminium≡al")
+    # µr=100：δ→δ/10、Rs→10Rs（µ=µ0·µr 口径）
+    smu = r.skin_effect(1e9, "cu", mu_r=100.0)
+    s0 = r.skin_effect(1e9, "cu")
+    _close(smu["delta_m"], s0["delta_m"] / 10.0, 1e-13, "µr=100 δ÷10")
+    _close(smu["rs_ohm_sq"], s0["rs_ohm_sq"] * 10.0, 1e-12, "µr=100 Rs×10")
+    # rho 覆盖 material
+    sc = r.skin_effect(1e9, "cu", rho=3.9e-7)
+    _close(sc["delta_m"], math.sqrt(3.9e-7 / (math.pi * 1e9 * 1.25663706212e-6)),
+           1e-12, "rho 覆盖（不锈钢 3.9e-7 口径）")
+    ok(sc["material"] == "custom", "自定义材料标记")
+    # 坏输入
+    ok(r.skin_effect(1e9, "brass")["ok"] is False, "未知材料应拒绝")
+    ok(r.skin_effect(0.0)["ok"] is False, "f=0 应拒绝")
+    ok(r.skin_effect(1e9, "cu", mu_r=-1.0)["ok"] is False, "负 µr 应拒绝")
+    ok(r.skin_effect(1e9, "cu", rho=-1.0)["ok"] is False, "负 rho 应拒绝")
+
+
+def test_coax_te11_cutoff_and_applicability():
+    """同轴 TE11 截止：与 coax_analysis 同式交叉一致 + 适用上限口径。
+
+    a=0.5,b=1.5mm,εr=2.2 → fc=32.1684GHz（与既有 test_coax_exact 锚一致）；
+    3.5mm 空气线（a=0.76,b=1.75mm）fc=38.0187GHz，与规格书"用到
+    33–34GHz"的口径对应（f_max≈0.95·fc≈36.1GHz）。
+    """
+    te = r.coax_te11_cutoff(0.5e-3, 1.5e-3, 2.2)
+    ok(te["ok"] is True, "应计算成功")
+    _close(te["fc_te11"], 32.1684e9, 0.05e9, "TE11 fc=32.1684GHz")
+    _close(te["lambda_c"], math.pi * 2.0e-3 * math.sqrt(2.2), 1e-12,
+           "λc=π(a+b)√εr")
+    _close(te["f_max_advised"], 0.95 * te["fc_te11"], 1e-6, "f_max=0.95·fc")
+    # 与 coax_analysis 的 fc_te11 交叉一致（同一物理量）
+    ca = r.coax_analysis(0.5e-3, 1.5e-3, 2.2)
+    _close(ca["fc_te11"], te["fc_te11"], 1e-6, "与 coax_analysis 一致")
+    # 3.5mm 空气线
+    te35 = r.coax_te11_cutoff(0.76e-3, 1.75e-3, 1.0)
+    _close(te35["fc_te11"], 38.0187e9, 0.05e9, "3.5mm 空气线 fc=38.02GHz")
+    ok(te35["f_max_advised"] < te35["fc_te11"], "适用上限低于截止")
+    # freq 判定
+    ok31 = r.coax_te11_cutoff(0.76e-3, 1.75e-3, 1.0, freq=31e9)
+    ok(ok31["single_mode_ok"] is True and not ok31["warnings"],
+       "31GHz < 0.95fc 应判单模且无告警")
+    ok365 = r.coax_te11_cutoff(0.76e-3, 1.75e-3, 1.0, freq=36.5e9)
+    ok(ok365["single_mode_ok"] is True and ok365["warnings"],
+       "36.5GHz（0.96fc）应单模但有余量告警")
+    ok40 = r.coax_te11_cutoff(0.76e-3, 1.75e-3, 1.0, freq=40e9)
+    ok(ok40["single_mode_ok"] is False and any("非单模" in w or "TE11" in w
+                                               for w in ok40["warnings"]),
+       "40GHz > fc 应判非单模")
+    # 坏输入
+    ok(r.coax_te11_cutoff(2e-3, 1e-3, 2.2)["ok"] is False, "a≥b 应拒绝")
+    ok(r.coax_te11_cutoff(0, 1e-3, 2.2)["ok"] is False, "a=0 应拒绝")
+    ok(r.coax_te11_cutoff(0.5e-3, 1.5e-3, -2.2)["ok"] is False,
+       "负 εr 应拒绝")
+
+
+def test_lc_resonator_q_srf():
+    """LC 谐振器：f0/Z0/Q/带宽/SRF 金标准 + 寄生告警口径。
+
+    1nH+1pF：f0=5.0329GHz、Z0c=31.6228Ω；ESR=0.5Ω → Q=63.2456、
+    BW=79.577MHz；Rp=3162.28Ω → Q=100；双损 1/Q 叠加 → Q=38.743；
+    Cpar=0.2pF → SRF=11.254GHz；Lpar=5nH → SRF=2.2508GHz（<f0 告警）。
+    """
+    lc = r.lc_resonator(1e-9, 1e-12, esr_ohm=0.5)
+    ok(lc["ok"] is True, "应计算成功")
+    _close(lc["f0"], 1.0 / (2.0 * math.pi * math.sqrt(1e-21)), 1.0,
+           "f0=1/(2π√LC)")
+    _close(lc["f0"], 5.0329e9, 0.001e9, "f0=5.0329GHz")
+    _close(lc["z0_char"], math.sqrt(1e-9 / 1e-12), 1e-9, "Z0c=√(L/C)=31.6228")
+    _close(lc["x_l_at_f0"], 2.0 * math.pi * lc["f0"] * 1e-9, 1e-6,
+           "X_L@f0=2πf0L")
+    _close(lc["q_unloaded"], 31.6227766 / 0.5, 1e-3, "Q=Z0c/ESR=63.2456")
+    _close(lc["bw_3db_hz"], lc["f0"] / lc["q_unloaded"], 1.0, "BW=f0/Q")
+    lcr = r.lc_resonator(1e-9, 1e-12, rp_ohm=3162.28)
+    _close(lcr["q_unloaded"], 100.0, 0.01, "Q=Rp/Z0c=100")
+    lc2 = r.lc_resonator(1e-9, 1e-12, esr_ohm=0.5, rp_ohm=3162.28)
+    _close(lc2["q_unloaded"], 38.743, 0.01, "双损 1/Q 叠加 Q=38.743")
+    _close(lc2["q_esr"], 63.245553, 1e-5, "Q_esr 分量")
+    _close(lc2["q_rp"], 100.0, 1e-3, "Q_rp 分量")
+    # 与既有 lc_resonance 交叉一致
+    old = r.lc_resonance(1e-9, 1e-12)
+    _close(old["f0"], lc["f0"], 1e-6, "与既有 lc_resonance f0 一致")
+    # SRF：Cpar=0.2pF → 11.254GHz；Lpar=5nH → 2.2508GHz
+    lsp = r.lc_resonator(1e-9, 1e-12, c_par_f=0.2e-12)
+    _close(lsp["srf_hz"], 1.0 / (2.0 * math.pi * math.sqrt(1e-9 * 0.2e-12)),
+           1e6, "SRF(Cpar)")
+    _close(lsp["srf_hz"], 11.254e9, 0.002e9, "SRF=11.254GHz")
+    ok(any("10 倍" in w for w in lsp["warnings"]), "SRF<10·f0 应告警")
+    llp = r.lc_resonator(1e-9, 1e-12, l_par_h=5e-9)
+    _close(llp["srf_hz"], 1.0 / (2.0 * math.pi * math.sqrt(5e-9 * 1e-12)),
+           1e3, "SRF(Lpar)=2.2508GHz")
+    ok(any("自谐振" in w for w in llp["warnings"]),
+       "SRF<f0 应告警失效/反转")
+    _close(llp["srf_hz"], 2.2508e9, 0.001e9, "SRF=2.2508GHz")
+    # 双寄生取 min
+    lboth = r.lc_resonator(1e-9, 1e-12, c_par_f=0.2e-12, l_par_h=5e-9)
+    eq(lboth["srf_hz"], lboth["srf_c_hz"], "双寄生 srf=min(srf_l, srf_c)")
+    # 无损耗 → Q=None + 提示
+    lq = r.lc_resonator(1e-9, 1e-12)
+    ok(lq["q_unloaded"] is None and lq["bw_3db_hz"] is None,
+       "无损耗信息 Q=None")
+    ok(any("损耗" in w for w in lq["warnings"]), "无损耗应有提示")
+    # 坏输入
+    ok(r.lc_resonator(0.0, 1e-12)["ok"] is False, "L=0 应拒绝")
+    ok(r.lc_resonator(1e-9, -1e-12)["ok"] is False, "负 C 应拒绝")
+    ok(r.lc_resonator(1e-9, 1e-12, esr_ohm=-0.5)["ok"] is False,
+       "负 ESR 应拒绝")
+    ok(r.lc_resonator(1e-9, 1e-12, rp_ohm=0.0)["ok"] is False,
+       "Rp=0 应拒绝")
+    ok(r.lc_resonator(1e-9, 1e-12, c_par_f=-1e-12)["ok"] is False,
+       "负 Cpar 应拒绝")
+
+
+def test_bisect_bracket_expansion():
+    """_bisect_monotonic 括号自适应：需扩展才可解的目标收敛，真无解仍报无解。
+
+    微带 H–J 式 Z0(u) 全域峰值 ≈631.8Ω@εr=4.4（u→0 时 Z0→0，非单调），
+    故 500Ω 超出原括号 [1e-3,1e3]（0.18…322Ω）但物理可达——必须自动
+    扩展括号才能求解；1000Ω 全域无解，应报无解而非抛异常。
+    """
+    # 需要扩展括号才能解（旧版直接报无解）
+    m500 = r.microstrip_synthesis(500.0, 1.6e-3, 4.4)
+    ok(m500["ok"] is True, "微带 500Ω 应经括号扩展求解")
+    back = r.microstrip_analysis(m500["w"], 1.6e-3, 4.4)
+    _close(back["Z0"], 500.0, 0.05, "500Ω 往返一致")
+    m560 = r.microstrip_synthesis(560.0, 1.6e-3, 4.4)
+    ok(m560["ok"] is True, "微带 560Ω 应可解")
+    back560 = r.microstrip_analysis(m560["w"], 1.6e-3, 4.4)
+    _close(back560["Z0"], 560.0, 0.05, "560Ω 往返一致")
+    # 带状线高 Z0 同样受益于扩展（域上限原为 u≤10）。500Ω 真实根
+    # u≈6.5e-8 落在 float64 精度墙上：k=1−5.2e-15 时 sqrt(1−k²) 损失
+    # ~48bit，K(k) 以 ~0.3Ω 台阶量化，故往返容差放宽到 0.5Ω（4e-4 相对）。
+    s500 = r.stripline_synthesis(500.0, 1e-3, 4.4)
+    ok(s500["ok"] is True, "带状线 500Ω 应可解")
+    _close(r.stripline_analysis(s500["w_over_b"] * 1e-3, 1e-3, 4.4)["Z0"],
+           500.0, 0.5, "带状线 500Ω 往返一致（精度墙内）")
+    # 物理不可达：微带 1000Ω 超过 H–J 全域峰值，仍报无解（ok:False 不抛异常）
+    m1000 = r.microstrip_synthesis(1000.0, 1.6e-3, 4.4)
+    ok(m1000["ok"] is False, "微带 1000Ω 应报无解")
+    ok("无解" in m1000["error"], "无解错误文案")
+    # 域下限之下：带状线 1Ω 仍优雅报无解
+    s1 = r.stripline_synthesis(1.0, 1e-3, 4.4)
+    ok(s1["ok"] is False and "无解" in s1["error"], "带状线 1Ω 应报无解")
+    # 原括号内目标不受影响（逐位一致路径）
+    ok(r.microstrip_synthesis(50.0, 1.6e-3, 4.4)["ok"] is True,
+       "常规 50Ω 综合不受影响")
+
+
+def test_singular_inputs_never_raise():
+    """奇异输入全覆盖：新增/修复路径全 ok:False 不抛异常；边界合法输入成功。
+
+    覆盖：NaN/Inf 入参、类型错值、溢出守卫（同轴/方同轴/线过地板）、
+    负 VRE、非 dict 级联条目、微带超峰值无解；合法边界：γ=0、60Hz、
+    500Ω 微带综合。
+    """
+    nan, inf = float("nan"), float("inf")
+    cases = [
+        ("微带分析 NaN W", r.microstrip_analysis(nan, 1.6e-3, 4.4)),
+        ("微带综合 inf Z0", r.microstrip_synthesis(inf, 1.6e-3, 4.4)),
+        ("Pi inf Z0", r.attenuator_pi(inf, 6.0)),
+        ("T nan 衰减", r.attenuator_t(50.0, nan)),
+        ("桥T 类型错 Z0", r.attenuator_bridged_t("五十", 6.0)),
+        ("L-Pad inf 衰减", r.attenuator_lpad(50.0, inf)),
+        ("VSWR inf 入口", r.vswr_convert(vswr=inf)),
+        ("VSWR nan 入口", r.vswr_convert(rl_db=nan)),
+        ("趋肤 nan 频率", r.skin_effect(nan)),
+        ("趋肤 inf µr", r.skin_effect(1e9, "cu", inf)),
+        ("TE11 nan 半径", r.coax_te11_cutoff(nan, 1.5e-3, 2.2)),
+        ("LC nan 电感", r.lc_resonator(nan, 1e-12)),
+        ("LC inf 寄生", r.lc_resonator(1e-9, 1e-12, c_par_f=inf)),
+        ("BJT 负 VRE", r.bjt_bias_divider(12.0, 0.01, 6.0, 100.0, vre=-0.5)),
+        ("级联非 dict 条目", r.cascade_noise(
+            [{"gain_db": 10.0, "nf_db": 3.0}, "x"], 1e6)),
+        ("同轴综合溢出", r.coax_synthesis(1e6, 1e-3, 2.2)),
+        ("方同轴综合溢出", r.sq_coax_synthesis(1e6, 1e-3, 2.2)),
+        ("线过地板溢出", r.wire_over_ground_synthesis(1e6, 1e-3, 1.0)),
+        ("微带超峰值 1000Ω", r.microstrip_synthesis(1000.0, 1.6e-3, 4.4)),
+        ("to_si inf", None),
+    ]
+    for name, out in cases[:-1]:
+        ok(isinstance(out, dict) and out.get("ok") is False
+           and isinstance(out.get("error"), str) and out["error"],
+           f"{name} 应返回 ok:False+error")
+    raises(r.CalcError, lambda: r.to_si(inf, "mm", "len"),
+           "to_si inf 应抛 CalcError（底层工具有限数校验显式抛）")
+    # 边界合法输入应成功
+    ok(r.microstrip_synthesis(500.0, 1.6e-3, 4.4)["ok"] is True,
+       "合法边界：微带 500Ω 综合")
+    ok(r.vswr_convert(gamma_mag=0.0)["ok"] is True, "合法边界：γ=0")
+    ok(r.skin_effect(60.0)["ok"] is True, "合法边界：60Hz 趋肤")
+    ok(r.coax_te11_cutoff(0.5e-3, 1.5e-3, 2.2, 0)["ok"] is True,
+       "合法边界：freq=0")
+
+
 if __name__ == "__main__":
     from _harness import run
     raise SystemExit(run(globals()))

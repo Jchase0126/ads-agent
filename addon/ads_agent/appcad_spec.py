@@ -18,7 +18,7 @@ Schema
     {"k":"ellipse", "xywh":[x,y,w,h],  "fill":..., "edge":..., "w":1},
     {"k":"arc",     "xywh":[x,y,w,h], "start":deg, "span":deg, "edge":..., "w":1},
   ],
-  "labels": [{"xy":[x,y], "text":"W =", "font":"MS Sans Serif", "pt":8,
+  "labels": [{"xy":[x,y], "text":"W =", "font":"Microsoft Sans Serif", "pt":8,
               "bold":false, "italic":false, "color":"#000000",
               "align":"left"|"right"|"center", "baseline":true}],
   "boxes":  [{"key":"W", "xywh":[x,y,w,h], "value":"12", "ro":false,
@@ -50,7 +50,7 @@ def _color(spec, default=None):
 
 
 def font_for(label, zoom=1.0):
-    f = QtGui.QFont(label.get("font", "MS Sans Serif"))
+    f = QtGui.QFont(label.get("font", "Microsoft Sans Serif"))
     f.setPointSizeF(float(label.get("pt", 8)) * zoom)
     f.setBold(bool(label.get("bold", False)))
     f.setItalic(bool(label.get("italic", False)))
@@ -66,11 +66,12 @@ def paint_spec(p: QtGui.QPainter, spec: dict, zoom: float = 1.0,
     the off-screen verification renderer)."""
     p.save()
     p.scale(zoom, zoom)
-    p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
     for sh in spec.get("shapes", []):
         k = sh["k"]
         pen = QtGui.QPen(_color(sh.get("edge", "#000000")))
         pen.setWidthF(float(sh.get("w", 1)))
+        pen.setCosmetic(True)  # 线宽不随 zoom/dpr 变换增粗
         if sh.get("dash"):
             pen.setDashPattern(sh["dash"])
         if not sh.get("edge"):
@@ -92,8 +93,8 @@ def paint_spec(p: QtGui.QPainter, spec: dict, zoom: float = 1.0,
         elif k == "arc":
             p.drawArc(QRectF(*[float(v) for v in sh["xywh"]]),
                       int(sh.get("start", 0) * 16), int(sh.get("span", 90) * 16))
-    # 形状保持 Antialiasing=False（矢量碎片按实机像素硬边），文字单独开
-    # TextAntialiasing：Windows 显示缩放下亚像素定位+抗锯齿，避免字形发糊。
+    # 形状开启 Antialiasing（矢量碎片平滑无锯齿；HiDPI/缩放下更清晰），
+    # TextAntialiasing 保持开启：Windows 显示缩放下亚像素定位，字形不发糊。
     p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
     for lb in spec.get("labels", []):
         p.setPen(QtGui.QPen(_color(lb.get("color", "#000000"))))
@@ -151,7 +152,7 @@ class SpecDiagram(QtWidgets.QWidget):
             e.setAlignment({"right": QtCore.Qt.AlignRight,
                             "center": QtCore.Qt.AlignCenter}.get(
                                 bx.get("align", "right"), QtCore.Qt.AlignRight))
-            f = QtGui.QFont("MS Sans Serif")
+            f = QtGui.QFont("Microsoft Sans Serif")
             f.setPointSizeF(8.0 * zoom)
             e.setFont(f)
             e.setStyleSheet(

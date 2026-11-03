@@ -68,6 +68,102 @@
   写入）无法安全中断，取消只能在该调用返回后生效 —— 界面会如实显示这个边界，
   不承诺"任意时刻立即停止"。计算子进程隔离是**资源隔离**，不是安全沙箱。
 
+### RF 计算器内核升级（2026-11-03）
+
+`backend/rfcalc.py` 纯内核升级，**只增不改**（既有函数签名/返回键/单位口径
+零变化；公式全部取自公开教科书/论文并在 docstring 标注出处，无任何代码
+派生）：
+
+- **新增计算能力**（8 个公开函数 + `CONDUCTORS` 电阻率表）：
+  定阻衰减器 `attenuator_pi/t/bridged_t/lpad`（含 L 型固有输出失配的如实
+  输出）、`vswr_convert`（VSWR↔|Γ|↔回波损耗↔失配损耗互算）、
+  `skin_effect`（趋肤深度+表面电阻，Cu/Al/Au/Ag 可参数化）、
+  `coax_te11_cutoff`（TE11 截止+单模适用上限口径说明）、
+  `lc_resonator`（f0/特性阻抗/Q/带宽/SRF 与寄生告警）。对拍数值表见
+  [docs/RF计算器与对拍清单.md](docs/RF计算器与对拍清单.md) 用例 24–28。
+- **稳健性**：校验口径统一（NaN/±Inf 在 `_num`/`to_si` 即拒，错误信息带
+  参数名与合法范围）；`_bisect_monotonic` 括号区间自适应（lo 减半/hi 加倍
+  自动扩展，微带 500Ω@FR4 这类超出初括号的目标现在可解；真无解时报错附
+  两端函数值）；同轴/方同轴/双线/线过地板综合对极端 Z0 的溢出改为明确
+  CalcError；BJT 偏置负 VRE、级联噪声非 dict 条目、容差非数值等奇异输入
+  路径全覆盖；"永不抛异常"契约经坏输入矩阵验证（25 个新增/修复调用点 ×
+  11 类坏输入 = 275 次调用零异常）。
+- **测试**：`tests/test_rfcalc.py` 63→74 项（新增衰减器金标准+ABCD/节点
+  电学校验、VSWR 往返+与 refl_from_z 交叉一致、趋肤文献值与标度自检、
+  TE11 与 coax_analysis 交叉一致、LC Q/SRF、二分扩展、奇异输入全
+  ok:False），全部通过；全仓 `tests/run_tests.py` 无新增回归（其中
+  `test_sim_provenance.py`/`test_model_attachments.py` 为既有环境性失败，
+  已 stash 验证与本次改动无关）。
+
+### RF 计算器界面与示意图升级（2026-11-03）
+
+`addon/ads_agent/rfcalc_panel.py`（及 appcad_tl/circ/spec 规格模块）界面与
+29→33 页示意图优化；布局数值全部来自本地重测量，文案为自撰：
+
+- **默认窗口完整可见**：页面固定 966×669（规格版式），旧默认窗宽 1000px
+  实际裁掉页面右缘 84px（预存问题）；默认尺寸改按 118px 侧栏 + 页宽 +
+  Web 条/状态栏完整可见取值（1088×728），快照取证同步同宽。
+- **Web 链接条截断修复**：各规格页底部 Web 文字超宽被两端裁切（预存），
+  改为逐级降字号直至装入规格矩形（下限 6pt）。
+- **示意图渲染质量**：矢量绘制统一开抗锯齿/cosmetic pen；逐页修正标签
+  错行、度数符号、悬空箭头、标注脱框与互压（Smith/Balun/Thermal/检测器/
+  RFIC/FET 分压与自偏/PAE/反射等页）；尺寸线贴边、长注释换行。
+- **视觉令牌与交互**：新增 ACCENT/悬停/只读等调色板令牌并全线走
+  `U()` 缩放；输入框焦点环、只读底色统一；侧栏重写为导航组件
+  （↑↓/Home/End/←→ 键盘导航、三态样式、可访问名与状态提示、修复重建
+  残留控件）；状态栏统一「当前页/计算完成/失败」口径；窗口快捷键提示
+  常驻；移除界面文案中的违规参照词。
+- **内核新能力接入界面**：新分组「扩展工具」+ 4 个新页 —— 衰减器设计
+  （Pi/T/桥T/L 四拓扑电阻与失配）、VSWR/回损换算、趋肤效应、LC 谐振器
+  （Q/带宽/SRF）；同轴页新增 TE11 截止/建议上限/单模判定只读行；
+  示意图全部 QPainter 矢量自绘，objectName 契约与 F4/F3/F8 流程不变。
+- **版式冲突修复**：反射计算页右栏结果标签与 Γ/T 列互压、互调页顶部
+  输入行互压、巴伦页结果栅格与图内 Zload 输入框重叠（栅格下移至图区
+  之下）——三处均为默认窗宽下可复现的真实重叠。
+- **测试**：`tests/test_rfcalc_panel.py` 27→33 项、`test_ui_navigation.py`
+  38 项、`test_qtcompat.py` 8 项全部通过；快照取证 33 页 + 整窗
+  （`--snap` 输出与默认视图同宽）。
+
+### RF 计算器八页版式对齐与 chrome 修正（2026-11-03，第二轮）
+
+针对实机截图逐页复核后重做 8 页（cpw/trough/stripline/rfic_v/rfic_i/
+det_large/bjt_base/fet_self）与页面公共 chrome。做法：离屏渲染 + 与参考截图
+做像素对拍（`tmp/gen/pagecmp.py`：mismatch% + 控件审计 clipped/overlap），
+逐页改到「零裁字、零互压」。
+
+- **字体根因**：页面 QSS（HarmonyOS/13px）会覆盖子控件字体，导致 8pt 标签
+  被换成更宽的字形后整词裁切（"mif"/"no"/"ma"）。规格页改为控件级
+  `Microsoft Sans Serif 8pt`（TTF，与实机 MS Sans Serif 度量兼容），
+  `_abs_text` 按 `horizontalAdvance` 自动扩宽并保持对齐锚点，从机制上消除裁字。
+- **菜单与窗框**：按实测重排——菜单变体（4 项页 File/Calculate/Options/Help，
+  5 项页多 Select Parameters）、文字 y=15、分隔线 y=30、主菜单按钮
+  880,36,78,16；顶部改为灰条/白面板/压边三段，窗框改为左右 x0..5、x960..965
+  自 y=9 起 + 底部高光边。
+- **Web 链接条**：改为逐页实测配色与显隐（浅黄底/白底/深蓝底等 + 对应文字色，
+  并加 1px 内凹边框）；参考图上为空白条的页（microstrip/cpw/stripline/parallel）
+  不再绘制链接文字，重复的窗口级底条隐藏。
+- **示意图黑块根因（新增 `_spec_clean`）**：逐像素矢量化把「细线墨迹闭环」
+  误当实心多边形填黑，导致基片/正面被整块黑矩形盖住。按页删块/改描边/补回
+  被吞掉的尺寸线，并重设标注字（L/H/T/W/G 13.5pt 粗、D1/D2 12pt、εr 14pt 斜体）。
+- **电路三页改绝对坐标画布**：rfic_v/rfic_i/det_large 从左右 VBox 流式布局
+  改为 966×669 绝对定位（新增 `_CanvasDg`/`_canvas_page`/`_abs_*` 基础设施）；
+  rfic_i 的 Vd 三段改回竖排 + 手绘花括号，热分析表 298×104 关闭滚动条；
+  det_large 重画检波器电路并补齐二极管参数卡与 Pin Start/Stop/Step 行；
+  rfic_v 补回频率响应曲线、Design Rule 单选组与 Band1/Band2 双列结果。
+- **cpw 选项如实化**：补回参考图的 With/No Groundplane 单选组，但引擎
+  `cpw_analysis(s,g,h,er)` 未建模该选项，故控件置灰 + tooltip 说明，页面
+  说明文字写明「引擎未建模」，不伪造功能。
+- **对拍结果**（mismatch%，均 issues 为空）：cpw 12.56→10.24、trough
+  10.52→8.81、stripline 9.12→7.61、rfic_v 11.12→6.15、rfic_i 13.52→8.51、
+  det_large 9.83→5.14、bjt_base 7.53→7.61、fet_self 7.62→7.72。
+- **测试**：`test_rfcalc.py` 74 项、`test_rfcalc_panel.py` 33 项、
+  `test_ui_navigation.py` 38 项、`test_qtcompat.py` 8 项全部通过；
+  快照 `tmp/snap_v2/`（33 页 + 整窗）。
+- **已知差距**：Qt 8pt 文字比参考图 VB6 位图字宽约 15~25%，是剩余 mismatch
+  的主要成分；microstrip 等未纳入本轮的页仍有同类「黑块」描摹问题；
+  det_large 参考页本无 Pin 表格，因测试契约保留在空白区。
+
+
 ## 1.3.0 — 2026-10-30
 
 - 新增 RF 计算器窗口（Tools ▸ ADS Agent ▸ "RF 计算器…"）：

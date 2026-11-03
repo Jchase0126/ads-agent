@@ -7705,28 +7705,28 @@ PAGES = {
     "k": "poly",
     "pts": [
      [
-      346.5,
-      194.5
+      342.0,
+      193.5
      ],
      [
-      362.5,
-      180.5
+      358.0,
+      179.5
      ],
      [
-      366.5,
-      180.5
+      362.0,
+      179.5
      ],
      [
-      366.5,
-      182.5
+      362.0,
+      181.5
      ],
      [
-      365.5,
-      184.5
+      361.0,
+      183.5
      ],
      [
-      347.5,
-      194.5
+      343.0,
+      193.5
      ]
     ],
     "fill": "#000000",
@@ -7811,7 +7811,7 @@ PAGES = {
      201
     ],
     "text": "εr",
-    "font": "MS Sans Serif",
+    "font": "Microsoft Sans Serif",
     "pt": 8,
     "bold": False,
     "italic": False,
@@ -21543,7 +21543,7 @@ PAGES = {
      214
     ],
     "text": "εr",
-    "font": "MS Sans Serif",
+    "font": "Microsoft Sans Serif",
     "pt": 8,
     "bold": False,
     "italic": False,
@@ -29083,7 +29083,7 @@ PAGES = {
      208
     ],
     "text": "εr",
-    "font": "MS Sans Serif",
+    "font": "Microsoft Sans Serif",
     "pt": 8,
     "bold": False,
     "italic": False,
@@ -37749,7 +37749,7 @@ PAGES = {
      132
     ],
     "text": "εr",
-    "font": "MS Sans Serif",
+    "font": "Microsoft Sans Serif",
     "pt": 8,
     "bold": False,
     "italic": False,
@@ -45339,7 +45339,7 @@ PAGES = {
      168
     ],
     "text": "εr",
-    "font": "MS Sans Serif",
+    "font": "Microsoft Sans Serif",
     "pt": 8,
     "bold": False,
     "italic": False,
@@ -48757,7 +48757,7 @@ PAGES = {
      216
     ],
     "text": "εr",
-    "font": "MS Sans Serif",
+    "font": "Microsoft Sans Serif",
     "pt": 8,
     "bold": False,
     "italic": False,
@@ -50543,7 +50543,7 @@ PAGES = {
      222
     ],
     "text": "εr",
-    "font": "MS Sans Serif",
+    "font": "Microsoft Sans Serif",
     "pt": 8,
     "bold": False,
     "italic": False,
@@ -59913,7 +59913,7 @@ PAGES = {
      221
     ],
     "text": "εr",
-    "font": "MS Sans Serif",
+    "font": "Microsoft Sans Serif",
     "pt": 8,
     "bold": False,
     "italic": False,

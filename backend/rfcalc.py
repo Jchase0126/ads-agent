@@ -39,6 +39,9 @@ __all__ = [
     "amp_efficiency",
     "refl_from_z", "refl_to_z", "z_to_y", "lc_resonance",
     "quarter_wave_transform",
+    "attenuator_pi", "attenuator_t", "attenuator_bridged_t",
+    "attenuator_lpad", "vswr_convert", "skin_effect", "CONDUCTORS",
+    "coax_te11_cutoff", "lc_resonator",
     "rfic_voltage_bias", "rfic_current_bias",
     "detector_large_signal", "detector_small_signal",
 ]
@@ -84,6 +87,8 @@ def to_si(value, unit: str, family: str) -> float:
         v = float(str(value).strip())
     except (TypeError, ValueError):
         raise CalcError(f"数值不合法：{value!r}")
+    if not math.isfinite(v):
+        raise CalcError(f"数值必须是有限数（收到 {v}）")
     scale = table.get(unit)
     if scale is None:
         raise CalcError(f"不认识的单位：{unit}（可用：{'/'.join(table)}）")
@@ -108,9 +113,13 @@ def dbm_to_w(p_dbm: float) -> float:
 
 def _num(x, name: str) -> float:
     try:
-        return float(str(x).strip())
+        v = float(str(x).strip())
     except (TypeError, ValueError):
         raise CalcError(f"{name}：数值不合法（收到 {x!r}）")
+    if not math.isfinite(v):
+        # NaN/±Inf 不许混进来：NaN 会骗过 v<=0 之类的区间校验（nan<=0 为 False）
+        raise CalcError(f"{name} 必须是有限数（收到 {v}）")
+    return v
 
 
 def _pos(x, name: str) -> float:
@@ -181,17 +190,73 @@ def _sinh_ratio(a: float, b: float) -> float:
 
 
 def _bisect_monotonic(f, lo: float, hi: float, target: float, iters: int = 200):
-    """在 [lo,hi] 内解 f(x)=target（f 单调、端点异号）；返回 x。"""
-    flo = f(lo) - target
-    fhi = f(hi) - target
-    if flo * fhi > 0:
-        raise CalcError("公式适用范围内无解（目标值超出可综合范围）")
+    """在 [lo,hi] 内解 f(x)=target（f 单调）；返回 x。
+
+    稳健性升级（向后兼容）：端点没有括住目标时**自动扩展括号区间**——
+    lo 逐次减半、hi 逐次加倍（各最多 60 次，覆盖 ~1e18 倍动态范围），
+    直到两端函数值异号；扩展点落在公式适用域外（f 抛 CalcError）或得到
+    NaN 时该方向停止扩展。两个方向都到头仍无法括住目标才报“无解”，
+    错误信息附两端函数值帮助定位。端点已括住目标时行为与旧版一致
+    （纯二分 iters 次）。
+    """
+
+    def _ev(x):
+        try:
+            return f(x) - target
+        except CalcError:
+            return None
+
+    def _usable(v):
+        return v is not None and not math.isnan(v)
+
+    flo = _ev(lo)
+    flo = flo if _usable(flo) else None
+    fhi = _ev(hi)
+    fhi = fhi if _usable(fhi) else None
+    if flo is not None and flo == 0.0:
+        return lo
+    if fhi is not None and fhi == 0.0:
+        return hi
+
+    def _bracketed():
+        return flo is not None and fhi is not None and flo * fhi < 0.0
+
+    lo_dead = hi_dead = False
+    for _ in range(60):
+        if _bracketed():
+            break
+        if not lo_dead:
+            lo *= 0.5
+            v = _ev(lo)
+            flo = v if _usable(v) else None
+            lo_dead = flo is None
+        if _bracketed():
+            break
+        if not hi_dead:
+            hi *= 2.0
+            v = _ev(hi)
+            fhi = v if _usable(v) else None
+            hi_dead = fhi is None
+        if lo_dead and hi_dead:
+            break
+    if not _bracketed():
+        def _fmt(v):
+            return "∞/出界" if v is None else f"{v:.6g}"
+        raise CalcError(
+            "公式适用范围内无解（目标值超出可综合范围；已自动扩展括号区间，"
+            f"两端函数值 {_fmt(flo)} … {_fmt(fhi)}）")
     for _ in range(iters):
         mid = 0.5 * (lo + hi)
-        fm = f(mid) - target
+        fm = _ev(mid)
+        if not _usable(fm):
+            # 二分中点出界（少见）：改用几何中点，保持落在正实数域内
+            mid = math.sqrt(lo * hi) if lo > 0.0 and hi > 0.0 else mid
+            fm = _ev(mid)
+            if not _usable(fm):
+                raise CalcError("反解区间内公式出界：请缩小目标值范围")
         if fm == 0.0:
             return mid
-        if fm * flo < 0:
+        if flo is not None and fm * flo < 0:
             hi, fhi = mid, fm
         else:
             lo, flo = mid, fm
@@ -457,6 +522,7 @@ def coax_analysis(a, b, er, tan_delta=0.0, freq=0.0, rho=1.72e-8):
     if a >= b:
         raise CalcError("内导体半径 a 必须小于外导体内半径 b")
     f = _nonneg(freq, "频率 f")
+    tand = _nonneg(tan_delta, "tanδ")
     rho = _pos(rho, "金属电阻率 ρ")
     ratio = b / a
     z0 = 60.0 / math.sqrt(er) * math.log(ratio)
@@ -470,7 +536,7 @@ def coax_analysis(a, b, er, tan_delta=0.0, freq=0.0, rho=1.72e-8):
         out["lambda_g"] = C0 / (f * math.sqrt(er))
         rs = math.sqrt(math.pi * f * MU0 * rho)
         ac = rs / (4.0 * math.pi * z0) * (1.0 / a + 1.0 / b)
-        ad = math.pi * f * math.sqrt(er) / C0 * _nonneg(tan_delta, "tanδ")
+        ad = math.pi * f * math.sqrt(er) / C0 * tand
         out["alpha_c_np_m"] = ac
         out["alpha_d_np_m"] = ad
         out["loss_db_m"] = DB * (ac + ad)
@@ -483,7 +549,11 @@ def coax_synthesis(z0_target, b, er):
     z0_target = _pos(z0_target, "目标阻抗 Z0")
     b = _pos(b, "外导体内半径 b")
     er = _pos(er, "相对介电常数 εr")
-    a = b / math.exp(z0_target * math.sqrt(er) / 60.0)
+    expo = z0_target * math.sqrt(er) / 60.0
+    if expo > 709.0:
+        raise CalcError(
+            f"目标 Z0 过高：ln(b/a) 指数 {expo:.3g} 溢出浮点范围，请检查 Z0 单位")
+    a = b / math.exp(expo)
     return {"a": a, "b_over_a": b / a, "Z0": z0_target}
 
 
@@ -519,8 +589,12 @@ def sq_coax_synthesis(z0_target, s, er):
     z0_target = _pos(z0_target, "目标阻抗 Z0")
     s = _pos(s, "方腔边长 s")
     er = _pos(er, "相对介电常数 εr")
+    expo = z0_target * math.sqrt(er) / 60.0
+    if expo > 709.0:
+        raise CalcError(
+            f"目标 Z0 过高：ln(b_eq/a) 指数 {expo:.3g} 溢出浮点范围，请检查 Z0 单位")
     b_eq = 0.539038 * s
-    a = b_eq / math.exp(z0_target * math.sqrt(er) / 60.0)
+    a = b_eq / math.exp(expo)
     if a >= 0.5 * s:
         raise CalcError("目标 Z0 过低：内导体直径将超出方腔（需 2a < s）")
     return {"a": a, "Z0": z0_target,
@@ -555,7 +629,11 @@ def twin_wire_synthesis(z0_target, D, er):
     z0_target = _pos(z0_target, "目标阻抗 Z0")
     D = _pos(D, "中心距 D")
     er = _pos(er, "相对介电常数 εr")
-    x = math.cosh(z0_target * math.sqrt(er) / 120.0)  # = D/d
+    arg = z0_target * math.sqrt(er) / 120.0
+    if arg > 710.0:
+        raise CalcError(
+            f"目标 Z0 过高：acosh 参数 {arg:.3g} 溢出浮点范围，请检查 Z0 单位")
+    x = math.cosh(arg)  # = D/d
     return {"d": D / x, "D_over_d": x, "Z0": z0_target}
 
 
@@ -717,7 +795,11 @@ def wire_over_ground_synthesis(z0_target, h, er):
     z0_target = _pos(z0_target, "目标阻抗 Z0")
     h = _pos(h, "离地板高度 h")
     er = _pos(er, "相对介电常数 εr")
-    d = 2.0 * h / math.cosh(z0_target * math.sqrt(er) / 60.0)
+    arg = z0_target * math.sqrt(er) / 60.0
+    if arg > 710.0:
+        raise CalcError(
+            f"目标 Z0 过高：acosh 参数 {arg:.3g} 溢出浮点范围，请检查 Z0 单位")
+    d = 2.0 * h / math.cosh(arg)
     return {"d": d, "twoh_over_d": 2.0 * h / d, "Z0": z0_target,
             "warnings": []}
 
@@ -747,6 +829,8 @@ def cascade_noise(stages, bw_hz, t_ambient=T0):
     inv_oip3 = 0.0
     oip3_known = True
     for i, st in enumerate(stages, 1):
+        if not isinstance(st, dict):
+            raise CalcError(f"第{i}级必须是 dict（键：gain_db / nf_db / oip3_dbm）")
         gdB = _num(st.get("gain_db"), f"第{i}级增益 Gain")
         ndB = _num(st.get("nf_db"), f"第{i}级噪声系数 NF")
         if gdB <= -600 or ndB < -600:
@@ -891,7 +975,7 @@ def bjt_bias_divider(vcc, ic, vce, beta, v_be=0.7, vre=None, i2_factor=10.0):
     vce = _nonneg(vce, "集射电压 Vce")
     beta = _pos(beta, "电流放大系数 β")
     vbe = _num(v_be, "发射结电压 VBE")
-    vre = _num(vre, "RE 压降 VRE") if vre is not None else 0.1 * vcc
+    vre = _nonneg(vre, "RE 压降 VRE") if vre is not None else 0.1 * vcc
     factor = _pos(i2_factor, "分压电流倍数")
     if vre + vbe >= vcc:
         raise CalcError("VRE+VBE 必须小于 Vcc")
@@ -1095,6 +1179,327 @@ def quarter_wave_transform(z_source, z_load):
 
 
 # ---------------------------------------------------------------------------
+# 定阻衰减网络 Attenuator pads
+# 出处：D. M. Pozar, "Microwave Engineering", 4th ed., 衰减器小节；
+#       Reference Data for Radio Engineers (ITU), 第 5 章衰减网络表。
+# 口径：等阻抗 Z0 两端设计，k = 10^(A/20) 为电压衰减倍数。
+# ---------------------------------------------------------------------------
+def _att_k(att_db, name="目标衰减"):
+    """衰减 dB → 电压比 k，并做范围/浮点分辨率校验。"""
+    a = _num(att_db, name)
+    if a < 0:
+        raise CalcError(f"{name} 不能为负（衰减器无增益）（收到 {a}）")
+    if a > 200.0:
+        raise CalcError(f"{name} 过大（>200 dB），电阻数值已无工程意义（收到 {a}）")
+    k = 10.0 ** (a / 20.0)
+    if k - 1.0 == 0.0:
+        raise CalcError(f"{name} 过小：低于浮点分辨率，无法区分衰减与直通（收到 {a}）")
+    return a, k
+
+
+@_safe
+def attenuator_pi(z0, att_db):
+    """Pi 型定阻衰减器：给定 Z0 与衰减 A(dB) → 串联/并联电阻（Ω）。
+
+    出处：Pozar, Microwave Engineering, 4th ed., 衰减网络小节；
+          Reference Data for Radio Engineers 衰减器表。
+    公式（k = 10^(A/20)）：
+        R串 = Z0·(k²−1)/(2k)；R并（每侧） = Z0·(k+1)/(k−1)。
+    两侧对称，A→0 时 R并→∞、R串→0（网络退化为直通）。
+    """
+    z = _pos(z0, "系统阻抗 Z0")
+    a, k = _att_k(att_db, "目标衰减")
+    out = {"z0": z,
+           "att_db": a,
+           "r_series": z * (k * k - 1.0) / (2.0 * k),
+           "r_shunt": z * (k + 1.0) / (k - 1.0)}
+    if a > 60.0:
+        out.setdefault("warnings", []).append(
+            "衰减 >60 dB：单节 Pi 网络电阻比过大，实装建议多节级联")
+    return out
+
+
+@_safe
+def attenuator_t(z0, att_db):
+    """T 型定阻衰减器：给定 Z0 与衰减 A(dB) → 串联/并联电阻（Ω）。
+
+    出处：Pozar, Microwave Engineering, 4th ed.；同 Pi 型口径。
+    公式：R串（每侧） = Z0·(k−1)/(k+1)；R并 = Z0·2k/(k²−1)。
+    """
+    z = _pos(z0, "系统阻抗 Z0")
+    a, k = _att_k(att_db, "目标衰减")
+    out = {"z0": z,
+           "att_db": a,
+           "r_series": z * (k - 1.0) / (k + 1.0),
+           "r_shunt": z * 2.0 * k / (k * k - 1.0)}
+    if a > 60.0:
+        out.setdefault("warnings", []).append(
+            "衰减 >60 dB：单节 T 网络电阻比过大，实装建议多节级联")
+    return out
+
+
+@_safe
+def attenuator_bridged_t(z0, att_db):
+    """桥 T 型定阻衰减器：串臂两电阻固定为 Z0，仅两个可变电阻随衰减变化。
+
+    出处：Reference Data for Radio Engineers 衰减网络表；Terman,
+    "Radio Engineers' Handbook" 桥式衰减网络节。
+    公式：R桥 = Z0·(k−1)（跨接）；R并 = Z0/(k−1)（并联臂）。
+    A→0 时 R桥→0、R并→∞，网络退化为直通；适合做成连续可变衰减器。
+    """
+    z = _pos(z0, "系统阻抗 Z0")
+    a, k = _att_k(att_db, "目标衰减")
+    return {"z0": z,
+            "att_db": a,
+            "r_fixed": z,
+            "r_bridge": z * (k - 1.0),
+            "r_shunt": z / (k - 1.0)}
+
+
+@_safe
+def attenuator_lpad(z0, att_db):
+    """L 型衰减器（最小电阻数两元件网络，等信源/负载阻抗口径）。
+
+    出处：Reference Data for Radio Engineers 衰减网络表（L-Pad）。
+    公式（负载侧朝 R并，源侧朝 R串；k = 10^(A/20)）：
+        R串 = Z0·(k−1)/k；R并 = Z0/(k−1)。
+    输入端 Zin = Z0 严格匹配；L 型网络只有三个自由度，输出端
+    固有失配（Zout ≠ Z0），vswr_out 如实给出——这是 L 型拓扑的
+    属性，不是误差。仅需一端匹配（功放偏置衰减、扬声器 L-Pad）
+    时它是元件数最少的方案。两端都要求匹配请用 Pi/T 型。
+    """
+    z = _pos(z0, "系统阻抗 Z0")
+    a, k = _att_k(att_db, "目标衰减")
+    r_s = z * (k - 1.0) / k
+    r_p = z / (k - 1.0)
+    z_out = 1.0 / (1.0 / r_p + 1.0 / (r_s + z))
+    g_out = abs((z_out - z) / (z_out + z))
+    return {"z0": z,
+            "att_db": a,
+            "r_series": r_s,
+            "r_shunt": r_p,
+            "z_in": z,
+            "z_out": z_out,
+            "vswr_in": 1.0,
+            "vswr_out": (1.0 + g_out) / (1.0 - g_out)}
+
+
+# ---------------------------------------------------------------------------
+# 驻波比互算 VSWR ↔ |Γ| ↔ 回波损耗 ↔ 失配损耗
+# 出处：Pozar, Microwave Engineering, 4th ed., ch.2 驻波与反射小节。
+# ---------------------------------------------------------------------------
+@_safe
+def vswr_convert(vswr=None, gamma_mag=None, rl_db=None):
+    """VSWR / |Γ| / 回波损耗 RL(dB) / 失配损耗 ML(dB) 互算。
+
+    出处：Pozar, Microwave Engineering, 4th ed., ch.2。
+    三种入口恰好给一个（其余留 None），返回全部口径：
+        |Γ| = (V−1)/(V+1)；V = (1+|Γ|)/(1−|Γ|)；
+        RL = −20·lg|Γ|（|Γ|=0 → ∞）；ML = −10·lg(1−|Γ|²)。
+    另附反射/透射功率百分比。
+    """
+    given = [(vswr is not None, vswr, "vswr"),
+             (gamma_mag is not None, gamma_mag, "gamma_mag"),
+             (rl_db is not None, rl_db, "rl_db")]
+    n = sum(1 for has, _, _ in given if has)
+    if n == 0:
+        raise CalcError("请恰好提供 vswr / gamma_mag / rl_db 中的一个")
+    if n > 1:
+        raise CalcError("vswr / gamma_mag / rl_db 只能提供一个入口（多入口冗余易不一致）")
+    has, val, which = next(x for x in given if x[0])
+    if which == "vswr":
+        v = _num(val, "驻波比 VSWR")
+        if v < 1.0:
+            raise CalcError("驻波比 VSWR 需 ≥ 1（收到 {0}）".format(v))
+        g = (v - 1.0) / (v + 1.0)
+    elif which == "gamma_mag":
+        g = _num(val, "反射系数模 |Γ|")
+        if g < 0.0:
+            raise CalcError("反射系数模 |Γ| 不能为负（收到 {0}）".format(g))
+        if g >= 1.0:
+            raise CalcError("反射系数模 |Γ| 需在 0…1 之间（收到 {0}）".format(g))
+    else:
+        rl = _num(val, "回波损耗 RL")
+        if rl <= 0.0:
+            raise CalcError("回波损耗 RL 需大于 0 dB（收到 {0}）".format(rl))
+        g = 10.0 ** (-rl / 20.0)
+    v = (1.0 + g) / (1.0 - g) if g < 1.0 else float("inf")
+    rl = float("inf") if g == 0.0 else -20.0 * math.log10(g)
+    ml = -10.0 * math.log10(1.0 - g * g) if g < 1.0 else float("inf")
+    return {"vswr": v,
+            "gamma_mag": g,
+            "rl_db": rl,
+            "mismatch_loss_db": ml,
+            "power_reflected_pct": g * g * 100.0,
+            "power_transmitted_pct": (1.0 - g * g) * 100.0}
+
+
+# ---------------------------------------------------------------------------
+# 趋肤效应 Skin effect
+# 出处：Ramo, Whinnery, Van Duzer, "Fields and Waves in Communication
+#       Electronics", 趋肤深度与表面阻抗节；Pozar 表面电阻式。
+# ---------------------------------------------------------------------------
+CONDUCTORS = {
+    # 20 °C 电阻率（Ω·m）。cu 与本引擎 microstrip_analysis 默认 rho 同源。
+    "ag": 1.59e-8,
+    "cu": 1.72e-8,
+    "au": 2.44e-8,
+    "al": 2.65e-8,
+}
+# 别名（含常见中英文）
+for _k, _v in (("silver", "ag"), ("银", "ag"), ("copper", "cu"), ("铜", "cu"),
+               ("gold", "au"), ("金", "au"), ("aluminum", "al"),
+               ("aluminium", "al"), ("铝", "al")):
+    CONDUCTORS[_k] = CONDUCTORS[_v]
+del _k, _v
+
+
+@_safe
+def skin_effect(freq, material="cu", mu_r=1.0, rho=None):
+    """趋肤深度 δ 与表面电阻 Rs（Ω/sq）。
+
+    出处：Ramo, Whinnery, Van Duzer, "Fields and Waves in Communication
+    Electronics", 趋肤效应节；Pozar, Microwave Engineering 表面阻抗式。
+    公式：δ = √(ρ/(π·f·µ))；Rs = ρ/δ = √(π·f·µ·ρ)（Ω/方，与方块尺寸无关）。
+    material ∈ {"ag","cu","au","al"}（或中英文别名），rho（Ω·m）给定则
+    覆盖 material 查表；µ = µ0·µr。低频提示：导体厚度需 ≥3δ（工程上
+    常取 5δ）才可视为"厚导体"近似成立。
+    """
+    f = _pos(freq, "频率 f")
+    mr = _pos(mu_r, "相对磁导率 µr")
+    if rho is not None:
+        r = _pos(rho, "电阻率 rho")
+        mat = "custom"
+    else:
+        key = str(material).strip().lower()
+        if key not in CONDUCTORS:
+            raise CalcError(
+                f"未知材料 {material!r}；可用：ag/cu/au/al"
+                "（或 silver/copper/gold/aluminum、银/铜/金/铝）")
+        r = CONDUCTORS[key]
+        mat = key
+    mu = MU0 * mr
+    delta = math.sqrt(r / (math.pi * f * mu))
+    out = {"f_hz": f,
+           "material": mat,
+           "rho_ohm_m": r,
+           "mu_r": mr,
+           "delta_m": delta,
+           "rs_ohm_sq": r / delta}
+    if f < 1.0e3:
+        out.setdefault("warnings", []).append(
+            "频率较低：趋肤深度大，导体厚度需 ≥3δ（建议 5δ）厚度近似才成立")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 同轴高次模 Coax TE11 cutoff（工程近似）
+# 出处：Pozar, Microwave Engineering, 4th ed., 同轴线高次模小节：
+#       TE11 截止 λc ≈ π(a+b)，fc = c/(λc·√εr)。为单模工作工程上取
+#       f_max ≈ 0.95·fc（3.5 mm 空气同轴规格书口径 33–34 GHz 与此一致）。
+# ---------------------------------------------------------------------------
+@_safe
+def coax_te11_cutoff(a, b, er, freq=None):
+    """同轴线 TE11 高次模截止频率（工程近似）与单模适用上限。
+
+    出处：Pozar, Microwave Engineering, 4th ed., 同轴线高次模小节。
+    公式：λc = π(a+b)√εr（m）；fc = c/λc；f_max ≈ 0.95·fc 为本函数
+    采用的工程余量惯例（与 3.5 mm 空气线"用到 33–34 GHz"的规格口径
+    一致；该 0.95 系数是惯例而非文献公式）。freq 给定时附单模判定。
+    a 为内导体半径、b 为外导体内半径（m），要求 b > a。
+    """
+    ra = _pos(a, "内导体半径 a")
+    rb = _pos(b, "外导体内半径 b")
+    e = _pos(er, "相对介电常数 εr")
+    if rb <= ra:
+        raise CalcError(
+            f"外导体内半径 b 需大于内导体半径 a（收到 a={ra}，b={rb}）")
+    lam_c = math.pi * (ra + rb) * math.sqrt(e)
+    fc = C0 / lam_c
+    f_max = 0.95 * fc
+    out = {"fc_te11": fc,
+           "lambda_c": lam_c,
+           "f_max_advised": f_max}
+    warn = []
+    if freq is not None:
+        fv = _nonneg(freq, "工作频率 freq")
+        out["single_mode_ok"] = fv < fc
+        if fv >= fc:
+            warn.append(
+                f"工作频率 {fv:.6g} Hz ≥ TE11 截止 {fc:.6g} Hz："
+                "TE11 模可传播，已非单模工作")
+        elif fv > f_max:
+            warn.append(
+                f"工作频率 {fv:.6g} Hz 已达截止的 95% 以上"
+                f"（fc={fc:.6g} Hz）：工程上建议留 ≥5% 余量")
+    out["warnings"] = warn
+    return out
+
+
+# ---------------------------------------------------------------------------
+# LC 谐振器（含损耗与寄生）
+# 出处：Q 与带宽定义见任意教材（如 Pozar ch.6 谐振器小节）：
+#       Q_unloaded = 1/(1/Q_esr + 1/Q_rp)；BW = f0/Q。
+#       自谐振频率 SRF = 1/(2π√(L·Cpar)) 或 1/(2π√(Lpar·C))。
+# ---------------------------------------------------------------------------
+@_safe
+def lc_resonator(l_h, c_f, esr_ohm=0.0, rp_ohm=None, c_par_f=0.0, l_par_h=0.0):
+    """LC 谐振器：谐振频率、特性阻抗 √(L/C)、Q（ESR/并联电阻）、3 dB 带宽
+    与元件自谐振频率估算。
+
+    出处：Pozar, Microwave Engineering, 4th ed., ch.6 谐振器小节
+    （Q 定义与 1/Q 叠加口径）；SRF 为标准寄生模型式
+    f_SRF = 1/(2π√(L·Cpar)) / 1/(2π√(Lpar·C))。
+    esr_ohm：串联损耗电阻（0 = 未给）；rp_ohm：并联损耗电阻（None = 未给，
+    0 无意义）；c_par_f/l_par_h：元件寄生电容/电感（0 = 不计）。
+    两个损耗都未给时 Q 返回 None 并提示。
+    """
+    l = _pos(l_h, "电感 L")
+    c = _pos(c_f, "电容 C")
+    esr = _nonneg(esr_ohm, "串联电阻 ESR")
+    f0 = 1.0 / (2.0 * math.pi * math.sqrt(l * c))
+    zc = math.sqrt(l / c)
+    out = {"f0": f0,
+           "z0_char": zc,
+           "x_l_at_f0": 2.0 * math.pi * f0 * l}
+    q_esr = zc / esr if esr > 0.0 else None
+    q_rp = None
+    if rp_ohm is not None:
+        rp = _pos(rp_ohm, "并联电阻 Rp")
+        q_rp = rp / zc
+    out["q_esr"] = q_esr
+    out["q_rp"] = q_rp
+    if q_esr is not None and q_rp is not None:
+        q = 1.0 / (1.0 / q_esr + 1.0 / q_rp)
+    else:
+        q = q_esr if q_esr is not None else q_rp
+    out["q_unloaded"] = q
+    out["bw_3db_hz"] = (f0 / q) if q is not None else None
+    warn = []
+    if q is None:
+        warn.append("未提供损耗参数（esr_ohm / rp_ohm），无法计算 Q 与带宽")
+    cp = _nonneg(c_par_f, "寄生电容 Cpar")
+    lp = _nonneg(l_par_h, "寄生电感 Lpar")
+    srf_l = 1.0 / (2.0 * math.pi * math.sqrt(l * cp)) if cp > 0.0 else None
+    srf_c = 1.0 / (2.0 * math.pi * math.sqrt(lp * c)) if lp > 0.0 else None
+    out["srf_l_hz"] = srf_l
+    out["srf_c_hz"] = srf_c
+    srfs = [s for s in (srf_l, srf_c) if s is not None]
+    out["srf_hz"] = min(srfs) if srfs else None
+    if out["srf_hz"] is not None:
+        if out["srf_hz"] <= f0:
+            warn.append(
+                f"自谐振频率 {out['srf_hz']:.6g} Hz ≤ 工作谐振频率 {f0:.6g} Hz："
+                "元件已自谐振/反转，该频点不能再当作纯 L/C 使用")
+        elif out["srf_hz"] < 10.0 * f0:
+            warn.append(
+                f"自谐振频率 {out['srf_hz']:.6g} Hz 不足谐振频率的 10 倍："
+                "寄生效应显著，实际电抗偏离理想值")
+    out["warnings"] = warn
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 集总元件 180° 巴伦 Lumped Element Balun
 # ---------------------------------------------------------------------------
 @_safe
@@ -1197,7 +1602,7 @@ def standard_value(raw, tolerance_pct=5.0):
     v = _num(raw, "原始值")
     if v == 0 or not math.isfinite(v):
         raise CalcError("原始值必须是有限非零数")
-    tol = float(tolerance_pct)
+    tol = _num(tolerance_pct, "容差")
     if tol <= 0:
         raise CalcError("容差必须是正百分数")
     table = _e_series_table(tol)
