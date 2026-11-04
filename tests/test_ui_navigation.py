@@ -860,9 +860,11 @@ def test_model_token_usage_is_isolated_and_unknown_capacity_has_no_percentage():
     eq(widget.context_usage._usage["max"], 32768)
     eq(widget.context_usage._usage["used"], 0)
     widget._active_model = "a"
+    # 对齐 Cherry Studio 口径：实测(provider_usage)环不受草稿打字污染，
+    # used 保持实测值、estimated 不被翻转（估算标记只属于估算路径）。
     widget.input.setPlainText("新草稿")
-    ok(widget.context_usage._usage["used"] > 4096)
-    ok(widget.context_usage._usage["estimated"])
+    eq(widget.context_usage._usage["used"], 4096)
+    ok(not widget.context_usage._usage.get("estimated"))
     widget.input.clear()
     eq(widget.context_usage._usage["used"], 4096)
     widget._active_model = "b"
@@ -952,6 +954,52 @@ def test_chat_clipboard_shortcuts_override_host_and_keep_history_readonly():
             QApplication.clipboard().clear()
             host.close()
             APP.processEvents()
+
+
+def test_provider_delete_updates_sidebar_and_ignores_old_config():
+    widget = make(760, 850)
+    groups = [dict(model='a', models=['a', 'a2'], provider_name='A', enabled=True),
+              dict(model='b', models=['b'], provider_name='B', enabled=True)]
+    widget._ingest_provider_groups(dict(provider_groups=groups))
+    widget._refresh_saved_models(['a', 'a2', 'b'], {'a': 'A', 'a2': 'A', 'b': 'B'})
+    widget._editor_model = 'a'
+    generation = widget._profile_request_id
+    widget._on_provider_deleted(dict(ok=True, deleted=True, deleted_models=['a', 'a2'],
+        model='b', models=['b'], provider_groups=[groups[1]], profile_labels={'b': 'B'}),
+        'a', ('a', 'a2'), generation)
+    eq(widget.saved_model_list.count(), 1)
+    eq(widget.saved_models_heading.text(), '供应商 · 1')
+    widget._on_config_loaded(dict(model='a', models=['a', 'a2', 'b'], provider_groups=groups), generation)
+    eq(widget.saved_model_list.count(), 1, '过期配置不能恢复已删除供应商')
+    widget.close()
+
+
+def test_provider_delete_empty_and_unconfirmed_response():
+    widget = make(760, 850)
+    widget._refresh_saved_models(['a'], {'a': 'A'})
+    widget._editor_model = 'a'
+    generation = widget._profile_request_id
+    widget._on_provider_deleted(dict(ok=True, model='a', models=['a']), 'a', ('a',), generation)
+    eq(widget.saved_model_list.count(), 1)
+    ok('未确认' in widget.cfg_hint.text())
+    widget._on_provider_deleted(dict(ok=True, deleted=True, deleted_models=['a'],
+        model='', models=[], provider_groups=[], profile_labels={}), 'a', ('a',), generation)
+    eq(widget.saved_model_list.count(), 0)
+    eq(widget._active_model, '')
+    widget.close()
+
+
+def test_provider_delete_response_does_not_clear_other_editor():
+    widget = make(760, 850)
+    widget._editor_model = 'other'
+    widget.provider_name_edit.setText('保留我的编辑')
+    generation = widget._profile_request_id - 1
+    widget._on_provider_deleted(dict(ok=True, deleted=True, deleted_models=['a'],
+        model='b', models=['b'], provider_groups=[dict(model='b', models=['b'],
+        provider_name='B', enabled=True)], profile_labels={'b': 'B'}), 'a', ('a',), generation)
+    eq(widget.provider_name_edit.text(), '保留我的编辑')
+    eq(widget._editor_model, 'other')
+    widget.close()
 
 
 if __name__ == "__main__":

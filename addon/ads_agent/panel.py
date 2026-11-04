@@ -623,6 +623,24 @@ class ContextUsagePopup(QFrame):
         self.raise_()
 
 
+def _context_ring_color(pct: float, base: str) -> str:
+    """Cherry Studio contextUsageColor 的连续渐变移植（线性插值近似 oklch mix）。
+
+    0→50%：base（低占用）线性混入琥珀；50→100%：琥珀线性混入红。
+    无 80/95 分段台阶，颜色随占用连续变化。
+    """
+    pct = min(100.0, max(0.0, pct))
+    warning, danger = "#d99a32", "#ef6464"
+    start, end, t = ((base, warning, pct * 2) if pct <= 50
+                     else (warning, danger, (pct - 50) * 2))
+    t = min(100.0, t) / 100.0
+    a, b = QtGui.QColor(start), QtGui.QColor(end)
+    mix = QtGui.QColor(round(a.red() + (b.red() - a.red()) * t),
+                       round(a.green() + (b.green() - a.green()) * t),
+                       round(a.blue() + (b.blue() - a.blue()) * t))
+    return mix.name()
+
+
 class ContextUsageIndicator(QToolButton):
     """32px 上下文用量环：弧长 = 上下文占用；点击/悬浮/聚焦打开详情浮层。"""
 
@@ -815,6 +833,10 @@ class ContextUsageIndicator(QToolButton):
                 notes.append(f"本地历史裁剪预算：{budget:,} 字符（独立设置）")
             if limit and used is not None and used >= limit * .95:
                 notes.append("接近模型容量，建议清理历史或切换容量更大的模型")
+            if limit and used is not None and used > limit:
+                # Cherry Studio 把百分比夹到 100% 只画满环；我们保留真实比例，
+                # 但明确提示已超限（下次请求可能被拒绝或截断）。
+                notes.append("已超出模型容量，下次请求可能被拒绝或截断")
             return {"title": "上下文", "lines": lines, "notes": notes}
         limit = _usage_int(usage.get("max"))
         if used is not None and limit:
@@ -952,8 +974,8 @@ class ContextUsageIndicator(QToolButton):
         limit = _usage_int(self._usage.get("max")) if self._usage else None
         if used is not None and limit:
             ratio = used / limit
-            color = ("#ef6464" if ratio >= .95 else
-                     "#d99a32" if ratio >= .8 else self._pal["accent"])
+            # Cherry Studio 无分段阈值：颜色随占用 0→100% 连续渐变。
+            color = _context_ring_color(ratio * 100, self._pal["accent"])
             pen.setColor(QtGui.QColor(color))
             p.setPen(pen)
             p.drawArc(rect, 90 * 16, -round(min(1.0, ratio) * 360 * 16))
@@ -1220,6 +1242,12 @@ class ConfigWorker(QThread):
                 )
             elif e.code == 401:
                 self.result.emit({"error": _unauthorized_hint(), "unauthorized": True})
+            elif e.code == 400 and self._path == '/config/provider/delete':
+                try:
+                    detail = json.loads(e.read().decode('utf-8'))
+                except (ValueError, UnicodeError):
+                    detail = {}
+                self.result.emit({'error': str(detail.get('error') or '删除请求被拒绝')})
             else:
                 self.result.emit({"error": f"后端返回 HTTP {e.code}"})
         except urllib.error.URLError as e:
@@ -3049,7 +3077,7 @@ class AgentPanelWidget(QWidget):
             box = QtWidgets.QMessageBox(self)
             box.setWindowTitle("后端版本过旧")
             box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-            box.setText("检测到正在运行的后端是旧版本（没有更新检查接口）。")
+            box.setText("检测到正在运行的后端是旧版本（缺少新功能接口）。")
             box.setInformativeText(
                 "可以让面板自动重启后端来启用新功能。\n\n"
                 "注意：重启会中断正在进行的对话和仿真任务；"
@@ -3164,10 +3192,15 @@ class AgentPanelWidget(QWidget):
 
     def _on_backend_restarted(self, ok: bool, detail: str):
         try:
+            retry = getattr(self, "_stale_backend_retry", None)
             if ok:
+                self._stale_backend_retry = None
                 self.status.setText("后端已重启，正在重新检查更新…")
                 QTimer.singleShot(800, lambda: self._check_updates(silent=True,
                                                                    on_available=None))
+                if retry is not None:
+                    # 旧后端缺新能力（如删除供应商）触发的重启：重启完自动重做
+                    QTimer.singleShot(1200, retry)
             else:
                 self.status.setText(f"后端重启失败：{detail or '原因未知'}")
         except BaseException:  # noqa: BLE001
@@ -3944,6 +3977,11 @@ class AgentPanelWidget(QWidget):
         self.save_btn = QPushButton("保存并应用")
         self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.clicked.connect(self._save_settings)
+        self.provider_del_btn = QPushButton("删除供应商")
+        self.provider_del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.provider_del_btn.setToolTip("删除当前编辑的供应商及其全部模型")
+        self.provider_del_btn.clicked.connect(self._delete_provider)
+        self.provider_del_btn.hide()
         self.cfg_hint = FeedbackLabel()
         self.cfg_hint.setWordWrap(True)
         btn_row.addStretch(1)
@@ -4111,6 +4149,7 @@ class AgentPanelWidget(QWidget):
         self.settings_save_hint.setWordWrap(True)
         self.settings_save_hint.hide()
         footer.addStretch(1)
+        footer.addWidget(self.provider_del_btn)
         self.save_btn.setMinimumWidth(U.px(140))
         self.save_btn.setMaximumWidth(U.px(190))
         footer.addWidget(self.save_btn)
@@ -4152,6 +4191,7 @@ class AgentPanelWidget(QWidget):
         self.test_btn.setStyleSheet(_button_css(pal, "soft"))
         self.retry_profile_btn.setStyleSheet(_button_css(pal, "soft"))
         self.save_btn.setStyleSheet(_button_css(pal, "primary"))
+        self.provider_del_btn.setStyleSheet(_button_css(pal, "ghost"))
         self.sync_btn.setStyleSheet(_button_css(pal, "soft"))
         self.sync_btn.setIcon(_draw_icon('refresh', pal['subtle']))
         self.models_sidebar.setStyleSheet(
@@ -4412,8 +4452,10 @@ class AgentPanelWidget(QWidget):
         if "error" in data or data.get("backend_down"):
             self.cfg_hint.setText(data.get("error") or "后端未运行，请启动后端再重新载入。")
             self.retry_profile_btn.show()
+            self.provider_del_btn.hide()
             self.save_btn.setEnabled(False)
             return
+        self.provider_del_btn.show()
         self.provider_enabled.setChecked(data.get("enabled", True))
         self.base_url_edit.setText(data.get("base_url", ""))
         self._set_editor_provider(data.get("base_url", ""))
@@ -4441,6 +4483,7 @@ class AgentPanelWidget(QWidget):
         self.base_url_edit.clear()
         self.provider_name_edit.clear()
         self.retry_profile_btn.hide()
+        self.provider_del_btn.hide()
         self._set_editor_provider("")
         self._clear_discovered_models()
         self.saved_model_list.blockSignals(True)
@@ -4485,8 +4528,7 @@ class AgentPanelWidget(QWidget):
 
     def _on_config_loaded(self, data: dict, request_id=None):
         if request_id is not None and request_id != self._profile_request_id:
-            if "error" not in data and not data.get("backend_down"):
-                self._refresh_saved_models(self._saved_models + (data.get("models") or []), data.get('profile_labels'))
+            # 旧请求的快照不能合并，否则删除后的供应商会重新出现在列表里。
             return
         if data.get("backend_down"):
             self._auto_revive(retry=self.reload_config)
@@ -4504,12 +4546,15 @@ class AgentPanelWidget(QWidget):
         except (TypeError, ValueError):
             pass
         self.base_url_edit.setText(data.get("base_url", ""))
-        self._active_model = data.get("model") or self._active_model
+        if isinstance(data.get("model"), str):
+            self._active_model = data["model"]
         self._ingest_provider_groups(data)
-        self._set_model_combo_text(data.get("model") or self.model_combo.currentText())
-        self._refresh_saved_models(data.get("models") or [self.model_combo.currentText()], data.get('profile_labels'))
+        self._set_model_combo_text(self._active_model)
+        models = data.get("models")
+        self._refresh_saved_models(models if isinstance(models, list) else [self._active_model], data.get('profile_labels'))
         self._update_model_shortcut()
-        self._edit_saved_model(self._active_model)
+        if self._active_model:
+            self._edit_saved_model(self._active_model)
 
     def _toggle_settings(self, checked: bool):
         self.key_eye.setChecked(False)
@@ -4556,10 +4601,11 @@ class AgentPanelWidget(QWidget):
             import pathbridge
             accounting = pathbridge.load_backend_module("model_context.py", "ads_agent_model_context")
             if measured:
+                # 对齐 Cherry Studio（ContextUsageMeter）的口径：环上数值只反映
+                # provider 实测的回合末上下文，草稿打字不污染实测值、不改 estimated
+                # /basis（估算标记只属于估算路径，见契约 §0/§4.3）。草稿会在下一
+                # 回合请求后才真正计入，因此打字时环保持不动。
                 usage = dict(usage)
-                if draft:
-                    usage["used"] += accounting.estimate_text(draft) + 8
-                    usage["estimated"] = True
             else:
                 proj = self.projects_data.get("projects", {}).get(active, {})
                 history = proj.get("history", [])
@@ -4932,6 +4978,63 @@ class AgentPanelWidget(QWidget):
         self.model_editor_hint.setText("编辑后点击保存并应用，即可使用该模型。")
 
     # ------------------------------------------------------- self-healing
+    def _delete_provider(self):
+        name = self._editor_model
+        if not name:
+            return
+        members = self._provider_models_for(name)
+        label = self.provider_name_edit.text().strip() or name
+        extra = f"及其 {len(members)} 个模型" if members else ""
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("删除供应商")
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        box.setText(f"确定删除供应商“{label}”{extra}吗？此操作不可撤销。")
+        yes = box.addButton("删除", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        self.provider_del_btn.setEnabled(False)
+        self.cfg_hint.setText("删除中…")
+        request_id = self._profile_request_id
+        self._spawn_cfg_worker(
+            {"provider_model": name}, "/config/provider/delete",
+            lambda data, n=name, m=tuple(members), r=request_id:
+                self._on_provider_deleted(data, n, m, r))
+
+    def _on_provider_deleted(self, data: dict, name: str, members=(), request_id=None):
+        self.provider_del_btn.setEnabled(True)
+        same_editor = (request_id is None or request_id == self._profile_request_id)
+        if data.get("backend_old"):
+            if same_editor:
+                self.cfg_hint.setText("后端不支持删除接口，请更新并重启后端，再重新选择供应商删除。")
+            return
+        if data.get("backend_down") or "error" in data:
+            if same_editor:
+                self.cfg_hint.setText("删除结果未确认：" + str(data.get("error") or "后端不可用，请重新载入配置。"))
+            return
+        models = data.get("models")
+        groups = data.get("provider_groups")
+        deleted = data.get("deleted_models")
+        if (data.get("ok") is not True or data.get("deleted") is not True
+                or not isinstance(models, list) or not isinstance(groups, list)
+                or not isinstance(deleted, list) or name not in deleted
+                or not isinstance(data.get("model"), str)
+                or any(m in models for m in set(members) | {name})
+                or any(not isinstance(g, dict) or not isinstance(g.get("models"), list)
+                       or any(m in g["models"] for m in set(members) | {name}) for g in groups)):
+            if same_editor:
+                self.cfg_hint.setText("删除结果未确认，请重新载入配置后检查供应商列表。")
+            return
+        self._active_model = data["model"]
+        self._ingest_provider_groups(data)
+        self._refresh_saved_models(models, data.get("profile_labels") or {})
+        self._update_model_shortcut()
+        if same_editor:
+            self._new_model()
+            self.cfg_hint.setText(f"已删除供应商（{name}）。")
+
     def _auto_revive(self, retry=None):
         """Backend is down: auto-start it (hidden child) and optionally retry."""
         import backend_launcher

@@ -167,6 +167,11 @@ def load() -> dict:
     cfg["llm_base_url"] = os.environ.get("ADS_AGENT_BASE_URL", cfg["llm_base_url"])
     cfg["llm_model"] = os.environ.get("ADS_AGENT_MODEL", cfg["llm_model"])
 
+    # 显式删空与旧配置缺省不同，不能用默认值或环境变量复活供应商。
+    empty_providers = parser.getboolean("llm", "providers_empty", fallback=False)
+    if empty_providers:
+        cfg["llm_model"] = cfg["llm_base_url"] = cfg["llm_api_key"] = ""
+
     # 令牌的唯一来源：缺失或仍是公开默认值时，这里会生成并写回 config.ini。
     # 不用 get("ads","token",...) 读原始值——那样会把公开默认值当成有效配置。
     cfg["ads_token"] = ads_auth.ensure_token()
@@ -175,7 +180,9 @@ def load() -> dict:
     if parser.has_option("llm", "models"):
         raw = parser.get("llm", "models").strip()
         models = [m.strip() for m in raw.split(",") if m.strip()]
-    if cfg["llm_model"] not in models:
+    if empty_providers:
+        models = []
+    elif cfg["llm_model"] and cfg["llm_model"] not in models:
         models.insert(0, cfg["llm_model"])
     cfg["llm_models"] = models
     cfg["llm_profiles"] = _read_profiles(parser)
@@ -198,6 +205,8 @@ def _read_profiles(parser) -> dict:
         tokens = profile.get("context_window_tokens", 0)
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
             raise ValueError("模型上下文上限必须为非负整数 tokens")
+    if parser.getboolean("llm", "providers_empty", fallback=False):
+        return {}
     connection = {
         "base_url": parser.get("llm", "base_url", fallback=DEFAULTS["llm_base_url"], raw=True),
         "api_key": parser.get("llm", "api_key", fallback="", raw=True),
@@ -317,11 +326,15 @@ def update_llm_settings(
     provider_enabled: bool | None = None,
     context_model: str | None = None,
     context_window_tokens: int | None = None,
+    provider_remove: bool | None = None,
 ) -> dict:
     """Persist [llm] settings into config.ini, preserving comments & other keys.
 
     Only provided values are written. Returns the effective settings after
     the update; the in-memory CFG in server.py must be refreshed separately.
+
+    provider_remove=True 时删除 provider_model 所属的整个供应商（同一连接
+    身份的全部模型 profile），活动模型落在被删组内时会切到剩余模型。
 
     写入走 ads_auth.edit_config —— 与令牌生成/轮换**共用同一个跨进程锁**，
     否则"保存 LLM 设置"和"轮换令牌"会各自按旧快照整文件写回，
@@ -329,10 +342,13 @@ def update_llm_settings(
     """
     if provider_enabled is not None and not isinstance(provider_enabled, bool):
         raise ValueError("供应商启用状态必须为布尔值")
+    if provider_remove is not None and not isinstance(provider_remove, bool):
+        raise ValueError("供应商删除标记必须为布尔值")
     if context_window_tokens is not None and (isinstance(context_window_tokens, bool)
             or not isinstance(context_window_tokens, int) or context_window_tokens < 0):
         raise ValueError("模型上下文上限必须为非负整数 tokens")
     updates: dict[str, str] = {}
+    deleted_models: list[str] = []
     if base_url is not None and base_url.strip():
         updates["base_url"] = base_url.strip()
     if model is not None and model.strip():
@@ -364,7 +380,33 @@ def update_llm_settings(
             connection["provider_name"] = provider_name.strip()
         if provider_enabled is not None:
             connection["enabled"] = provider_enabled
-        if provider_models is not None:
+        if provider_remove:
+            if origin is None:
+                raise ValueError('请指定要删除的供应商')
+            env_model = os.environ.get("ADS_AGENT_MODEL", "").strip()
+            if env_model and env_model in previous_members:
+                raise ValueError('该模型由环境变量 ADS_AGENT_MODEL 指定，请先移除环境变量再删除供应商')
+            deleted_models.extend(previous_members)
+            for name in previous_members:
+                profiles.pop(name)
+            saved = models if models is not None else parser.get(
+                'llm', 'models', fallback=active).split(',')
+            remaining = list(dict.fromkeys(n.strip() for n in saved
+                                           if n.strip() and n.strip() not in previous_members))
+            remaining = [n for n in remaining if n in profiles]
+            remaining.extend(n for n in profiles if n not in remaining)
+            if active not in profiles:
+                active = next((n for n in remaining if profiles[n].get('enabled', True)),
+                              remaining[0] if remaining else "")
+            updates["model"] = active
+            updates["models"] = ", ".join(remaining)
+            updates["providers_empty"] = "false" if profiles else "true"
+            # legacy 顶层连接键跟随新的活动模型，避免残留指向已删供应商
+            conn = dict(profiles.get(active, {"base_url": "", "api_key": ""}))
+            conn.pop("context_window_tokens", None)
+            updates["base_url"] = conn.get("base_url", "")
+            updates["api_key"] = conn.get("api_key", "")
+        elif provider_models is not None:
             if not isinstance(provider_models, list) or not provider_models or not all(
                     isinstance(n, str) and n.strip() for n in provider_models):
                 raise ValueError('请至少选择一个有效模型')
@@ -385,12 +427,12 @@ def update_llm_settings(
             saved = models if models is not None else parser.get('llm', 'models', fallback=active).split(',')
             updates['models'] = ', '.join(dict.fromkeys([n.strip() for n in saved
                 if n.strip() and (n.strip() not in previous_members or n.strip() in members)] + members))
-        else:
+        elif target:
             old_limit = profiles.get(target, {}).get("context_window_tokens", 0)
             profiles[target] = connection
             if old_limit:
                 profiles[target]["context_window_tokens"] = old_limit
-        if context_window_tokens is not None:
+        if context_window_tokens is not None and not provider_remove:
             limit_model = (context_model or target).strip()
             if limit_model not in (members if provider_models is not None else [target]):
                 raise ValueError("上下文设置的模型必须在当前供应商选中的模型列表中")
@@ -398,8 +440,10 @@ def update_llm_settings(
                 profiles[limit_model]["context_window_tokens"] = context_window_tokens
             else:
                 profiles[limit_model].pop("context_window_tokens", None)
-        updates["base_url"] = connection.get("base_url", "")
-        updates["api_key"] = connection.get("api_key", "")
+        if not provider_remove and profiles:
+            updates["providers_empty"] = "false"
+            updates["base_url"] = connection.get("base_url", "")
+            updates["api_key"] = connection.get("api_key", "")
         updates["profiles"] = json.dumps(profiles, ensure_ascii=False)
         start = next((i for i, l in enumerate(lines) if l.strip().lower() == "[llm]"), None)
         if start is None:
@@ -439,6 +483,7 @@ def update_llm_settings(
         # 是否在跨进程锁内完成（正常恒为 True；False 说明当时锁被占住，
         # 本次写入退化为无锁，极小概率丢更新 —— 面板/日志据此排查）
         "config_locked": locked,
+        **({"deleted_models": deleted_models} if provider_remove else {}),
     }
 
 

@@ -158,7 +158,10 @@ cache_hit_tokens, cache_miss_tokens, reasoning_tokens, requests
 
 `ContextUsageIndicator` 仍是一个 32px 的 `QToolButton`，行为要求：
 
-- **主环语义不变**：环弧长 = 上下文占用比例，≥80% 琥珀、≥95% 红；
+- **主环语义**：环弧长 = 上下文占用比例；颜色随占用**连续渐变**
+  （0→50% 由低占用色混入琥珀、50→100% 琥珀混入红，无分段台阶，
+  对齐 Cherry Studio `contextUsageColor`；实测值不被输入草稿污染）；
+  ≥95% / 超容量在浮层 notes 中文字提示；
 - 悬浮 / 键盘聚焦 / 点击 → 打开**详情浮层**（不要只依赖超长 tooltip：
   现有 tooltip 已经 8 行以上，真机上会被屏幕边缘裁切）。浮层内容分组：
 

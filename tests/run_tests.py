@@ -55,6 +55,7 @@ CASES = [
     # ---------------- logic ----------------
     ("test_token_migration.py", "令牌生成 / 迁移 / 两端一致 / 并发收敛", "logic", False),
     ("test_config_write_race.py", "config.ini 并发写入协调 / 不丢设置与令牌", "logic", False),
+    ("test_provider_remove.py", "删除供应商 provider_remove 语义", "logic", False),
     ("test_auth.py", "后端接口鉴权 / 令牌不落日志 / keep-alive", "http", False),
     ("test_sim_output_dir.py", "仿真输出目录唯一性 / 不覆盖旧结果", "logic", False),
     ("test_build_gate.py", "写入备份 / 保存后复核 / 仿真门禁 / 日志语义 / 每轮汇总", "logic", False),

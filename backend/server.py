@@ -1361,6 +1361,31 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "known": True, "ads": cancel_info})
             return
 
+        if self.path == "/config/provider/delete":
+            body = self._read_json(limit=200_000)
+            if body is None:
+                return
+            name = body.get("provider_model")
+            if not isinstance(name, str) or not name.strip():
+                self._send_json({"error": "请选择供应商"}, 400)
+                return
+            try:
+                status = config_mod.update_llm_settings(
+                    provider_model=name.strip(), provider_remove=True)
+            except ValueError as e:
+                # 404 保留给旧版服务未实现此路由，避免误判为兼容性问题。
+                self._send_json({"error": str(e)}, 400)
+                return
+            except Exception as e:  # noqa: BLE001
+                log.exception("删除供应商失败")
+                self._send_json({"error": f"删除供应商失败: {type(e).__name__}: {e}"}, 500)
+                return
+            CFG.update(config_mod.load())
+            self._send_json({"ok": True, "deleted": True, **_config_status(),
+                             "deleted_models": status["deleted_models"],
+                             "config_locked": status["config_locked"]})
+            return
+
         if self.path == "/config/model":
             body = self._read_json(limit=200_000)
             if body is None:
@@ -1390,6 +1415,7 @@ class Handler(BaseHTTPRequestHandler):
                     provider_enabled=body.get("provider_enabled"),
                     context_model=body.get("context_model"),
                     context_window_tokens=body.get("context_window_tokens"),
+                    provider_remove=body.get("provider_remove"),
                 )
             except Exception as e:  # noqa: BLE001
                 self._send_json({"error": f"保存配置失败: {type(e).__name__}: {e}"}, 500)
