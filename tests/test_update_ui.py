@@ -3,7 +3,13 @@
 跑法：python tests/test_update_ui.py
 覆盖：控件与 objectName、各后端状态（update_available / up_to_date / ready / error / 离线）
       的文案与按钮启用态、ready 绝不谎称已安装、reveal 只定位不执行、静默检查不打扰、
-      以及所有更新路径 never-raise。
+      顶栏绿色按钮常驻显示当前版本 / 点击分流，以及所有更新路径 never-raise。
+
+2026-11-04 需求驱动修改（按键改常驻），非放宽安全断言：
+用户要求「自动更新绿色按键在没有新版本时显示当前版本号，比如 v1.3.5」。按
+docs/顶栏绿色按键显示当前版本_接口契约_2026-11-04.md §4.1，原先 4 处「按钮应隐藏/收起/复位成
+『一键更新』」的断言改为「常驻可见 + 显示版本号」，这是需求变更本身，不是为了让实现过关而松绑。
+所有既有 never-raise / not_contains / 不得谎称已安装 的安全断言一条未删。
 """
 
 import os
@@ -23,6 +29,7 @@ except ImportError:  # pragma: no cover
     sys.exit(2)
 
 import panel  # noqa: E402
+import pathbridge  # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
 
@@ -89,6 +96,14 @@ READY = {
 }
 OFFLINE = {"error": "后端未启动（[WinError 10061] 由于目标计算机积极拒绝，无法连接。）",
            "backend_down": True}
+
+
+def local_plugin_version():
+    """本地安装版本（与实现同源：pathbridge.load().PLUGIN_VERSION），取不到返回 ""。"""
+    try:
+        return str(getattr(pathbridge.load(), "PLUGIN_VERSION", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # ---------------------------------------------------------------- 控件
@@ -499,17 +514,25 @@ def test_auto_check_setting_persists_without_touching_other_sections():
 
 
 # ---------------------------------------------------------------- 顶部绿色一键更新按钮
-def test_top_update_button_hidden_by_default_and_toggles():
-    """默认隐藏；发现新版本出现并带版本号；已是最新时收起。"""
+def test_top_update_button_visible_by_default_and_shows_version():
+    """常驻：默认可见并显示当前版本 v{V}；发现新版本变「一键更新 vX」；已是最新仍显示版本号。"""
     widget = make_panel()
     try:
+        local = local_plugin_version()
         ok(hasattr(widget, "update_top_btn"), "面板顶部应有绿色一键更新按钮")
-        ok(not widget.update_top_btn.isVisible(), "默认必须隐藏")
+        ok(widget.update_top_btn.isVisible(), "顶栏按钮必须常驻可见（没有新版本也不收起）")
+        if local:
+            contains(widget.update_top_btn.text(), f"v{local}",
+                     "没有新版本时应显示本地当前版本号")
+        else:
+            eq(widget.update_top_btn.text(), "检查更新", "版本号取不到时应显示「检查更新」")
         widget._on_update_checked(dict(AVAILABLE))
         ok(widget.update_top_btn.isVisible(), "发现新版本时按钮应出现")
         contains(widget.update_top_btn.text(), "1.4.0", "按钮文案应带新版本号")
         widget._on_update_checked(dict(UP_TO_DATE))
-        ok(not widget.update_top_btn.isVisible(), "已是最新时按钮应收起")
+        ok(widget.update_top_btn.isVisible(), "已是最新时按钮仍然常驻可见")
+        contains(widget.update_top_btn.text(), "1.4.0",
+                 "已是最新时应显示当前版本号（来自检查数据）")
     finally:
         close(widget)
 
@@ -549,7 +572,8 @@ def test_top_button_click_runs_prepare_then_apply_chain():
         eq(calls["apply"], 1, "ready 后必须立即自动 apply（一键语义）")
         eq(calls["restart"], 1, "applied 后必须自动重启后端")
         contains(widget.status.text(), "1.4.0", "状态栏应显示已更新到的版本")
-        ok(not widget.update_top_btn.isVisible(), "更新完成后按钮应收起")
+        contains(widget.update_top_btn.text(), "1.4.0", "更新完成后顶栏应显示新版本号")
+        ok(widget.update_top_btn.isVisible(), "更新完成后按钮仍常驻可见（不再收起）")
     finally:
         close(widget)
 
@@ -558,11 +582,311 @@ def test_top_button_failure_restores_button():
     """prepare 失败时按钮恢复可点，且不能把「正在下载」卡死。"""
     widget = make_panel()
     try:
+        local = local_plugin_version()
         widget._on_update_checked(dict(AVAILABLE))
         widget._apply_update_now()
         widget._on_update_prepared({"error": "后端未启动", "backend_down": True})
         ok(widget.update_top_btn.isEnabled(), "失败后按钮应恢复可用")
-        contains(widget.update_top_btn.text(), "一键更新", "按钮文案应复位")
+        if local:
+            contains(widget.update_top_btn.text(), f"v{local}",
+                     "失败复位后应显示当前版本号")
+        not_contains(widget.update_top_btn.text(), "一键更新",
+                     "失败复位后文案不再是「一键更新」（此时没有可用更新）")
+        not_contains(widget.update_top_btn.text(), "正在下载",
+                     "失败后不得把「正在下载」卡死在按钮上")
+        ok(widget.update_top_btn.isVisible(), "失败后按钮仍常驻可见")
+    finally:
+        close(widget)
+
+
+def test_top_button_initial_shows_version_and_check_tooltip():
+    """契约 §2 初始态：常驻可见、文案 v{V}、tooltip/读屏文案说明「当前版本 + 点击检查更新」。"""
+    widget = make_panel()
+    try:
+        local = local_plugin_version()
+        btn = widget.update_top_btn
+        ok(btn.isVisible(), "初始状态下顶栏按钮必须可见")
+        ok(btn.isEnabled(), "初始状态下顶栏按钮必须可点")
+        if local:
+            eq(btn.text(), f"v{local}", "初始文案必须是当前版本号 v{V}")
+            contains(btn.toolTip(), "当前版本", "tooltip 应说明这是当前版本")
+        else:
+            eq(btn.text(), "检查更新", "版本号取不到时应显示「检查更新」")
+        contains(btn.toolTip(), "点击检查更新", "tooltip 应说明点击是检查更新")
+        if local:
+            contains(btn.accessibleName(), "当前版本", "读屏文案应说明当前版本")
+        contains(btn.accessibleName(), "点击检查更新", "读屏文案应说明点击语义")
+    finally:
+        close(widget)
+
+
+def test_top_button_up_to_date_prefers_data_current_version():
+    """已是最新时显示数据里的 current_version（后端权威），而不是本地常量。"""
+    widget = make_panel()
+    try:
+        local = local_plugin_version()
+        widget._on_update_checked({
+            "status": "up_to_date",
+            "current_version": "1.4.0",
+            "latest_version": "1.4.0",
+            "message": "当前版本不低于最新稳定版本，不会回退。",
+        })
+        eq(widget.update_top_btn.text(), "v1.4.0",
+           "已是最新时应显示数据里的 current_version")
+        if local and local != "1.4.0":
+            not_contains(widget.update_top_btn.text(), local,
+                         "数据里有当前版本时不得退回本地常量")
+        ok(widget.update_top_btn.isVisible(), "已是最新时按钮仍常驻可见")
+        contains(widget.update_top_btn.toolTip(), "已是最新版本", "tooltip 应说明已是最新")
+    finally:
+        close(widget)
+
+
+def test_top_button_available_click_runs_prepare():
+    """有可用更新时点击顶栏按钮 → 直接走一键下载（prepare），不再重新检查。"""
+    widget = make_panel()
+    try:
+        widget._on_update_checked(dict(AVAILABLE))
+        eq(widget.update_top_btn.text(), "一键更新 v1.4.0", "有更新时按钮文案应为一键更新")
+        calls = {"prepare": 0, "check": 0}
+        original_prepare = panel.AgentPanelWidget._prepare_update
+        original_check = panel.AgentPanelWidget._check_updates
+        try:
+            panel.AgentPanelWidget._prepare_update = (
+                lambda self: calls.__setitem__("prepare", calls["prepare"] + 1))
+            panel.AgentPanelWidget._check_updates = (
+                lambda self, silent=False, on_available=None:
+                    calls.__setitem__("check", calls["check"] + 1))
+            widget.update_top_btn.click()
+            APP.processEvents()
+        finally:
+            panel.AgentPanelWidget._prepare_update = original_prepare
+            panel.AgentPanelWidget._check_updates = original_check
+        eq(calls["prepare"], 1, "有可用更新时点击必须触发 prepare 链路")
+        eq(calls["check"], 0, "有可用更新时点击不应重新检查")
+        contains(widget.update_top_btn.text(), "正在下载", "点击后按钮应进入下载中状态")
+        ok(not widget.update_top_btn.isEnabled(), "下载中按钮应禁用，避免重复点击")
+    finally:
+        close(widget)
+
+
+def test_top_button_up_to_date_click_rechecks():
+    """无可用更新时点击顶栏按钮 → 重新检查（不触发下载）。"""
+    widget = make_panel()
+    try:
+        widget._on_update_checked(dict(UP_TO_DATE))
+        calls = {"prepare": 0, "check": 0}
+        original_prepare = panel.AgentPanelWidget._prepare_update
+        original_check = panel.AgentPanelWidget._check_updates
+        try:
+            panel.AgentPanelWidget._prepare_update = (
+                lambda self: calls.__setitem__("prepare", calls["prepare"] + 1))
+            panel.AgentPanelWidget._check_updates = (
+                lambda self, silent=False, on_available=None:
+                    calls.__setitem__("check", calls["check"] + 1))
+            widget.update_top_btn.click()
+            APP.processEvents()
+        finally:
+            panel.AgentPanelWidget._prepare_update = original_prepare
+            panel.AgentPanelWidget._check_updates = original_check
+        eq(calls["check"], 1, "无可用更新时点击必须重新检查")
+        eq(calls["prepare"], 0, "无可用更新时点击绝不能开始下载")
+    finally:
+        close(widget)
+
+
+def test_top_button_error_state_keeps_version_and_rechecks():
+    """检查失败：仍显示当前版本号、仍可点，点击触发重新检查。"""
+    widget = make_panel()
+    try:
+        local = local_plugin_version()
+        widget._on_update_checked({"status": "error", "message": "网络不可用"})
+        if local:
+            eq(widget.update_top_btn.text(), f"v{local}",
+               "检查失败后应保持当前版本号")
+        ok(widget.update_top_btn.isVisible(), "检查失败后按钮仍常驻可见")
+        ok(widget.update_top_btn.isEnabled(), "检查失败后按钮应仍可点")
+        contains(widget.update_top_btn.toolTip(), "检查更新失败", "tooltip 应说明上次检查失败")
+        calls = {"prepare": 0, "check": 0}
+        original_prepare = panel.AgentPanelWidget._prepare_update
+        original_check = panel.AgentPanelWidget._check_updates
+        try:
+            panel.AgentPanelWidget._prepare_update = (
+                lambda self: calls.__setitem__("prepare", calls["prepare"] + 1))
+            panel.AgentPanelWidget._check_updates = (
+                lambda self, silent=False, on_available=None:
+                    calls.__setitem__("check", calls["check"] + 1))
+            widget.update_top_btn.click()
+            APP.processEvents()
+        finally:
+            panel.AgentPanelWidget._prepare_update = original_prepare
+            panel.AgentPanelWidget._check_updates = original_check
+        eq(calls["check"], 1, "检查失败后点击必须重新检查")
+        eq(calls["prepare"], 0, "检查失败后点击绝不能开始下载")
+    finally:
+        close(widget)
+
+
+def test_top_button_without_local_version_falls_back_to_check_text():
+    """本地版本取不到（抛异常或返回空）：文案退化成「检查更新」，且 never-raise。"""
+    widget = make_panel()
+    original_load = pathbridge.load
+    try:
+        for broken in (lambda: None, lambda: (_ for _ in ()).throw(RuntimeError("boom"))):
+            pathbridge.load = broken
+            widget._on_update_checked({"status": "error", "message": "检查失败"})
+            eq(widget.update_top_btn.text(), "检查更新",
+               "取不到本地版本时应退化成「检查更新」")
+            ok(widget.update_top_btn.isVisible(), "版本未知时按钮也必须常驻可见")
+            contains(widget.update_top_btn.toolTip(), "点击检查更新",
+                     "版本未知时 tooltip 仍应说明点击行为")
+        ok(True, "版本来源异常不得让顶栏按钮链路抛异常")
+    finally:
+        pathbridge.load = original_load
+        close(widget)
+
+
+def test_top_button_applied_shows_new_version():
+    """更新完成：顶栏显示 v{applied_version}，仍常驻且可点。"""
+    widget = make_panel()
+    try:
+        restarted = {"n": 0}
+        original_restart = panel.AgentPanelWidget._restart_backend_async
+        try:
+            panel.AgentPanelWidget._restart_backend_async = (
+                lambda self: restarted.__setitem__("n", restarted["n"] + 1))
+            widget._on_update_applied({
+                "status": "applied", "applied_version": "1.4.0",
+                "message": "已应用更新", "files": 3,
+            })
+        finally:
+            panel.AgentPanelWidget._restart_backend_async = original_restart
+        eq(widget.update_top_btn.text(), "v1.4.0", "更新完成后应显示新版本号")
+        ok(widget.update_top_btn.isVisible(), "更新完成后按钮仍常驻可见")
+        ok(widget.update_top_btn.isEnabled(), "更新完成后按钮应恢复可点")
+        contains(widget.update_top_btn.toolTip(), "已更新到", "tooltip 应说明已更新到新版本")
+        eq(restarted["n"], 1, "更新完成后仍应自动重启后端")
+    finally:
+        close(widget)
+
+
+def test_top_button_never_raises_on_garbage_status_data():
+    """垃圾检查结果（{} / {"status": 123} / None 等）：never-raise，按钮仍在且文案非空。"""
+    widget = make_panel()
+    try:
+        for payload in ({}, {"status": 123}, None,
+                        {"status": "update_available", "latest_version": 1},
+                        {"status": "up_to_date", "current_version": None},
+                        {"error": None}, {"status": "error", "message": None}):
+            widget._on_update_checked(payload)
+            ok(widget.update_top_btn.isVisible(), "垃圾数据也不能把常驻按钮弄丢")
+            ok(bool(widget.update_top_btn.text()), "垃圾数据下按钮文案不得为空")
+        ok(True, "垃圾数据不得让顶栏按钮链路抛异常")
+    finally:
+        close(widget)
+
+
+def test_top_button_prepare_recheck_up_to_date_restores_current_version():
+    """点了「一键更新」后后端复检说已是最新：必须复位成 v{current}、可点、tooltip 回「当前版本」。
+
+    update_service.py:346 _prepare_locked() 每次都会重新 _check()，:351-352 若状态不是
+    update_available 就直接返回，因此「下载入口点下去、复检发现其实已是最新」是真实可达路径。
+    契约 §2 up_to_date 行要求可见 + 可点 + 文案 v{current}，禁用只允许出现在 preparing 行。
+    """
+    widget = make_panel()
+    original_prepare = panel.AgentPanelWidget._prepare_update
+    try:
+        local = local_plugin_version()
+        # 掐断真实 worker：这里只验证状态机复位，不连后端。
+        panel.AgentPanelWidget._prepare_update = lambda self: None
+        widget._on_update_checked(dict(AVAILABLE))
+        widget._apply_update_now()
+        eq(widget.update_top_btn.text(), "正在下载更新…", "点击后应进入下载中状态")
+        ok(not widget.update_top_btn.isEnabled(), "下载中按钮应禁用")
+
+        widget._on_update_prepared({
+            "status": "up_to_date",
+            "current_version": "1.4.0",
+            "latest_version": "1.4.0",
+            "message": "当前版本不低于最新稳定版本，不会回退。",
+        })
+        btn = widget.update_top_btn
+        eq(btn.text().strip(), "v1.4.0", "复检已是最新时应显示数据里的当前版本")
+        ok(btn.isEnabled(), "复检已是最新后按钮必须恢复可点（禁用只允许在下载中）")
+        ok(btn.isVisible(), "复检已是最新后按钮仍常驻可见")
+        contains(btn.toolTip(), "当前版本", "tooltip 应回到「当前版本」文案")
+        not_contains(btn.toolTip(), "正在下载", "tooltip 不得停在下载中文案")
+        not_contains(btn.toolTip(), "上次更新失败", "复检已是最新不是失败，措辞不得写成失败")
+        not_contains(btn.text(), "一键更新", "复检已是最新后不得再显示「一键更新」")
+
+        # 复位后点击应走「重新检查」，绝不重新开始下载。
+        calls = {"check": 0, "prepare": 0}
+        original_check = panel.AgentPanelWidget._check_updates
+        try:
+            panel.AgentPanelWidget._check_updates = (
+                lambda self, silent=False, on_available=None:
+                    calls.__setitem__("check", calls["check"] + 1))
+            panel.AgentPanelWidget._prepare_update = (
+                lambda self: calls.__setitem__("prepare", calls["prepare"] + 1))
+            btn.click()
+            APP.processEvents()
+        finally:
+            panel.AgentPanelWidget._check_updates = original_check
+        eq(calls["check"], 1, "复位后点击必须重新检查更新")
+        eq(calls["prepare"], 0, "已是最新时点击绝不能开始下载")
+
+        # 数据里没有 current_version：退回本地版本，仍可点、文案不为空。
+        widget._update_current_version = ""
+        widget._on_update_prepared({"status": "up_to_date", "message": "已是最新"})
+        ok(widget.update_top_btn.isEnabled(), "缺 current_version 时也必须恢复可点")
+        if local:
+            eq(widget.update_top_btn.text().strip(), f"v{local}",
+               "缺 current_version 时应退回本地 v{V}")
+        ok(bool(widget.update_top_btn.text().strip()), "复位后文案不得为空")
+    finally:
+        panel.AgentPanelWidget._prepare_update = original_prepare
+        close(widget)
+
+
+def test_top_button_fits_minimum_panel_width():
+    """面板最小宽度 330 时：常驻按键不被裁切，也不会把「模型设置」挤出右边界。
+
+    这是常驻改造的连带布局约束：330 是 panel.py 里 setMinimumWidth(U.px(330)) 声明的最小宽度，
+    顶栏必须在这宽度下仍放下 侧栏键 + 品牌字 + 更新键 + 主题键 + 设置键。
+    2026-11-04 用户反馈修订：品牌标题（ADS Agent）**任何宽度都必须显示**——空间不足时
+    由 _elide_title 做省略号（如「AD…」），绝不消失；更新键 min 宽锁定 sizeHint（永不裁字），
+    被压缩的只能是可省略的品牌字；紧凑态（<400）设置键收窄 U.px(84)、间距 U.px(2)，
+    变宽后全部还原。
+    """
+    widget = make_panel(330, 520)
+    try:
+        btn = widget.update_top_btn
+        ok(btn.isVisible(), "最小宽度下更新键仍必须常驻可见")
+        ok(btn.isEnabled(), "最小宽度下更新键必须可点")
+        ok(btn.width() >= btn.sizeHint().width(), "最小宽度下更新键不得被裁切")
+        ok(bool(btn.text().strip()), "最小宽度下更新键文案不得为空")
+        settings_right = widget.settings_btn.x() + widget.settings_btn.width()
+        ok(settings_right < widget.width(),
+           f"最小宽度下顶栏动作被裁切（右缘 {settings_right} >= {widget.width()}）")
+        ok(widget.title.isVisible(), "品牌标题任何宽度都必须可见（2026-11-04 用户反馈）")
+        ok(bool(widget.title.text().strip()),
+           "品牌标题文案不得为空（最窄时是省略号形态，如 AD…）")
+        ok(not widget.subtitle.isVisible(), "最小宽度下品牌副标题隐藏（<400 既有降级）")
+        eq(widget.settings_btn.width(), panel.U.px(84),
+           "紧凑态设置键应收窄到 U.px(84)，给品牌字和更新键腾空间")
+        # 变宽后必须还原常规间距/内边距/宽度，不能永久停在紧凑态。
+        widget.resize(600, 520)
+        APP.processEvents()
+        eq(widget._top_row.spacing(), panel.U.P("sm"), "变宽后顶栏间距必须还原")
+        contains(btn.styleSheet(), f"padding:{panel.U.px(5)}px {panel.U.px(14)}px",
+                 "变宽后更新键水平内边距必须还原")
+        ok(btn.width() >= btn.sizeHint().width(), "变宽后更新键不得被裁切")
+        ok(btn.isVisible(), "变宽后更新键仍常驻可见")
+        ok(widget.title.isVisible(), "变宽后品牌标题必须保持可见")
+        eq(widget.title.text(), "ADS Agent",
+           "变宽后品牌标题必须还原全文（不得停留在省略号）")
+        ok(widget.subtitle.isVisible(), "变宽后品牌副标题必须恢复可见")
+        eq(widget.settings_btn.width(), panel.U.px(92), "变宽后设置键宽度必须还原 92")
     finally:
         close(widget)
 

@@ -144,14 +144,96 @@ TOOLS = [
             "description": (
                 "把已存在的工作区挂回当前会话（不创建、不修改磁盘）。ADS 重启后"
                 "报\"当前没有打开的工作区\"时的标准恢复手段：path 省略即打开最近"
-                "一次使用的工作区；不要全盘扫描文件系统去找 lib.defs。"
+                "一次使用的工作区。path 可给完整工作区目录、以路径分隔符结尾的"
+                "父目录（在其一层子目录里找），或名称/名称片段（在最近记录与已知"
+                "根目录里解析）；名称片段命中多个时返回 ambiguous 与 candidates，"
+                "必须让用户选择，禁止自行挑一个，禁止全盘扫描或遍历盘符找 lib.defs。"
+                "切换到另一个工作区会丢弃当前未保存修改：必须用户确认后才传"
+                "force=true；已打开同一工作区不受影响。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "工作区目录（须含 lib.defs）；省略用最近一次使用的工作区",
+                        "description": "完整工作区目录 / 以分隔符结尾的父目录 / 名称或名称片段；省略用最近一次使用的工作区",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "切换到另一个工作区时是否强制（会丢弃当前未保存修改），默认 false；必须用户确认后才传 true",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_workspaces",
+            "description": (
+                "发现已有工作区（只读：不创建、不打开）。用户说了工作区名字但没给"
+                "完整路径时**优先调用本工具**按名称/路径片段查找；禁止全盘扫描、"
+                "禁止遍历盘符、禁止用 run_python 猜路径。返回候选的 name/path/"
+                "valid/last_used；命中多个时把候选列给用户选择，不要自行挑一个。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "按名称/路径片段过滤，大小写不敏感；省略则返回最近使用与已发现的工作区",
+                    },
+                    "max": {
+                        "type": "integer",
+                        "description": "最多返回条数，默认 20，上限 100",
+                    },
+                    "roots": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "额外的扫描根目录，通常省略（ADS 端按已知根目录与最近记录解析）",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_workspace",
+            "description": (
+                "在磁盘上新建一个 ADS 工作区，默认创建后立即打开（open=true）。"
+                "name 与 path 至少给一个，都给时以 path 为准。目标目录已存在时"
+                "拒绝创建（reason=exists）且绝不覆盖/删除任何内容。当前已有其它"
+                "工作区打开时，切换会丢弃其未保存修改，必须用户确认后才传"
+                "force=true（否则返回 needs_force）。建目录请用本工具，不要用"
+                "run_python 手工 os.makedirs。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "工作区名（即目录名），非法字符会被拒绝",
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "父目录；省略时按默认工作区根目录解析",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "完整目标路径；与 name 至少给一个，都给时以 path 为准",
+                    },
+                    "library": {
+                        "type": "string",
+                        "description": "创建后新建的首个可写库名，省略则不建库",
+                    },
+                    "open": {
+                        "type": "boolean",
+                        "description": "创建后是否立即打开，默认 true",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "当前已有其它工作区打开时是否强制切换（会丢弃未保存修改），默认 false；必须用户确认后才传 true",
                     },
                 },
             },
@@ -1070,6 +1152,11 @@ TIMEOUTS = {
     "get_workspace_info": 60,
     # 大工作区挂载要读库清单，按 list_designs 同档给
     "open_workspace": 120,
+    # 发现只在已知根目录的 1–2 层子目录里扫（ADS 端整体预算 3s），
+    # 120 秒足够覆盖网络盘/杀软抖动，又不会让模型干等太久
+    "list_workspaces": 120,
+    # 建目录 + 建首个库 + 打开：首次挂载大工作区偏慢，按最坏情况给
+    "create_workspace": 180,
     "list_designs": 120,
     "get_design_variables": 120,
     "set_design_variables": 180,
@@ -1249,6 +1336,20 @@ def describe_result(name: str, result) -> tuple:
     return "info", "成功"
 
 
+def _default_workspace_root(cfg: dict, name: str, args: dict) -> str:
+    """该次调用应由后端补上的默认父目录；不需要补时返回空串。
+
+    ``[agent] workspace_root`` 只服务于 ``create_workspace``：模型既没给
+    ``root`` 也没给 ``path`` 时，把它补成 ``root``。ADS 进程拿不到后端配置，
+    所以只能在这里注入；其它工具的参数一律不动（空串视同"没给"）。
+    """
+    if name != "create_workspace" or not isinstance(args, dict):
+        return ""
+    if args.get("root") or args.get("path"):
+        return ""
+    return str(cfg.get("workspace_root") or "").strip()
+
+
 def call(cfg: dict, name: str, args: dict, job_id: str = "") -> dict:
     """Forward a tool call to the ADS-side executor, return its JSON result.
 
@@ -1260,6 +1361,12 @@ def call(cfg: dict, name: str, args: dict, job_id: str = "") -> dict:
         raise AdsToolError(f"{name} 是后端本地工具，应由 agent 处理（不应派发到 ADS）")
     if name not in TIMEOUTS and name != "run_simulation":
         raise AdsToolError(f"未知工具: {name}")
+    # [agent] workspace_root：只有 create_workspace 缺 root/path 时补默认父目录。
+    # 先复制再改，避免污染调用方传进来的参数字典（agent 可能复用）。
+    default_root = _default_workspace_root(cfg, name, args)
+    if default_root:
+        args = dict(args or {})
+        args["root"] = default_root
     # 派发前先确认对端身份：带令牌的请求不能发给"碰巧占了那个端口"的服务
     _verify_toolserver(cfg)
     import uuid

@@ -42,8 +42,10 @@ import os
 import re
 import shutil
 import io
+import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -107,22 +109,141 @@ def _last_workspace_path() -> str:
         return ""
 
 
-def _remember_workspace(path) -> None:
-    """记下最近工作区。失败静默 —— 记不住只是退化成手动打开，不该报错。"""
-    p = os.path.normpath(str(path or "").strip())
-    if not p:
-        return
+# ---------------------------------------------------------------------------
+# 最近工作区记录（契约 1.4：last_workspace.txt 继续写，另加 recent_workspaces.json）
+# ---------------------------------------------------------------------------
+_WS_RECENT_MAX = 20                # recent_workspaces.json 最多保留的条数
+_WS_LIST_DEFAULT_MAX = 20          # list_workspaces 默认返回条数
+_WS_LIST_MAX = 100                 # list_workspaces 返回条数上限
+_WS_SCAN_MAX_ROOTS = 10            # 一轮发现最多扫描的根目录数
+_WS_SCAN_MAX_DIR_ENTRIES = 2000    # 单目录条目超过这个数直接跳过（不列完）
+_WS_SCAN_MAX_DIRS = 5000           # 一轮发现最多检查的目录数
+_WS_SCAN_BUDGET_S = 3.0            # 一轮发现的总耗时预算（秒）
+_WS_NAME_BAD_CHARS = '\\/:*?"<>|'  # Windows 目录名非法字符
+
+
+def _data_root_dir() -> str:
+    """数据根目录（与 last_workspace.txt 同目录，沿用其解析方式）。"""
+    return os.path.dirname(_last_workspace_file())
+
+
+def _recent_workspaces_file() -> str:
+    """``<数据根>/recent_workspaces.json`` —— 多个最近工作区的唯一记录。"""
+    return os.path.join(_data_root_dir(), "recent_workspaces.json")
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _ws_norm(path) -> str:
+    """规范工作区路径：去引号/空白、expanduser、normpath（不做 realpath）。"""
+    raw = str(path or "").strip().strip('"')
+    if not raw:
+        return ""
+    return os.path.normpath(os.path.expanduser(raw))
+
+
+def _ws_same_path(a, b) -> bool:
+    """Windows 大小写不敏感地比较两个工作区路径。"""
+    if not a or not b:
+        return False
+    return os.path.normcase(_ws_norm(a)) == os.path.normcase(_ws_norm(b))
+
+
+def _read_recent_workspaces() -> list:
+    """读最近工作区记录。
+
+    文件缺失/损坏都当空表；同时兼容只写过 last_workspace.txt 的旧数据根
+    （升级后不能让历史记录凭空消失）。返回按最近使用排序的
+    ``[{"path","name","last_used"}]``，最多 20 条。
+    """
+    items = []
     try:
-        fp = _last_workspace_file()
-        try:  # 值没变就不写：_require_workspace 每次工具调用都会经过这里
-            with open(fp, encoding="utf-8") as f:
-                if f.read().strip() == p:
-                    return
+        with open(_recent_workspaces_file(), encoding="utf-8") as f:
+            raw = json.load(f)
+        seq = raw.get("items") if isinstance(raw, dict) else raw
+        for it in (seq or []):
+            if not isinstance(it, dict):
+                continue
+            p = _ws_norm(it.get("path"))
+            if not p:
+                continue
+            items.append({
+                "path": p,
+                "name": str(it.get("name") or os.path.basename(p)),
+                "last_used": str(it.get("last_used") or ""),
+            })
+    except (OSError, ValueError):
+        items = []
+    if not items:
+        old = _last_workspace_path()
+        if old:
+            old = _ws_norm(old)
+            items = [{"path": old, "name": os.path.basename(old), "last_used": ""}]
+    out, seen = [], set()
+    for it in items:
+        key = os.path.normcase(it["path"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+        if len(out) >= _WS_RECENT_MAX:
+            break
+    return out
+
+
+def _write_recent_workspaces(items) -> None:
+    """原子写：临时文件 + os.replace，中途崩溃也不会留下半截 JSON。"""
+    fp = _recent_workspaces_file()
+    os.makedirs(os.path.dirname(fp), exist_ok=True)
+    payload = {"version": 1, "items": list(items)[:_WS_RECENT_MAX]}
+    fd, tmp = tempfile.mkstemp(prefix=".recent_workspaces.", suffix=".tmp",
+                               dir=os.path.dirname(fp))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, fp)
+    except Exception:
+        try:
+            os.unlink(tmp)
         except OSError:
             pass
-        os.makedirs(os.path.dirname(fp), exist_ok=True)
-        with open(fp, "w", encoding="utf-8") as f:
-            f.write(p)
+        raise
+
+
+def _remember_workspace(path) -> None:
+    """记下最近工作区：last_workspace.txt（旧入口）+ recent_workspaces.json。
+
+    失败静默 —— 记不住只是退化成手动打开，不该报错。
+    """
+    p = _ws_norm(path)
+    if not p:
+        return
+    try:  # 旧口径：值没变就不写；_require_workspace 每次工具调用都会经过这里
+        fp = _last_workspace_file()
+        same = False
+        try:
+            with open(fp, encoding="utf-8") as f:
+                same = f.read().strip() == p
+        except OSError:
+            same = False
+        if not same:
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(p)
+    except Exception:  # noqa: BLE001
+        pass
+    try:  # 新口径：最近在前、去重、上限 20；已在最前且文件存在就不重写
+        recent_fp = _recent_workspaces_file()
+        items = _read_recent_workspaces()
+        if os.path.isfile(recent_fp) and items and _ws_same_path(items[0]["path"], p):
+            return
+        fresh = [{"path": p, "name": os.path.basename(p), "last_used": _now_iso()}]
+        fresh += [it for it in items if not _ws_same_path(it["path"], p)]
+        _write_recent_workspaces(fresh)
     except Exception:  # noqa: BLE001
         pass
 
@@ -137,13 +258,15 @@ class PreconditionError(RuntimeError):
 
 
 def _no_workspace_hint() -> str:
-    """统一的“无工作区”错误文案：先给恢复路径，再给手动兜底。"""
+    """统一的“无工作区”错误文案：先给恢复路径，再给发现/新建与手动兜底。"""
     last = _last_workspace_path()
     if last:
         return (f"当前没有打开的工作区。调用 open_workspace()（或 open_workspace 工具）"
-                f"可重新打开最近的工作区: {last}")
+                f"可重新打开最近的工作区: {last}；也可用 list_workspaces() 查找其它工作区，"
+                f"或用 create_workspace(name=...) 新建")
     return ("当前没有打开的工作区。可用 open_workspace(路径) 打开已有工作区目录"
-            "（含 lib.defs），或在 ADS 中手动打开 Workspace")
+            "（含 lib.defs），或用 list_workspaces() 查找已有工作区、"
+            "create_workspace(name=...) 新建；也可在 ADS 中手动打开 Workspace")
 
 
 def _require_workspace():
@@ -180,41 +303,662 @@ def get_workspace_info(args: dict, ctx=None) -> dict:
     return info
 
 
-def open_workspace(args: dict, ctx=None) -> dict:
-    """把一个已存在的工作区挂回当前 ADS 会话（ADS 重启后恢复现场的第一步）。
+# ---------------------------------------------------------------------------
+# 工作区发现（契约 1.1）：只扫已知根目录 1–2 层，禁止 os.walk 全盘/盘符根
+# ---------------------------------------------------------------------------
 
-    path 省略时用最近一次成功使用的工作区（<数据根>/last_workspace.txt）。
-    本工具只调 de.open_workspace 挂载会话，不创建、不修改任何磁盘内容；
-    路径无效时把最近记录一并报出来 —— 模型不需要也不应该去全盘扫描猜路径。
+def _is_workspace_dir(path) -> bool:
+    """目录是否工作区：优先 SDK 的 directory_is_workspace，缺失时回退 lib.defs。"""
+    p = _ws_norm(path)
+    if not p or not os.path.isdir(p):
+        return False
+    try:
+        de = _de()
+        probe = getattr(de, "directory_is_workspace", None)
+        if callable(probe):
+            try:
+                return bool(probe(p))
+            except Exception:  # noqa: BLE001 — SDK 判定出错按“非工作区”处理
+                return False
+    except Exception:  # noqa: BLE001 — 没有 ADS 绑定：用磁盘事实判断
+        pass
+    try:
+        return os.path.isfile(os.path.join(p, "lib.defs"))
+    except OSError:
+        return False
+
+
+def _workspace_roots(explicit=None) -> list:
+    """发现根目录（契约 1.4）。
+
+    顺序：roots 参数 → env ADS_AGENT_WORKSPACE_ROOT → 最近工作区父目录 →
+    最近工作区自身 → 家目录下的默认候选（只取存在的，不递归）。去重且 ≤10 个。
     """
+    roots = []
+    raw = explicit or []
+    if isinstance(raw, str):
+        raw = [raw]
+    for r in raw:
+        p = _ws_norm(r)
+        if p:
+            roots.append(p)
+    if not roots:
+        env_root = _ws_norm(os.environ.get("ADS_AGENT_WORKSPACE_ROOT") or "")
+        if env_root:
+            roots.append(env_root)
+    if not roots:
+        for it in _read_recent_workspaces():
+            if os.path.isdir(it["path"]):
+                roots.extend([_ws_norm(os.path.dirname(it["path"])), it["path"]])
+                break
+    if not roots:
+        for cand in ("~/ads_workspaces", "~/ADS_Workspaces", "~/Documents"):
+            p = _ws_norm(cand)
+            if os.path.isdir(p):
+                roots.append(p)
+    out, seen = [], set()
+    for r in roots:
+        key = os.path.normcase(r)
+        if not r or key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+        if len(out) >= _WS_SCAN_MAX_ROOTS:
+            break
+    return out
+
+
+def _create_workspace_root(explicit=None) -> str:
+    """新建工作区的父目录（契约 1.4）。
+
+    顺序：root 参数 → env ADS_AGENT_WORKSPACE_ROOT → 最近工作区的父目录 →
+    ``<数据根>/workspaces``。
+    """
+    raw = _ws_norm(explicit)
+    if raw:
+        return raw
+    env_root = _ws_norm(os.environ.get("ADS_AGENT_WORKSPACE_ROOT") or "")
+    if env_root:
+        return env_root
+    for it in _read_recent_workspaces():
+        if os.path.isdir(it["path"]):
+            return _ws_norm(os.path.dirname(it["path"]))
+    old = _last_workspace_path()
+    if old:
+        return _ws_norm(os.path.dirname(old))
+    return os.path.join(_data_root_dir(), "workspaces")
+
+
+def _list_child_dirs(path: str, deadline: float, notes: list):
+    """有界列出直接子目录；条目超限/超时返回 None 并写 note（不列完超大盘）。"""
+    dirs = []
+    try:
+        with os.scandir(path) as it:
+            n = 0
+            for entry in it:
+                n += 1
+                if n > _WS_SCAN_MAX_DIR_ENTRIES:
+                    notes.append(f"{path}: 条目超过 {_WS_SCAN_MAX_DIR_ENTRIES}，"
+                                 f"跳过该目录（避免全盘拖慢）")
+                    return None
+                if time.monotonic() > deadline:
+                    notes.append(f"扫描超出 {_WS_SCAN_BUDGET_S:g} 秒预算，已提前停止")
+                    return None
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        dirs.append(os.path.join(path, entry.name))
+                except OSError:
+                    continue
+    except OSError as e:
+        notes.append(f"{path}: 无法读取（{type(e).__name__}），已跳过")
+        return None
+    return dirs
+
+
+def _scan_workspace_dirs(roots, deadline: float, notes: list) -> dict:
+    """扫已知根目录的 1–2 层子目录，返回 {found, scanned, truncated}。
+
+    只用 os.scandir 逐层列目录，不 os.walk、不递归、不碰盘符根。
+    """
+    found, seen = [], set()
+    scanned = 0
+    truncated = False
+
+    def _remember(p):
+        p = _ws_norm(p)
+        key = os.path.normcase(p)
+        if not p or key in seen:
+            return
+        seen.add(key)
+        found.append(p)
+
+    for root in roots:
+        if time.monotonic() > deadline:
+            truncated = True
+            notes.append(f"扫描超出 {_WS_SCAN_BUDGET_S:g} 秒预算，已提前停止")
+            break
+        if not os.path.isdir(root):
+            notes.append(f"根目录不存在: {root}")
+            continue
+        if _is_workspace_dir(root):
+            _remember(root)
+        level1 = _list_child_dirs(root, deadline, notes)
+        if level1 is None:
+            truncated = True
+            if time.monotonic() > deadline:
+                break
+            continue
+        for child in level1:
+            if time.monotonic() > deadline:
+                truncated = True
+                notes.append(f"扫描超出 {_WS_SCAN_BUDGET_S:g} 秒预算，已提前停止")
+                break
+            scanned += 1
+            if scanned > _WS_SCAN_MAX_DIRS:
+                truncated = True
+                notes.append(f"已检查 {_WS_SCAN_MAX_DIRS} 个目录，停止继续扫描")
+                break
+            if _is_workspace_dir(child):
+                _remember(child)
+                continue
+            # 第 2 层：第 1 层不是工作区时才下钻（例如 <根>/分类/<工作区>）
+            level2 = _list_child_dirs(child, deadline, notes)
+            if level2 is None:
+                truncated = True
+                continue
+            for grand in level2:
+                if time.monotonic() > deadline:
+                    truncated = True
+                    notes.append(f"扫描超出 {_WS_SCAN_BUDGET_S:g} 秒预算，已提前停止")
+                    break
+                scanned += 1
+                if scanned > _WS_SCAN_MAX_DIRS:
+                    truncated = True
+                    notes.append(f"已检查 {_WS_SCAN_MAX_DIRS} 个目录，停止继续扫描")
+                    break
+                if _is_workspace_dir(grand):
+                    _remember(grand)
+        if truncated and (time.monotonic() > deadline or scanned > _WS_SCAN_MAX_DIRS):
+            break
+    return {"found": found, "scanned": scanned, "truncated": truncated}
+
+
+def list_workspaces(args: dict, ctx=None) -> dict:
+    """有界发现已有工作区：只扫已知根目录 1–2 层，绝不 os.walk 全盘/盘符根。
+
+    模型拿不准工作区在哪时先调本工具，再把候选列给用户选；不要自己扫描磁盘。
+    返回 workspaces/recent/roots/scanned/truncated/notes（契约 1.1）。
+    """
+    query = str(args.get("query") or "").strip()
+    try:
+        max_n = int(args.get("max") or _WS_LIST_DEFAULT_MAX)
+    except (TypeError, ValueError):
+        max_n = _WS_LIST_DEFAULT_MAX
+    max_n = max(1, min(max_n, _WS_LIST_MAX))
+    notes = []
+    raw_roots = args.get("roots") or []
+    if isinstance(raw_roots, str):
+        raw_roots = [raw_roots]
+    if len(raw_roots) > _WS_SCAN_MAX_ROOTS:
+        notes.append(f"roots 最多扫描 {_WS_SCAN_MAX_ROOTS} 个，其余已忽略")
+    recent = _read_recent_workspaces()
+    roots = _workspace_roots(raw_roots)
+    if not roots:
+        notes.append("没有可扫描的工作区根目录"
+                     "（可用 roots 参数或 ADS_AGENT_WORKSPACE_ROOT 指定）")
+    scan = _scan_workspace_dirs(roots, time.monotonic() + _WS_SCAN_BUDGET_S, notes)
+    q = query.casefold()
+    workspaces, seen = [], set()
+
+    def _hit(name, path):
+        return not q or q in name.casefold() or q in path.casefold()
+
+    def _append(name, path, valid, last_used, source):
+        p = _ws_norm(path)
+        key = os.path.normcase(p)
+        if not p or key in seen:
+            return
+        seen.add(key)
+        workspaces.append({"name": name or os.path.basename(p), "path": p,
+                           "valid": bool(valid), "last_used": last_used or "",
+                           "source": source})
+
+    for it in recent:
+        if _hit(it["name"], it["path"]):
+            _append(it["name"], it["path"], _is_workspace_dir(it["path"]),
+                    it["last_used"], "recent")
+    for p in scan["found"]:
+        if _hit(os.path.basename(p), p):
+            _append(os.path.basename(p), p, True, "", "scan")
+    total = len(workspaces)
+    truncated = bool(scan["truncated"])
+    if total > max_n:
+        workspaces = workspaces[:max_n]
+        truncated = True
+        notes.append(f"命中 {total} 个工作区，已按 max={max_n} 截断")
+    return {"workspaces": workspaces, "recent": recent, "roots": roots,
+            "scanned": scan["scanned"], "truncated": truncated, "notes": notes}
+
+
+def _as_bool(value, default=False) -> bool:
+    """宽松布尔解析：兼容模型传 "true"/"1"/"false" 等字符串。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _looks_like_path(raw: str) -> bool:
+    """是否“看起来是路径”（绝对路径或含分隔符）——这种输入走异常通道。"""
+    return bool(os.path.isabs(raw) or os.sep in raw or (os.altsep and os.altsep in raw))
+
+
+def _candidate(path, last_used="") -> dict:
+    p = _ws_norm(path)
+    return {"name": os.path.basename(p) or p, "path": p, "last_used": last_used or ""}
+
+
+def _sort_candidates(candidates) -> list:
+    """候选排序：last_used 倒序，其次 name 升序（契约 6.1，最多 10 条由决策态裁剪）。"""
+    uniq, seen = [], set()
+    for c in candidates or []:
+        key = os.path.normcase(c.get("path") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    uniq.sort(key=lambda c: (c.get("name") or "").casefold())
+    uniq.sort(key=lambda c: c.get("last_used") or "", reverse=True)
+    return uniq
+
+
+def _open_decision(reason: str, candidates=None, current: str = "",
+                   message: str = "") -> dict:
+    """需要用户决策时返回的结构化结果（不抛异常，契约 1.3）。"""
+    return {
+        "opened": False,
+        "reason": reason,
+        "candidates": _sort_candidates(candidates)[:10],
+        "current_workspace": current or "",
+        "message": message,
+    }
+
+
+def _recent_hint(limit: int = 3) -> str:
+    """not_found 文案里附最近使用过的路径，帮用户给出完整路径。"""
+    paths = [_ws_norm(it["path"]) for it in _read_recent_workspaces()[:limit]]
+    paths = [p for p in paths if p]
+    if not paths:
+        return ""
+    return "最近的记录: " + "；".join(paths)
+
+
+def _current_workspace_path(de) -> str:
+    """当前打开的工作区路径（没打开返回 ""）；只读，不产生副作用。"""
+    try:
+        if not de.workspace_is_open():
+            return ""
+        ws = de.active_workspace()
+        return _ws_norm(getattr(ws, "path", "") or "")
+    except Exception:  # noqa: BLE001 — 查询失败按“没有打开”处理
+        return ""
+
+
+def _workspace_is_open(de) -> bool:
+    try:
+        return bool(de.workspace_is_open())
+    except Exception:  # noqa: BLE001
+        return bool(_current_workspace_path(de))
+
+
+def _call_de_open(de, path: str, force: bool = False):
+    """调 SDK 打开工作区。
+
+    force 必须是关键字（真 SDK 是 ``open_workspace(wrk_path, *, force=False)``）。
+    """
+    return de.open_workspace(path, force=bool(force))
+
+
+def _child_workspaces(parent: str, deadline: float, notes: list) -> list:
+    """父目录 1 层子目录中的工作区（用于“以分隔符结尾的父目录”模式）。"""
+    found = []
+    if _is_workspace_dir(parent):
+        found.append(_ws_norm(parent))
+    for child in (_list_child_dirs(parent, deadline, notes) or []):
+        if _is_workspace_dir(child):
+            found.append(_ws_norm(child))
+    out, seen = [], set()
+    for p in found:
+        key = os.path.normcase(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def _fragment_candidates(fragment: str, deadline: float, notes: list) -> list:
+    """名称片段解析：recent 记录 + 已知根目录有界扫描，返回候选（含无效目录）。"""
+    q = fragment.casefold()
+    out, seen = [], set()
+
+    def _add(path, last_used=""):
+        p = _ws_norm(path)
+        key = os.path.normcase(p)
+        if not p or key in seen or not os.path.isdir(p):
+            return
+        seen.add(key)
+        out.append(_candidate(p, last_used))
+
+    for it in _read_recent_workspaces():
+        name = it.get("name") or os.path.basename(it["path"])
+        if q in name.casefold() or q in it["path"].casefold():
+            _add(it["path"], it.get("last_used") or "")
+    # 已有 ≥2 个候选就够判 ambiguous 了，省掉一次磁盘扫描
+    if len(out) < 2:
+        roots = _workspace_roots()
+        if roots:
+            scan = _scan_workspace_dirs(roots, deadline, notes)
+            for p in scan["found"]:
+                if q in os.path.basename(p).casefold() or q in p.casefold():
+                    _add(p)
+    return _sort_candidates(out)
+
+
+def _fragment_not_found(fragment: str, current: str) -> dict:
+    tail = _recent_hint()
+    msg = (f"没有找到与 {fragment!r} 匹配的工作区。"
+           f"可先用 list_workspaces(query=...) 查找，或提供完整工作区路径（含 lib.defs）重试。")
+    if tail:
+        msg += tail
+    return _open_decision("not_found", [], current, msg)
+
+
+def _open_workspace(args: dict, ctx=None) -> dict:
+    """open_workspace 的实现体（决策态/异常通道的分流都集中在这里）。"""
     de = _de()
     if not callable(getattr(de, "open_workspace", None)):
         raise RuntimeError(
             "当前 ADS 的 keysight.ads.de 没有 open_workspace 接口，请在 ADS 中手动打开工作区"
         )
-    raw = str(args.get("path") or "").strip().strip('"')
+    force = _as_bool(args.get("force"), False)
+    raw_arg = str(args.get("path") or "").strip().strip('"')
+    notes = []
+    deadline = time.monotonic() + _WS_SCAN_BUDGET_S
+    raw = raw_arg
+
     if not raw:
+        # 省略 path：最近记录（txt 优先，旧入口只有它）；都没有才报前置条件
         raw = _last_workspace_path()
+        if not raw:
+            recent = _read_recent_workspaces()
+            raw = recent[0]["path"] if recent else ""
         if not raw:
             raise PreconditionError(
                 "没有可用的最近工作区记录。请显式传 path（含 lib.defs 的工作区目录），"
                 "或在 ADS 中手动打开 Workspace"
             )
-    if not os.path.isdir(raw):
-        last = _last_workspace_path()
-        note = f"（最近一次使用的记录是 {last}，也已失效）" if last else ""
-        raise PreconditionError(f"工作区目录不存在: {raw}{note}")
-    if not os.path.isfile(os.path.join(raw, "lib.defs")):
-        raise PreconditionError(
-            f"{raw} 不是工作区目录（缺少 lib.defs）。工作区是包含 lib.defs 的目录")
-    if de.workspace_is_open():
-        cur = de.active_workspace()
-        cur_path = os.path.normpath(str(getattr(cur, "path", "") or ""))
-        if cur_path == os.path.normpath(raw):
-            return {**get_workspace_info({}, ctx), "already_open": True}
-    opened = de.open_workspace(raw)
-    _remember_workspace(getattr(opened, "path", raw))
-    return get_workspace_info({}, ctx)
+        p = _ws_norm(raw)
+        cur = _current_workspace_path(de)
+        if not os.path.isdir(p):
+            return _open_decision(
+                "not_found", [], cur,
+                f"最近记录的工作区已不存在: {p}。可用 list_workspaces 重新查找，"
+                f"或提供完整工作区路径（含 lib.defs）。")
+        if not _is_workspace_dir(p):
+            return _open_decision(
+                "invalid_path", [{**_candidate(p), "valid": False}], cur,
+                f"{p} 不是工作区目录（缺少 lib.defs）。工作区是包含 lib.defs 的目录。")
+        target = p
+    else:
+        p = _ws_norm(raw)
+        trailing = raw.endswith(("/", "\\"))
+        if os.path.isdir(p):
+            if _is_workspace_dir(p):
+                target = p
+            elif trailing:
+                # ② 尾分隔符父目录：在 1 层子目录里找
+                cur = _current_workspace_path(de)
+                hits = _child_workspaces(p, deadline, notes)
+                if not hits:
+                    return _open_decision(
+                        "not_found", [], cur,
+                        f"父目录 {p} 下没有找到工作区目录（含 lib.defs）。"
+                        f"可用 list_workspaces 查找，或提供工作区完整路径。")
+                if len(hits) > 1:
+                    return _open_decision(
+                        "ambiguous", [_candidate(h) for h in hits], cur,
+                        f"{p} 下有 {len(hits)} 个工作区，请让用户选择后再用完整路径重试。")
+                target = hits[0]
+            else:
+                # 显式路径：保留异常通道（既有测试依赖原文）
+                raise PreconditionError(
+                    f"{p} 不是工作区目录（缺少 lib.defs）。工作区是包含 lib.defs 的目录"
+                )
+        elif _looks_like_path(raw):
+            if trailing:
+                cur = _current_workspace_path(de)
+                return _open_decision(
+                    "not_found", [], cur,
+                    f"父目录不存在: {p}。可用 list_workspaces 查找已有工作区，"
+                    f"或提供工作区完整路径。")
+            last = _last_workspace_path()
+            note = f"（最近一次使用的记录是 {last}，也已失效）" if last else ""
+            raise PreconditionError(f"工作区目录不存在: {raw}{note}")
+        else:
+            # ③ 名称/名称片段
+            cur = _current_workspace_path(de)
+            hits = _fragment_candidates(raw, deadline, notes)
+            if not hits:
+                return _fragment_not_found(raw, cur)
+            if len(hits) > 1:
+                return _open_decision(
+                    "ambiguous", hits, cur,
+                    f"名称片段 {raw!r} 命中 {len(hits)} 个工作区，"
+                    f"请让用户选择后再用完整路径重试（不会替你选）。")
+            only = hits[0]
+            if not _is_workspace_dir(only["path"]):
+                return _open_decision(
+                    "invalid_path", [{**only, "valid": False}], cur,
+                    f"{only['path']} 不是工作区目录（缺少 lib.defs）。"
+                    f"工作区是包含 lib.defs 的目录。")
+            target = only["path"]
+
+    cur = _current_workspace_path(de)
+    is_open = _workspace_is_open(de)
+    if is_open and cur and _ws_same_path(cur, target):
+        info = get_workspace_info({}, ctx)
+        return {**info, "already_open": True, "opened": True,
+                "switched": False, "notes": notes}
+    if is_open and cur and not _ws_same_path(cur, target) and not force:
+        return _open_decision(
+            "needs_force", [], cur,
+            f"当前已打开工作区 {cur}；打开 {target} 会切换工作区并可能丢弃未保存修改。"
+            f"请先向用户确认，确认后再传 force=true 重试。")
+    force_closed = bool(is_open and cur and not _ws_same_path(cur, target) and force)
+    opened = _call_de_open(de, target, force)
+    new_path = _ws_norm(getattr(opened, "path", "") or target)
+    _remember_workspace(new_path)
+    info = get_workspace_info({}, ctx)
+    return {**info, "already_open": False, "opened": True,
+            "switched": bool(cur) and not _ws_same_path(cur, new_path),
+            "force_closed": force_closed, "notes": notes}
+
+
+def open_workspace(args: dict, ctx=None) -> dict:
+    """把一个工作区挂回当前 ADS 会话（ADS 重启后恢复现场 / 切换工作区）。
+
+    path 支持三种形态：完整工作区目录；以路径分隔符结尾的父目录；
+    名称或名称片段（在最近记录 + 已知根目录里解析）。
+    显式路径无效时保留 PreconditionError；名称/父目录/最近记录解析出的
+    歧义或无效返回结构化决策态，交给模型问用户，而不是抛异常。
+    """
+    return _open_workspace(args, ctx)
+
+
+def _invalid_workspace_name_reason(name: str) -> str:
+    """工作区名是否非法；合法返回 ""，非法返回中文原因（契约 1.2）。"""
+    if not name:
+        return "工作区名称不能为空"
+    if name in (".", ".."):
+        return f"工作区名称不能是 {name!r}"
+    for ch in _WS_NAME_BAD_CHARS:
+        if ch in name:
+            return f"工作区名称不能包含字符 {ch!r}"
+    if len(name) > 120:
+        return f"工作区名称过长（{len(name)} 字符，上限 120）"
+    return ""
+
+
+def _create_refusal(reason: str, path: str = "", current: str = "",
+                    message: str = "", candidates=None) -> dict:
+    out = {
+        "created": False,
+        "reason": reason,
+        "path": _ws_norm(path),
+        "current_workspace": current or "",
+        "message": message,
+    }
+    if candidates:
+        out["candidates"] = _sort_candidates(candidates)[:10]
+    return out
+
+
+def create_workspace(args: dict, ctx=None) -> dict:
+    """新建一个 ADS 工作区并按需立即打开（契约 1.2）。
+
+    纪律：目标已存在绝不覆盖/删除；已有其它工作区且未传 force 时返回
+    needs_force 让用户确认；SDK 缺 create_workspace 时返回 sdk_unsupported。
+    """
+    de = _de()
+    notes = []
+    raw_name = str(args.get("name") or "").strip()
+    raw_path = str(args.get("path") or "").strip().strip('"')
+    library = str(args.get("library") or "").strip()
+    open_flag = _as_bool(args.get("open"), True)
+    force = _as_bool(args.get("force"), False)
+
+    if not raw_name and not raw_path:
+        return _create_refusal(
+            "invalid_name", "", "",
+            "请提供 name（新工作区名称）或 path（完整目标路径），两者至少给一个。")
+
+    if raw_path:
+        target = _ws_norm(raw_path)
+        if not target:
+            return _create_refusal("invalid_path", raw_path, "", f"目标路径无效: {raw_path!r}")
+        base_name = os.path.basename(target)
+    else:
+        name_reason = _invalid_workspace_name_reason(raw_name)
+        if name_reason:
+            return _create_refusal("invalid_name", "", "", name_reason)
+        root = _create_workspace_root(args.get("root"))
+        if not root:
+            return _create_refusal("invalid_path", "", "",
+                                   "无法解析新建工作区的父目录，请显式传 root 或 path。")
+        target = os.path.join(root, raw_name)
+        base_name = raw_name
+
+    name_reason = _invalid_workspace_name_reason(base_name)
+    if name_reason:
+        return _create_refusal("invalid_name", target, "", name_reason)
+    if library:
+        lib_reason = _invalid_workspace_name_reason(library)
+        if lib_reason:
+            return _create_refusal("invalid_name", target, "", f"库名非法：{lib_reason}")
+    if os.path.exists(target):
+        return _create_refusal(
+            "exists", target, "",
+            f"目标已存在，不会覆盖或删除: {target}。可换一个名称/路径，"
+            f"或直接用 open_workspace 打开它。")
+    if not callable(getattr(de, "create_workspace", None)):
+        return _create_refusal(
+            "sdk_unsupported", target, "",
+            "当前 ADS 版本没有 de.create_workspace 接口，无法由会话新建工作区；"
+            "请改用 open_workspace 打开已有工作区，或在 ADS 中手动新建。")
+
+    # 拒绝路径必须先于任何磁盘写：exists / sdk_unsupported / needs_force
+    # 全部判完，确定要建之后才 makedirs，保证“拒绝 = 零磁盘副作用”。
+    previous = _current_workspace_path(de)
+    if _workspace_is_open(de) and previous and not _ws_same_path(previous, target) and not force:
+        return _create_refusal(
+            "needs_force", target, previous,
+            f"当前已打开工作区 {previous}；新建并切换到 {target} 可能丢弃未保存修改。"
+            f"请先向用户确认，确认后再传 force=true 重试。")
+
+    parent = os.path.dirname(target)
+    if parent and not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return _create_refusal(
+                "invalid_path", target, previous,
+                f"父目录无法创建: {parent}（{type(e).__name__}: {e}）")
+
+    try:
+        de.create_workspace(target)
+    except Exception as e:  # noqa: BLE001 — SDK 的失败类型不稳定，统一转结构化拒绝
+        if os.path.exists(target):
+            return _create_refusal(
+                "exists", target, previous,
+                f"目标已存在，不会覆盖或删除: {target}。")
+        return _create_refusal(
+            "invalid_path", target, previous,
+            f"创建失败: {target}（{type(e).__name__}: {e}）")
+    if not os.path.isdir(target):
+        return _create_refusal(
+            "invalid_path", target, previous,
+            f"SDK 返回成功但目标目录不存在: {target}")
+
+    library_created = ""
+    if library:
+        maker = getattr(de, "create_new_library", None)
+        if not callable(maker):
+            notes.append("当前 ADS 没有 de.create_new_library，库未创建")
+        else:
+            try:
+                maker(library, target)
+                library_created = library
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"库 {library} 创建失败: {type(e).__name__}: {e}")
+
+    workspace_open = False
+    if open_flag:
+        try:
+            opened = _call_de_open(de, target, force)
+            got = _ws_norm(getattr(opened, "path", "") or target)
+            _remember_workspace(got)
+            workspace_open = True
+        except Exception as e:  # noqa: BLE001 — 建成功但没打开，必须如实报告
+            notes.append(f"工作区已创建，但自动打开失败: {type(e).__name__}: {e}；"
+                         f"可稍后调用 open_workspace({target!r}) 重试")
+    if not open_flag and previous:
+        # workspace_open 只描述“目标工作区是否被打开”，别让模型误判成
+        # “当前没有工作区”—— 旧工作区还在，切不切换由调用方决定。
+        notes.append(f"目标工作区已创建但未打开；当前仍打开 {previous}。"
+                     f"workspace_open 只描述目标工作区，如需切换请先确认再调 open_workspace。")
+    info = get_workspace_info({}, ctx) if workspace_open else {"workspace_open": False}
+    force_closed = bool(previous and force and workspace_open
+                        and not _ws_same_path(previous, target))
+    return {
+        "created": True,
+        "name": base_name,
+        "path": target,
+        "workspace_open": bool(info.get("workspace_open")),
+        "libraries": list(info.get("libraries") or []),
+        "writable_libraries": list(info.get("writable_libraries") or []),
+        "library_created": library_created,
+        "previous_workspace": previous,
+        "force_closed": force_closed,
+        "notes": notes,
+    }
 
 
 # run_python 环境里有个同名助手（见 install_env_helpers）；它通过这个别名
@@ -7232,6 +7976,41 @@ def install_env_helpers(env: dict) -> None:
             print("[workspace] 该工作区原本就处于打开状态")
         return ws()
 
+    def mkws(name, root=None, library=None):
+        """新建并打开工作区：mkws("Demo") / mkws("Demo", root=r"D:/ws")。
+
+        这是聊天里“新建工作区”的推荐入口，不要用 os.makedirs 手工造目录；
+        成功后打印 path / libraries，失败按 reason 打印原因。
+        """
+        args = {"name": name, "open": True}
+        if root:
+            args["root"] = root
+        if library:
+            args["library"] = library
+        res = create_workspace(args)
+        if not res.get("created"):
+            print(f"[workspace] 新建失败({res.get('reason')}): {res.get('message')}")
+            return res
+        print(f"[workspace] created: {res.get('path')}")
+        print(f"[workspace] libraries: {res.get('libraries')}")
+        if not res.get("workspace_open"):
+            print("[workspace] 已创建但未打开："
+                  + "；".join(res.get("notes") or ["未知原因"]))
+        return res
+
+    def lsws(query=None):
+        """有界列出已有工作区：lsws() / lsws("Demo")。不做全盘扫描。"""
+        res = list_workspaces({"query": query} if query else {})
+        for it in res.get("workspaces") or []:
+            mark = "" if it.get("valid") else "  [无效]"
+            print(f"[workspace] {it.get('name')}  {it.get('path')}{mark}")
+        if not res.get("workspaces"):
+            print("[workspace] 未找到工作区；可用 mkws(name) 新建，"
+                  "或 lsws() 查看已扫描的根目录")
+        if res.get("truncated"):
+            print(f"[workspace] 结果已截断，实际检查 {res.get('scanned')} 个目录")
+        return res
+
     def ls(obj=None, only_callable: bool = False, limit: int = 80):
         """不传参 -> 环境速览（工作区/库）；传对象 -> 列出成员名。"""
         if obj is None:
@@ -7484,6 +8263,7 @@ def install_env_helpers(env: dict) -> None:
         pass
 
     env.update({"ws": ws, "open_workspace": open_workspace, "ls": ls, "sig": sig, "dm": dm,
+                "mkws": mkws, "lsws": lsws,
                 "odesign": odesign,
                 "put": put, "wire": wire, "save": save, "pins": pins,
                 "connect": connect, "libs": libs, "cells": cells,
@@ -8116,6 +8896,8 @@ def _model_dep_plan(design, netlist_text, ws, library: str) -> dict:
 DISPATCH = {
     "get_workspace_info": get_workspace_info,
     "open_workspace": open_workspace,
+    "create_workspace": create_workspace,
+    "list_workspaces": list_workspaces,
     "list_designs": list_designs,
     "get_design_variables": get_design_variables,
     "set_design_variables": set_design_variables,

@@ -1,5 +1,68 @@
 # 更新记录
 
+## 1.3.6 — 2026-11-04（对话式新建/打开工作区 + 顶栏更新入口改版 + 上下文用量环）
+
+- **对话内新建工作区（`create_workspace`）**：用户说一句「新建一个叫 X 的
+  工作区」即可创建目录、按需建首个库并打开，失败返回 `created=false` 与
+  `reason`（exists / invalid_name / invalid_path / needs_force / sdk_unsupported），
+  已存在目录**绝不覆盖**，拒绝路径零磁盘副作用。
+- **工作区发现（`list_workspaces`）**：按名称/路径片段过滤，只扫已知根目录的
+  1–2 层（单根上限、总预算 3s，超限 `truncated=true`），禁止 `os.walk` 全盘；
+  已知名字但没给完整路径时先列候选给用户选，模型不得自行挑一个。
+- **打开与切换闸门（`open_workspace` 增强）**：path 支持完整目录/父目录/名称
+  片段；多候选返回 `ambiguous`+candidates，零命中 `not_found`，缺 `lib.defs`
+  为 `invalid_path`，当前已有其它工作区且未确认时返回 `needs_force`；
+  切换会丢弃未保存修改，用户确认后才传 `force=true`。
+- **最近工作区记录**：数据根目录新增 `recent_workspaces.json`（原子写、去重、
+  上限 20），同时继续写 `last_workspace.txt` 保持旧入口兼容。
+- **提示词与文档**：SYSTEM_PROMPT 新增「工作区：新建与打开」规则并改写旧口径
+  （「请在 ADS 中手动打开 Workspace」不再是首选建议）；README 增加
+  「用对话创建工作区」小节；新增
+  [工作区创建与打开使用说明](docs/工作区创建与打开_使用说明_2026-11-04.md)；
+  兼容性矩阵补齐 `list_workspaces` / `create_workspace` 行与 `open_workspace`
+  的 `force` 语义；两个新工具已登记能力门禁（capability / adscompat）。
+- **顶栏更新入口改版（行为变更，用户反馈两轮修订）**：更新入口改为常驻——
+  平时是与「ADS Agent」品牌字同色的**黑色扁平文字**，显示当前版本号 `v1.3.5`
+  （透明背景、跟随深浅主题，不再常绿也不隐藏）；**只有检测到 GitHub 有新版本**
+  才切换为**绿色圆角胶囊**「一键更新 vX.Y.Z」（四周带弧形）。
+- **点击语义分层**：有可用更新＝下载 → SHA-256 校验 → 覆盖安装 → 重启后端
+  （沿用 1.3.5 链路）；没有可用更新（初始 / 已是最新 / 检查失败）＝立即
+  **重新检查**，不再是「点了没反应」的死按钮；下载期间禁用 +「正在下载更新…」。
+- **品牌字常驻 + 布局锁宽**：`ADS Agent` 标题在任何面板宽度都可见（空间不足时
+  省略号为 `AD…`，不再消失）；更新键最小宽度锁定 `sizeHint`，任何状态下
+  更新键与「模型设置」都不被裁字；窄面板（<400px）设置键临时收窄 8px、绿色
+  胶囊只显示新版本号（如 `v1.4.0`，完整说明在 tooltip）。
+- **prepare 复检自动复位**：点了「一键更新」后端复检发现其实已是最新时
+  （`update_service._prepare_locked` 会重新 `_check`），按钮自动复位成当前
+  版本并可点，不再永久卡在「正在下载更新…」。
+- **状态与异常**：已是最新时优先显示检查结果的 `current_version`，更新完成后
+  显示 `applied_version`；tooltip 与 `setAccessibleName` 同步；取不到本地版本号
+  文案回退「检查更新」（不硬编码版本号）；新逻辑一律 never-raise。
+- **流式 usage 真正到手**：所有流式请求带 `stream_options.include_usage`
+  （网关回 400 时自动去掉重试，绝不让整轮对话因此失败）；流内分块到达的
+  `usage` 由「整体替换」改为**逐键 + 嵌套 details 合并**，DeepSeek 与
+  OpenAI/GLM/StepFun 形状都能拿到 `prompt_tokens_details.cached_tokens` 等字段。
+- **缓存用量规范化**：`backend/model_context.py` 新增 `normalize_reported()`
+  （兼容 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` /
+  `prompt_tokens_details.cached_tokens`，脏数据一律 None、绝不抛异常）、
+  `usage()` 增补 `total_tokens/cache_hit_tokens/cache_miss_tokens/
+  reasoning_tokens/cache_hit_rate`（估算路径全为 None，不用 0 冒充）、
+  `add_usage()` 纯函数会话累加器。
+- **用量环详情浮层**：用量环主环语义不变（80%/95% 才变色），点击/悬浮/聚焦
+  打开详情浮层——分组显示「上下文 / 本回合（输入·输出·缓存命中及命中率·
+  未命中·推理）/ 本次会话（请求次数·缓存命中率）」，缺失字段整段省略，
+  估算值带 `≈`；每轮统计行在 `hit+miss>0` 时追加「缓存命中 62%」。
+- **测试**：test_workspace_create 9、test_workspace_discovery 12、
+  test_workspace_tools 12、test_workspace_e2e 8、test_usage_capture 5、
+  test_model_context_cache 15、test_context_usage_flow 11、
+  test_context_usage_ui 8、test_update_ui 31、test_update_top_btn_version 12
+  （新增）、test_ui_navigation 38 全部通过；全量 `run_tests.py` 81 文件
+  79 通过 / 2 失败（test_sim_provenance / test_model_attachments，均为既有
+  历史问题，与本次改动无关）。
+- 口径与记录：[工作区接口契约](docs/工作区对话式创建与打开_接口契约_2026-11-04.md)、
+  [顶栏按键契约](docs/顶栏绿色按键显示当前版本_接口契约_2026-11-04.md)、
+  [context-usage-spec](docs/context-usage-spec.md)；
+  详见 [docs/releases/1.3.6.md](docs/releases/1.3.6.md)。
 ## 1.3.5 — 2026-11-03（一键更新按钮 + 崩溃静默自动上传）
 
 - **顶栏一键更新**：GitHub 有新版本时，面板标题行出现亮绿色「一键更新 v?」

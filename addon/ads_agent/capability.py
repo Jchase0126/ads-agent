@@ -56,6 +56,9 @@ def _probe_de() -> dict:
         ("workspace_is_open", "de_workspace_is_open"),
         ("active_workspace", "de_active_workspace"),
         ("open_workspace", "de_open_workspace"),
+        # 对话式新建工作区依赖 SDK 创建接口；老版本没有它时 create_workspace
+        # 应当被门禁挡在工具列表外，而不是让模型反复撞运行时错误。
+        ("create_workspace", "de_create_workspace"),
     ):
         out[key] = ((SUPPORTED, "") if callable(getattr(de, attr, None))
                     else (UNAVAILABLE, f"keysight.ads.de 缺少 {attr}"))
@@ -234,6 +237,11 @@ def detect() -> dict:
 TOOL_REQUIREMENTS = {
     "get_workspace_info": ("de_module", "de_workspace_is_open", "de_active_workspace"),
     "open_workspace": ("de_module", "de_open_workspace", "de_active_workspace"),
+    # 对话式工作区：list_workspaces 只做有界目录探测（de.directory_is_workspace
+    # 缺失时退化为看 lib.defs），不要求工作区已打开；create_workspace 依赖 SDK
+    # 是否提供创建接口（缺失时被门禁挡下，工具自身也返回 reason=sdk_unsupported）。
+    "list_workspaces": ("de_module",),
+    "create_workspace": ("de_module", "de_create_workspace"),
     "list_designs": ("de_module", "de_active_workspace"),
     "get_design_variables": ("de_module", "de_active_workspace", "design_mode_enum"),
     "set_design_variables": ("de_module", "de_active_workspace", "design_mode_enum"),

@@ -30,6 +30,7 @@ class _FakeDe:
         self.is_open = False
         self.ws_obj = None
         self.opened_paths = []
+        self.opened_forces = []
 
     def workspace_is_open(self):
         return self.is_open
@@ -37,8 +38,9 @@ class _FakeDe:
     def active_workspace(self):
         return self.ws_obj
 
-    def open_workspace(self, path):
+    def open_workspace(self, path, force=False):
         self.opened_paths.append(path)
+        self.opened_forces.append(force)
         self.ws_obj = _FakeWS(path)
         self.is_open = True
         return self.ws_obj
@@ -126,6 +128,8 @@ def test_open_workspace_idempotent_when_same_path_already_open():
             again = ads_ops.open_workspace({})
         eq(again.get("already_open"), True, "同路径重复打开返回 already_open")
         eq(len(fake.opened_paths), 1, "没有重复调用底层 open_workspace")
+        eq(fake.opened_forces, [False],
+           "already_open 分支不对已打开工作区传 force=True（避免误丢未保存修改）")
     finally:
         env.close()
 

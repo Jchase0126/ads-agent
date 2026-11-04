@@ -354,61 +354,541 @@ def _draw_icon(name: str, color: str, size: int = 16):
     return QIcon(pm)
 
 
+_SOURCE_NAMES = {"official": "官方文档", "configured": "此模型的手动设置",
+                 "unknown": "未确认"}
+# 契约 docs/context-usage-spec.md §4：能到面板的 token 字段一律先按
+# 「int 且非 bool 且 >= 0」校验 —— 非法值置 None，绝不用 0 冒充缺失。
+_USAGE_TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens",
+                       "cache_hit_tokens", "cache_miss_tokens", "cached_tokens",
+                       "reasoning_tokens")
+_TURN_TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "cache_hit_tokens",
+                      "cache_miss_tokens", "reasoning_tokens")
+_SESSION_TOKEN_FIELDS = _TURN_TOKEN_FIELDS + ("total_tokens",)
+
+
+def _usage_int(value):
+    """契约口径：int 且非 bool 且 >= 0；其余一律 None（不伪造 0）。"""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _usage_rate(value):
+    """缓存命中率 0.0~1.0；bool / 越界 / 非数字一律 None。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return rate if 0.0 <= rate <= 1.0 else None
+
+
+def _usage_seconds(value):
+    """turn.llm_seconds：非负 float；非法 → None。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _usage_hit_rate(hit, miss):
+    """命中率只由两个有效计数推导；任一缺失 → None（不猜）。"""
+    hit, miss = _usage_int(hit), _usage_int(miss)
+    if hit is None or miss is None or hit + miss <= 0:
+        return None
+    return hit / (hit + miss)
+
+
+def _usage_percent(rate, digits=1):
+    """0.0~1.0 → 『75%』/『73.9%』；接近整数时不带小数点。"""
+    pct = max(0.0, min(1.0, rate)) * 100
+    if abs(pct - round(pct)) < 0.05:
+        return f"{round(pct)}%"
+    return f"{pct:.{digits}f}%"
+
+
+def _normalize_usage_turn(turn):
+    """逐字段校验后端 turn 字典：非 dict → None，非法字段 → None。"""
+    if not isinstance(turn, dict):
+        return None
+    normalized = {field: _usage_int(turn.get(field)) for field in _SESSION_TOKEN_FIELDS}
+    normalized["requests"] = _usage_int(turn.get("requests"))
+    normalized["measured_requests"] = _usage_int(turn.get("measured_requests"))
+    normalized["llm_seconds"] = _usage_seconds(turn.get("llm_seconds"))
+    return normalized
+
+
+def _session_add(total, reported):
+    """旧后端没有 model_context.add_usage 时的本地累加（与契约 1.3 同口径）。"""
+    previous = total if isinstance(total, dict) else {}
+    reported = reported if isinstance(reported, dict) else {}
+    measured = (_usage_int(reported.get("prompt_tokens")) is not None
+                and _usage_int(reported.get("completion_tokens")) is not None)
+    result = {
+        "requests": (_usage_int(previous.get("requests")) or 0) + 1,
+        "measured_requests": (_usage_int(previous.get("measured_requests")) or 0)
+        + (1 if measured else 0),
+    }
+    result["estimated_requests"] = result["requests"] - result["measured_requests"]
+    for field in _SESSION_TOKEN_FIELDS:
+        base = _usage_int(previous.get(field)) or 0
+        value = _usage_int(reported.get(field))
+        if field == "total_tokens" and value is None:
+            prompt = _usage_int(reported.get("prompt_tokens"))
+            completion = _usage_int(reported.get("completion_tokens"))
+            value = prompt + completion if prompt is not None and completion is not None else None
+        result[field] = base + (value or 0)
+    result["cache_hit_rate"] = _usage_hit_rate(result["cache_hit_tokens"],
+                                               result["cache_miss_tokens"])
+    return result
+
+
+def _usage_normalize_event(panel_obj, model_usage, ev, project, model):
+    """契约 §4.1：校验实测字段并累计「本次会话」；老后端缺字段只置 None。
+
+    写成模块级函数（而不是面板方法），这样测试里的最小面板替身也能直接复用
+    真实的 _on_event 逻辑，不必复制一份归一化代码。
+    """
+    normalized = dict(model_usage)
+    for field in _USAGE_TOKEN_FIELDS:
+        normalized[field] = _usage_int(ev.get(field, model_usage.get(field)))
+    normalized["cache_hit_rate"] = _usage_rate(
+        ev.get("cache_hit_rate", model_usage.get("cache_hit_rate")))
+    normalized["turn"] = _normalize_usage_turn(ev.get("turn", model_usage.get("turn")))
+    phase = ev.get("phase")
+    normalized["phase"] = phase if isinstance(phase, str) else ""
+    previous = getattr(panel_obj, "_context_usage", {}).get((project, model)) or {}
+    session = previous.get("session") if isinstance(previous.get("session"), dict) else None
+    if (normalized["phase"] == "response"
+            and model_usage.get("basis") == "provider_usage"
+            and not model_usage.get("estimated")):
+        reported = {field: normalized.get(field) for field in _USAGE_TOKEN_FIELDS}
+        reported["cache_hit_rate"] = normalized.get("cache_hit_rate")
+        normalized["session"] = _usage_accumulate_session(session, reported)
+    elif isinstance(session, dict):
+        normalized["session"] = session      # request/streaming 阶段不重置累计
+    return normalized
+
+
+def _usage_accumulate_session(session, reported):
+    """契约 §4.2：面板侧「本次会话」累计；优先用后端 model_context.add_usage。"""
+    try:
+        import pathbridge
+        accounting = pathbridge.load_backend_module("model_context.py",
+                                                    "ads_agent_model_context")
+        add_usage = getattr(accounting, "add_usage", None)
+        if callable(add_usage):
+            result = add_usage(session, reported)
+            if isinstance(result, dict):
+                return result
+    except Exception:  # noqa: BLE001 — 累加失败不能拖垮整轮对话
+        pass
+    return _session_add(session, reported)
+
+
+class _CacheHitBar(QWidget):
+    """详情浮层里的缓存命中色条；与上下文占用主环无关，不会被误读成占用。"""
+
+    def __init__(self, pal=None, parent=None):
+        super().__init__(parent)
+        self._rate = None
+        self._pal = pal or PALETTES["light"]
+        self.setFixedHeight(U.px(4))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def set_rate(self, rate, pal=None):
+        self._rate = rate if rate is not None else None
+        if pal:
+            self._pal = pal
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        rect = QtCore.QRectF(self.rect())
+        radius = max(1.0, rect.height() / 2)
+        painter.setBrush(QtGui.QColor(self._pal["input_border"]))
+        painter.drawRoundedRect(rect, radius, radius)
+        if self._rate is not None and self._rate > 0:
+            width = max(radius * 2, rect.width() * min(1.0, self._rate))
+            filled = QtCore.QRectF(rect.left(), rect.top(), width, rect.height())
+            painter.setBrush(QtGui.QColor(self._pal["accent"]))
+            painter.drawRoundedRect(filled, radius, radius)
+        painter.end()
+
+
+class ContextUsagePopup(QFrame):
+    """上下文用量详情浮层（不是超长 tooltip）：分组显示、贴屏幕边缘自动收敛。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setObjectName("contextUsagePopup")
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        # 不抢鼠标事件，也不抢焦点：浮层只是"看"，点击/键盘都留在面板里。
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._pal = PALETTES["light"]
+        self._groups = []
+        self._labels = []
+        self._bars = []
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(U.px(12), U.px(10), U.px(12), U.px(10))
+        self._layout.setSpacing(U.px(4))
+        self._apply_style()
+
+    def _apply_style(self):
+        pal = self._pal
+        self.setStyleSheet(
+            f"QFrame#contextUsagePopup{{background:{pal['input_bg']};color:{pal['text']};"
+            f"border:1px solid {pal['input_border']};border-radius:{U.R('md')}px;}}"
+            f"QFrame#contextUsagePopup QLabel{{background:transparent;border:none;"
+            f"color:{pal['text']};{U.font_css()}}}")
+
+    def set_palette(self, pal):
+        if pal:
+            self._pal = pal
+            self._apply_style()
+            self._render()
+            self.adjustSize()
+
+    def set_groups(self, groups):
+        self._groups = list(groups or [])
+        self._render()
+        self.adjustSize()
+
+    def text(self):
+        """纯文本（测试与无障碍读取用）。"""
+        lines = []
+        for group in self._groups:
+            lines.append(str(group.get("title") or ""))
+            lines.extend(group.get("lines") or [])
+            lines.extend(group.get("notes") or [])
+        return "\n".join(line for line in lines if line)
+
+    def _clear(self):
+        for widget in self._labels + self._bars:
+            widget.setParent(None)
+            widget.deleteLater()
+        self._labels = []
+        self._bars = []
+
+    def _render(self):
+        self._clear()
+        for group in self._groups:
+            title = QLabel(str(group.get("title") or ""))
+            title.setFont(U.qfont("micro", bold=True))
+            title.setStyleSheet(f"color:{self._pal['accent']};border:none;")
+            self._layout.addWidget(title)
+            self._labels.append(title)
+            for line in group.get("lines") or []:
+                label = QLabel(str(line))
+                label.setFont(U.qfont("small"))
+                label.setWordWrap(False)
+                self._layout.addWidget(label)
+                self._labels.append(label)
+            if group.get("bar") is not None:
+                bar = _CacheHitBar(self._pal)
+                bar.set_rate(group["bar"], self._pal)
+                self._layout.addWidget(bar)
+                self._bars.append(bar)
+            for note in group.get("notes") or []:
+                label = QLabel(str(note))
+                label.setFont(U.qfont("micro"))
+                label.setStyleSheet(f"color:{self._pal['subtle']};border:none;")
+                label.setWordWrap(False)
+                self._layout.addWidget(label)
+                self._labels.append(label)
+
+    def show_at(self, anchor):
+        """贴在锚点上方显示；屏幕边缘（含多显示器）自动收敛回可视区。"""
+        self.adjustSize()
+        center = anchor.mapToGlobal(QPoint(anchor.width() // 2, 0))
+        screen = (QtWidgets.QApplication.screenAt(center)
+                  or QtWidgets.QApplication.primaryScreen())
+        area = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 800)
+        width, height = self.width(), self.height()
+        margin = U.px(4)
+        x = center.x() - width // 2
+        y = center.y() - height - U.px(6)
+        if y < area.top() + margin:
+            y = anchor.mapToGlobal(QPoint(0, anchor.height())).y() + U.px(6)
+        x = max(area.left() + margin, min(x, area.right() - width - margin))
+        y = max(area.top() + margin, min(y, area.bottom() - height - margin))
+        self.move(x, y)
+        self.show()
+        self.raise_()
+
+
 class ContextUsageIndicator(QToolButton):
-    """小型静态用量环；悬浮或键盘聚焦显示上下文统计。"""
+    """32px 上下文用量环：弧长 = 上下文占用；点击/悬浮/聚焦打开详情浮层。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._usage = None
         self._pal = PALETTES["light"]
+        self._popup = None
         self.setFixedSize(U.px(32), U.px(32))
         self.setAutoRaise(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.clicked.connect(self._show_details)
+        self.setAccessibleName("上下文用量")
+        # 悬浮 250ms 后弹详情浮层；点击 / Enter 立即开关；失焦或移出立刻收起。
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(250)
+        self._hover_timer.timeout.connect(self._show_popup)
+        self.clicked.connect(self._toggle_popup)
         self.set_usage(None)
 
+    # ------------------------------------------------------------- 文案
     def set_usage(self, usage):
-        self._usage = usage
-        tip = "上下文字符预算未启用"
-        if usage and usage.get("unit") == "tokens":
-            used, limit = usage["used"], usage.get("max")
-            model = usage.get("model") or "当前模型"
-            prefix = "约 " if usage.get("estimated") else ""
-            tip = (f"{model}\n{prefix}{used / limit:.1%} · {used:,} / {limit:,} tokens"
-                   if limit else f"{model}\n{prefix}{used:,} tokens · 模型容量未知")
-            tip += ("\n本地估算：不是模型分词器的精确计数" if usage.get("estimated")
-                    else "\n接口实测：最近一次请求的输入 + 输出（非累计计费）")
-            if usage.get("basis") == "local_history":
-                tip += "\n尚未包含后端系统提示和完整工具结果"
-            if usage.get("prompt_tokens") is not None:
-                tip += f"\n输入：{usage['prompt_tokens']:,} tokens"
-            if usage.get("completion_tokens") is not None:
-                tip += f" · 输出：{usage['completion_tokens']:,} tokens"
-            source = {"official": "官方文档", "configured": "此模型的手动设置", "unknown": "未确认"}
-            tip += f"\n容量来源：{source.get(usage.get('source'), '未确认')}"
-            budget = usage.get("character_budget")
-            if budget:
-                tip += f"\n本地历史裁剪预算：{budget:,} 字符（独立设置）"
-            tip += "\n切换模型共用当前聊天历史，用量与容量按模型分别计算"
-            if limit and used >= limit * .95:
-                tip += "\n接近模型容量，建议清理历史或切换容量更大的模型"
-        elif usage:
-            used, limit = usage["used"], usage["max"]
-            tip = (f"{used / limit:.1%} · {used:,} / {limit:,} 字符\n"
-                   "当前上下文及生成正文 · 字符预算（非模型 token 上限）")
-            if usage.get("estimated"):
-                tip += "\n本地估算：历史、草稿和生成正文；不含后端系统提示及完整工具结果"
-            tokens = usage.get("prompt_tokens")
-            if tokens is not None:
-                tip += f"\n接口报告输入：{tokens:,} tokens"
-            if usage.get("completion_tokens") is not None:
-                tip += f" · 输出：{usage['completion_tokens']:,} tokens"
+        self._usage = usage if isinstance(usage, dict) else None
+        tip = self._tooltip_text()
         self.setToolTip(tip)
-        self.setAccessibleName("上下文用量")
         self.setAccessibleDescription(tip)
+        if self._popup is not None and self._popup.isVisible():
+            self._show_popup()      # 浮层开着时实况刷新，不用重新点一次
         self.update()
 
+    def _tooltip_text(self):
+        usage = self._usage
+        if not usage:
+            return "上下文字符预算未启用"
+        if usage.get("unit") == "tokens":
+            return self._tokens_tooltip(usage)
+        return self._chars_tooltip(usage)
+
+    def _tokens_tooltip(self, usage):
+        """短版（详情浮层才是全文）：模型 / 上下文 / 本回合 / 会话 / 容量来源。"""
+        used = _usage_int(usage.get("used"))
+        limit = _usage_int(usage.get("max"))
+        model = usage.get("model") or "当前模型"
+        approx = "≈" if usage.get("estimated") else ""
+        if limit and used is not None:
+            lines = [model, f"{approx}{used / limit:.1%} · {used:,} / {limit:,} tokens"]
+        else:
+            lines = [model, f"{approx}{(used or 0):,} tokens · 模型容量未知"]
+        turn = self._turn_summary(usage)
+        if turn:
+            lines.append("本回合 " + " · ".join(turn))
+        session = usage.get("session")
+        if isinstance(session, dict):
+            parts = []
+            requests = _usage_int(session.get("requests"))
+            if requests is not None:
+                parts.append(f"{requests} 次请求")
+            rate = _usage_rate(session.get("cache_hit_rate"))
+            if rate is None:
+                rate = _usage_hit_rate(session.get("cache_hit_tokens"),
+                                       session.get("cache_miss_tokens"))
+            if rate is not None:
+                parts.append(f"缓存命中率 {_usage_percent(rate)}")
+            if parts:
+                lines.append("本次会话 " + " · ".join(parts))
+        lines.append(f"容量来源：{_SOURCE_NAMES.get(usage.get('source'), '未确认')}")
+        if usage.get("estimated"):
+            lines.append("本地估算：不是模型分词器的精确计数")
+        if usage.get("basis") == "local_history":
+            lines.append("未含后端系统提示和完整工具结果")
+        lines.append("点击查看详情")
+        return "\n".join(lines)
+
+    def _chars_tooltip(self, usage):
+        """字符预算分支：保留原有文案（含 30 天内既有断言），只加详情入口。"""
+        used = _usage_int(usage.get("used"))
+        limit = _usage_int(usage.get("max"))
+        if used is None or not limit:
+            return "上下文字符预算未启用"
+        lines = [f"{used / limit:.1%} · {used:,} / {limit:,} 字符",
+                 "当前上下文及生成正文 · 字符预算（非模型 token 上限）"]
+        if usage.get("estimated"):
+            lines.append("本地估算：历史、草稿和生成正文；不含后端系统提示及完整工具结果")
+        tokens = _usage_int(usage.get("prompt_tokens"))
+        if tokens is not None:
+            line = f"接口报告输入：{tokens:,} tokens"
+            completion = _usage_int(usage.get("completion_tokens"))
+            if completion is not None:
+                line += f" · 输出：{completion:,} tokens"
+            lines.append(line)
+        turn = self._turn_summary(usage)
+        if turn:
+            lines.append("本回合 " + " · ".join(turn))
+        lines.append("点击查看详情")
+        return "\n".join(lines)
+
+    def _turn_parts(self, source):
+        """从 turn 或顶层字段拼『输入 / 输出 / 缓存命中 / 未命中 / 推理』。"""
+        if not isinstance(source, dict):
+            return []
+        prompt = _usage_int(source.get("prompt_tokens"))
+        completion = _usage_int(source.get("completion_tokens"))
+        hit = _usage_int(source.get("cache_hit_tokens"))
+        miss = _usage_int(source.get("cache_miss_tokens"))
+        reasoning = _usage_int(source.get("reasoning_tokens"))
+        rate = _usage_rate(source.get("cache_hit_rate"))
+        if rate is None:
+            rate = _usage_hit_rate(hit, miss)
+        parts = []
+        if prompt is not None:
+            parts.append(f"输入 {prompt:,}")
+        if completion is not None:
+            parts.append(f"输出 {completion:,}")
+        if hit is not None:
+            label = f"缓存命中 {hit:,}"
+            if rate is not None:
+                label += f" ({_usage_percent(rate)})"
+            parts.append(label)
+        if miss is not None:
+            parts.append(f"未命中 {miss:,}")
+        if reasoning is not None:
+            parts.append(f"推理 {reasoning:,}")
+        return parts
+
+    def _turn_summary(self, usage):
+        turn = usage.get("turn")
+        if self._has_measured_turn(turn):
+            parts = self._turn_parts(turn)
+            if parts:
+                return parts
+        return self._turn_parts(usage)
+
+    @staticmethod
+    def _has_measured_turn(turn):
+        """turn 里至少有一个非零实测计数才算「本回合」有内容。
+
+        后端在 request/streaming 阶段会带一个全 0 的回合累计；把它渲染成
+        「输入 0 · 输出 0 …」只会让人以为真的没有用量，所以整段省略。
+        """
+        return isinstance(turn, dict) and any(
+            _usage_int(turn.get(field)) for field in _TURN_TOKEN_FIELDS)
+
+    # ------------------------------------------------------------- 详情浮层
+    def detail_groups(self):
+        """分组详情：上下文 / 本回合 / 本次会话；缺失字段整段省略。"""
+        usage = self._usage
+        if not usage:
+            return [{"title": "上下文", "lines": ["上下文字符预算未启用"]}]
+        groups = [self._context_group(usage)]
+        turn = usage.get("turn")
+        source = turn if self._has_measured_turn(turn) else usage
+        turn_parts = self._turn_parts(source)
+        if turn_parts:
+            group = {"title": "本回合", "lines": [" · ".join(turn_parts)]}
+            hit = _usage_int(source.get("cache_hit_tokens"))
+            miss = _usage_int(source.get("cache_miss_tokens"))
+            rate = _usage_rate(source.get("cache_hit_rate"))
+            if rate is None:
+                rate = _usage_hit_rate(hit, miss)
+            if rate is not None and hit is not None and miss is not None:
+                group["bar"] = rate
+                group["notes"] = [f"缓存命中率 {_usage_percent(rate)}（色条，不是上下文占用）"]
+            groups.append(group)
+        session = self._session_group(usage)
+        if session is not None:
+            groups.append(session)
+        return groups
+
+    def _context_group(self, usage):
+        used = _usage_int(usage.get("used"))
+        approx = "≈" if usage.get("estimated") else ""
+        notes = []
+        if usage.get("unit") == "tokens":
+            limit = _usage_int(usage.get("max"))
+            if used is None:
+                lines = ["本次请求尚无实测用量"]
+            elif limit:
+                lines = [f"{approx}{used / limit:.1%} · {used:,} / {limit:,} tokens"]
+            else:
+                lines = [f"{approx}{used:,} tokens · 模型容量未知"]
+            model = usage.get("model") or "当前模型"
+            lines.append(f"{model} · 容量来源：{_SOURCE_NAMES.get(usage.get('source'), '未确认')}")
+            if usage.get("estimated"):
+                notes.append("≈ 本地估算：不是模型分词器的精确计数")
+            if usage.get("basis") == "local_history":
+                notes.append("未含后端系统提示和完整工具结果")
+            budget = _usage_int(usage.get("character_budget"))
+            if budget:
+                notes.append(f"本地历史裁剪预算：{budget:,} 字符（独立设置）")
+            if limit and used is not None and used >= limit * .95:
+                notes.append("接近模型容量，建议清理历史或切换容量更大的模型")
+            return {"title": "上下文", "lines": lines, "notes": notes}
+        limit = _usage_int(usage.get("max"))
+        if used is not None and limit:
+            lines = [f"{approx}{used / limit:.1%} · {used:,} / {limit:,} 字符",
+                     "当前上下文及生成正文 · 字符预算（非模型 token 上限）"]
+        else:
+            lines = ["上下文字符预算未启用"]
+        if usage.get("estimated"):
+            notes.append("本地估算：历史、草稿及生成正文；不含后端系统提示及完整工具结果")
+        return {"title": "上下文", "lines": lines, "notes": notes}
+
+    def _session_group(self, usage):
+        """『本次会话』只统计接口实测（重启面板清零），不落盘。"""
+        session = usage.get("session")
+        if not isinstance(session, dict):
+            return None
+        parts = []
+        requests = _usage_int(session.get("requests"))
+        if requests is not None:
+            parts.append(f"{requests} 次请求")
+        prompt = _usage_int(session.get("prompt_tokens"))
+        if prompt is not None:
+            parts.append(f"输入 {prompt:,}")
+        completion = _usage_int(session.get("completion_tokens"))
+        if completion is not None:
+            parts.append(f"输出 {completion:,}")
+        rate = _usage_rate(session.get("cache_hit_rate"))
+        if rate is None:
+            rate = _usage_hit_rate(session.get("cache_hit_tokens"),
+                                   session.get("cache_miss_tokens"))
+        if rate is not None:
+            parts.append(f"缓存命中率 {_usage_percent(rate)}")
+        if not parts:
+            return None
+        return {"title": "本次会话", "lines": [" · ".join(parts)],
+                "notes": ["仅统计接口实测；重启面板后清零"]}
+
+    def details_text(self):
+        """详情浮层的纯文本（测试与无障碍读取用）。"""
+        blocks = []
+        for group in self.detail_groups():
+            lines = ([group.get("title") or ""] + list(group.get("lines") or [])
+                     + list(group.get("notes") or []))
+            blocks.append("\n".join(line for line in lines if line))
+        return "\n\n".join(block for block in blocks if block)
+
+    def _popup_widget(self):
+        if self._popup is None:
+            self._popup = ContextUsagePopup(self)
+            self._popup.set_palette(self._pal)
+        return self._popup
+
+    def _show_popup(self):
+        self._hover_timer.stop()
+        popup = self._popup_widget()
+        popup.set_palette(self._pal)
+        popup.set_groups(self.detail_groups())
+        popup.show_at(self)
+
+    def _hide_popup(self):
+        self._hover_timer.stop()
+        if self._popup is not None:
+            self._popup.hide()
+
+    def _toggle_popup(self):
+        if self._popup is not None and self._popup.isVisible():
+            self._hide_popup()
+        else:
+            self._show_popup()
+
+    def _show_details(self):
+        self._show_popup()
+
+    # ------------------------------------------------------------- 交互
     def set_palette(self, pal):
         self._pal = pal
         self.setStyleSheet(
@@ -416,11 +896,43 @@ class ContextUsageIndicator(QToolButton):
             "background:transparent;padding:0;}"
             f"QToolButton:hover{{background:{pal['hover']};}}"
             f"QToolButton:focus{{border-color:{pal['accent']};}}")
+        if self._popup is not None:
+            self._popup.set_palette(pal)
         self.update()
 
-    def _show_details(self):
-        QtWidgets.QToolTip.showText(
-            self.mapToGlobal(QPoint(self.width() // 2, 0)), self.toolTip(), self)
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._hover_timer.start()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._hide_popup()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._show_popup()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._hide_popup()
+
+    def hideEvent(self, event):
+        self._hide_popup()
+        super().hideEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._toggle_popup()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def event(self, event):
+        # 悬浮时用详情浮层替代系统 tooltip；toolTip() 文本仍保留给无障碍与测试。
+        if event.type() == QtCore.QEvent.Type.ToolTip:
+            self._show_popup()
+            return True
+        return super().event(event)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -435,8 +947,11 @@ class ContextUsageIndicator(QToolButton):
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(rect)
-        if self._usage and self._usage.get("max"):
-            ratio = self._usage["used"] / self._usage["max"]
+        # 弧长只由 used/max 决定（缓存命中率画在浮层里，绝不混进主环）。
+        used = _usage_int(self._usage.get("used")) if self._usage else None
+        limit = _usage_int(self._usage.get("max")) if self._usage else None
+        if used is not None and limit:
+            ratio = used / limit
             color = ("#ef6464" if ratio >= .95 else
                      "#d99a32" if ratio >= .8 else self._pal["accent"])
             pen.setColor(QtGui.QColor(color))
@@ -794,6 +1309,15 @@ def _format_stats(stats: dict, reply_text: str) -> str:
         parts.append(f"{n / secs:.1f} Token/秒")
     if model:
         parts.append(model)
+    # 契约 §4.4：只有拿到两个有效计数（hit+miss>0）才追加缓存命中率，
+    # 缺失/非法一律不写，避免用 0% 或 None 冒充实测。
+    hit = _usage_int(stats.get("cache_hit_tokens"))
+    miss = _usage_int(stats.get("cache_miss_tokens"))
+    if hit is not None and miss is not None and hit + miss > 0:
+        parts.append(f"缓存命中 {_usage_percent(hit / (hit + miss))}")
+        calls = _usage_int(stats.get("requests"))
+        if calls is not None and calls > 1:
+            parts.append(f"{calls} 次调用")
     return " · ".join(parts)
 
 
@@ -1526,6 +2050,8 @@ class AgentPanelWidget(QWidget):
         # The host title bar owns closing; avoid duplicate hide controls here.
         top = QHBoxLayout()
         top.setSpacing(U.P("sm"))
+        self._top_row = top          # 窄面板（< 400）时由 _adapt_responsive 收紧间距
+        self._top_compact = None     # 当前顶栏是否处于窄宽紧凑态（避免每帧重设样式）
         self.side_btn = self._round_tool_button("☰", "展开/收起项目列表", checkable=True)
         self.side_btn.setChecked(True)
         self.side_btn.toggled.connect(self._on_side_toggle)
@@ -1541,26 +2067,28 @@ class AgentPanelWidget(QWidget):
         title_col.setContentsMargins(0, 0, 0, 0)
         title_col.setSpacing(0)
         self.title = QLabel("ADS Agent")
+        # 品牌标题是顶栏唯一可伸缩项：显式 min 宽 0 + 布局后省略号（_elide_title），
+        # 空间不足时先裁品牌字（显示 ADS Age…），绝不挤压右侧功能键/更新键。
+        self.title.setMinimumWidth(0)
+        self._title_full = "ADS Agent"
         self.subtitle = QLabel("射频设计智能助手")
         title_col.addWidget(self.title)
         title_col.addWidget(self.subtitle)
         top.addLayout(title_col, 1)
 
-        # 顶部「一键更新」亮绿按钮：只有检查到新版本时才出现（默认隐藏）。
-        self.update_top_btn = QPushButton("发现新版本")
+        # 顶部「一键更新」亮绿按钮：**常驻**——平时显示当前版本 ``vX.Y.Z``，
+        # 发现新版本才变成「一键更新 vX.Y.Z」（2026-11-04 需求：无更新也不再隐藏）。
+        self._update_latest_available = ""   # 最近一次检查是否有可用新版本
+        self._update_current_version = ""    # 最近一次检查数据里的 current_version（显示优先）
+        self._update_top_state = ""          # "" / checking / up_to_date / available / error
+        self._update_top_error = ""          # 最近一次检查失败原因摘要（只用于 tooltip）
+        self.update_top_btn = QPushButton("")
         self.update_top_btn.setObjectName("updateTopBtn")
-        self.update_top_btn.setAccessibleName("发现新版本：一键下载并自动更新")
-        self.update_top_btn.setToolTip("GitHub 上有新版本。点击后自动下载、校验并更新，随后自动重启后端。")
         self.update_top_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.update_top_btn.setStyleSheet(
-            f"QPushButton{{background:#22C55E;color:#ffffff;border:none;"
-            f"border-radius:{U.R('pill')}px;padding:{U.px(5)}px {U.px(14)}px;"
-            f"font-size:{U.fs('small')}px;font-weight:bold;}}"
-            f"QPushButton:hover{{background:#16A34A;}}"
-            f"QPushButton:disabled{{background:{'#9CA3AF'};}}")
-        self.update_top_btn.hide()
-        self.update_top_btn.clicked.connect(self._apply_update_now)
+        self._apply_update_btn_style()   # 默认扁平文字态；有新版本由 _show_top_update 切绿色胶囊
+        self.update_top_btn.clicked.connect(self._on_top_update_clicked)
         top.addWidget(self.update_top_btn)
+        self._show_top_update("")   # 初始即显示 v{V}（本地版本取不到则「检查更新」）
 
         self.theme_btn = self._round_tool_button("🌙", "深色 / 浅色主题")
         self.theme_btn.clicked.connect(self._toggle_theme)
@@ -2022,6 +2550,9 @@ class AgentPanelWidget(QWidget):
             self._update_checking = True
             if not silent:
                 self._update_state("checking", "")
+                # 按钮文案保持不变（仍是 v{V}），只把 tooltip/读屏提示补成「正在检查」。
+                self._update_top_state = "checking"
+                self._show_top_update("")
             worker = ConfigWorker(None, path="/updates/check", timeout=30)
             worker.result.connect(
                 lambda data, s=silent, cb=on_available: self._on_update_checked(data, s, cb))
@@ -2053,18 +2584,27 @@ class AgentPanelWidget(QWidget):
             if data.get("backend_old"):
                 # 后端缺 /updates 接口 = 升级前的旧进程还在跑：主动提出自动重启。
                 self._offer_backend_restart()
+                self._note_top_update_error(str(data.get("error") or "后端版本过旧，缺少更新检查接口"))
                 if not silent:
                     self._update_state("error", data.get("error", ""))
+                    self._show_top_update("")
                 return
             if "error" in data and "status" not in data:
+                self._note_top_update_error(str(data.get("error") or ""))
                 if not silent:
                     self._update_state("error", data.get("error", ""))
+                    self._show_top_update("")
                 return
             status = str(data.get("status") or "").strip()
             current = str(data.get("current_version") or "")
             latest = str(data.get("latest_version") or "")
             message = str(data.get("message") or "")
+            if current:
+                # 后端是版本权威：只用于显示，不回写任何配置。
+                self._update_current_version = current
             if status == "update_available":
+                self._update_top_state = "available"
+                self._update_latest_available = latest
                 self._update_state(status, message, current, latest)
                 self._show_top_update(latest)
                 if callable(on_available):
@@ -2076,28 +2616,191 @@ class AgentPanelWidget(QWidget):
                     except BaseException:  # noqa: BLE001
                         pass
             elif status == "up_to_date":
+                self._update_top_state = "up_to_date"
+                self._update_latest_available = ""
                 self._show_top_update("")
                 if not silent:
                     self._update_state(status, message, current, latest)
             else:
+                self._note_top_update_error(message or "检查更新失败")
                 if not silent:
                     self._update_state("error", message or "检查更新失败")
+                    self._show_top_update("")
         except BaseException:  # noqa: BLE001
             pass
 
-    def _show_top_update(self, latest: str):
-        """发现新版本时显示顶部绿色按钮；已是最新/检查失败时隐藏。never-raise。"""
+    def _note_top_update_error(self, reason: str):
+        """记录最近一次失败原因，供顶栏按钮 tooltip 摘要（只显示，别的什么都不做）。never-raise。"""
+        try:
+            self._update_top_state = "error"
+            self._update_latest_available = ""
+            self._update_top_error = str(reason or "").strip()
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _apply_update_btn_style(self, green: bool | None = None, compact: bool | None = None):
+        """顶栏更新键的双态样式（2026-11-04 用户反馈）：
+
+        - **默认（green=False）扁平文字态**：透明背景、无边框，文字色跟随面板主题
+          （浅色=近黑，深色=浅白），与左侧「ADS Agent」品牌字观感一致；悬停只有一层
+          极淡的灰色底，提示可点。
+        - **green=True（检测到 GitHub 有新版本）绿色胶囊态**：#22C55E 圆角胶囊
+          （border-radius=pill，四周带弧形），白字加粗。
+
+        ``compact`` 只收窄水平内边距（面板最窄 330 时省宽度），不影响颜色与圆角。
+        参数缺省时沿用上一次的状态（``_update_btn_green`` / ``_top_compact``）。
+        never-raise。"""
+        try:
+            if green is None:
+                green = bool(getattr(self, "_update_btn_green", False))
+            if compact is None:
+                compact = bool(getattr(self, "_top_compact", False))
+            self._update_btn_green = bool(green)
+            self._top_compact = bool(compact)
+            pad_x = U.px(8) if compact else U.px(14)
+            radius = U.R('pill')
+            if green:
+                self.update_top_btn.setStyleSheet(
+                    f"QPushButton{{background:#22C55E;color:#ffffff;border:none;"
+                    f"border-radius:{radius}px;padding:{U.px(5)}px {pad_x}px;"
+                    f"font-size:{U.fs('small')}px;font-weight:bold;}}"
+                    f"QPushButton:hover{{background:#16A34A;}}"
+                    f"QPushButton:disabled{{background:{'#9CA3AF'};}}")
+            else:
+                # 扁平文字态：不设固定色，用 palette(window-text) 跟随深浅主题，
+                # 观感与品牌标题「ADS Agent」一致；按钮本身仍是可点的「检查更新」入口。
+                self.update_top_btn.setStyleSheet(
+                    f"QPushButton{{background:transparent;color:palette(window-text);border:none;"
+                    f"border-radius:{U.R('sm')}px;padding:{U.px(5)}px {pad_x}px;"
+                    f"font-size:{U.fs('small')}px;font-weight:normal;}}"
+                    f"QPushButton:hover{{background:rgba(128,128,128,0.18);}}"
+                    f"QPushButton:disabled{{color:#9CA3AF;background:transparent;}}")
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _elide_title(self):
+        """品牌标题按实际宽度做省略号（``ADS Age…``），空间恢复后还原全文。
+        只裁品牌字，绝不挤压右侧功能键。never-raise。"""
+        try:
+            lbl = getattr(self, "title", None)
+            if lbl is None:
+                return
+            full = str(getattr(self, "_title_full", "") or lbl.text() or "").strip()
+            if full:
+                self._title_full = full
+            fm = lbl.fontMetrics()
+            width = max(0, int(lbl.width()))
+            if width <= 0 or fm.horizontalAdvance(full) <= width:
+                if lbl.text() != full:
+                    lbl.setText(full)
+                    # 文字还原后 sizeHint 变了，布局会重排，再核一遍是否需要省略
+                    QTimer.singleShot(0, self._elide_title)
+                return
+            elided = fm.elidedText(full, Qt.TextElideMode.ElideRight, width)
+            if elided != lbl.text():
+                lbl.setText(elided)
+                # 省略后标题变窄，布局回收空间，可能反过来又放得下更多字 —— 再核一遍
+                QTimer.singleShot(0, self._elide_title)
+        except BaseException:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _v_label(version) -> str:
+        """版本号统一成 ``vX.Y.Z``：自带 v 前缀不重复加，空值返回 ""。never-raise。"""
+        try:
+            text = str(version or "").strip()
+            if text[:1] in ("v", "V"):
+                text = text[1:].strip()
+            return ("v" + text) if text else ""
+        except BaseException:  # noqa: BLE001
+            return ""
+
+    def _local_plugin_version(self) -> str:
+        """本地安装版本，唯一来源是 ``pathbridge.load().PLUGIN_VERSION``（禁止 hardcode）。never-raise。"""
+        try:
+            import pathbridge
+
+            return str(getattr(pathbridge.load(), "PLUGIN_VERSION", "") or "").strip()
+        except BaseException:  # noqa: BLE001
+            return ""
+
+    def _top_btn_current_version(self) -> str:
+        """顶栏要显示的当前版本：最近一次检查数据的 current_version 优先，其次本地版本。"""
+        try:
+            data_version = str(getattr(self, "_update_current_version", "") or "").strip()
+            return data_version or self._local_plugin_version()
+        except BaseException:  # noqa: BLE001
+            return ""
+
+    def _show_top_update(self, latest: str = ""):
+        """刷新顶栏绿色按钮：有新版本 → 「一键更新 vX」；否则**常驻**显示当前版本。绝不 hide。never-raise。"""
         try:
             btn = getattr(self, "update_top_btn", None)
             if btn is None:
                 return
+            latest = str(latest or "").strip()
             if latest:
-                btn.setText(f"一键更新 v{latest}")
-                btn.setToolTip(f"GitHub 上有新版本 v{latest}。点击后自动下载、校验并更新，"
-                               "随后自动重启后端完成升级。")
-                btn.show()
+                label = self._v_label(latest)
+                # 窄面板（<400 紧凑态）绿色胶囊只显示新版本号（颜色即语义），
+                # 完整说明放 tooltip，保证不把设置键挤出顶栏；宽面板仍是「一键更新 vX」。
+                if getattr(self, "_top_compact", False):
+                    btn.setText(label)
+                    btn.setToolTip(f"发现新版本 {label}！点击后自动下载、校验并更新，"
+                                   "随后自动重启后端完成升级。")
+                    btn.setAccessibleName(f"更新到 {label}")
+                else:
+                    btn.setText(f"一键更新 {label}")
+                    btn.setToolTip(f"GitHub 上有新版本 {label}。点击后自动下载、校验并更新，"
+                                   "随后自动重启后端完成升级。")
+                    btn.setAccessibleName(f"一键更新 {label}：点击后自动下载、校验并更新")
             else:
-                btn.hide()
+                label = self._v_label(self._top_btn_current_version())
+                state = getattr(self, "_update_top_state", "")
+                if label:
+                    btn.setText(label)
+                    if state == "checking":
+                        btn.setToolTip(f"当前版本 {label}，正在检查更新…（不会下载任何文件）")
+                        btn.setAccessibleName(f"当前版本 {label}，正在检查更新")
+                    elif state == "up_to_date":
+                        btn.setToolTip(f"当前版本 {label}，已是最新版本。点击可重新检查更新。")
+                        btn.setAccessibleName(f"当前版本 {label}，已是最新版本，点击重新检查更新")
+                    elif state == "error":
+                        reason = str(getattr(self, "_update_top_error", "") or "").strip()
+                        suffix = f"：{reason[:60]}" if reason else ""
+                        btn.setToolTip(f"当前版本 {label}，上次检查更新失败{suffix}。点击可重试。")
+                        btn.setAccessibleName(f"当前版本 {label}，检查更新失败，点击重试")
+                    else:
+                        btn.setToolTip(f"当前版本 {label}，点击检查更新（不会自动下载任何文件）。")
+                        btn.setAccessibleName(f"当前版本 {label}，点击检查更新")
+                else:
+                    # 版本号取不到：退化成「检查更新」，绝不再说「发现新版本」误导用户。
+                    btn.setText("检查更新")
+                    btn.setToolTip("点击检查更新（不会自动下载任何文件）。")
+                    btn.setAccessibleName("检查更新")
+            # 双态样式：默认扁平文字（与品牌字同色），检测到新版本才换绿色胶囊。
+            self._apply_update_btn_style(green=bool(latest))
+            # 锁死最小宽度 = sizeHint：QBoxLayout 空间不足时会优先把按钮压到 min 以下
+            # 造成文字被裁；锁死后被裁的只会是可省略号的品牌标题（title min=0）。
+            try:
+                btn.setMinimumWidth(max(0, btn.sizeHint().width()))
+            except BaseException:  # noqa: BLE001
+                pass
+            btn.show()   # 常驻：任何状态都不隐藏，只有面板销毁才消失
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _on_top_update_clicked(self):
+        """顶栏绿色按钮点击分流：已知可用更新 → 一键更新；其它状态 → 重新检查。never-raise。"""
+        try:
+            btn = getattr(self, "update_top_btn", None)
+            if btn is not None and not btn.isEnabled():
+                return                    # preparing 期间按钮已禁用，不重复触发
+            if getattr(self, "_update_preparing", False):
+                return
+            if str(getattr(self, "_update_latest_available", "") or "").strip():
+                self._apply_update_now()   # 最近一次检查确实有可用新版本
+            else:
+                self._check_updates(silent=False)   # 初始/已是最新/失败 → 重新检查
         except BaseException:  # noqa: BLE001
             pass
 
@@ -2110,6 +2813,10 @@ class AgentPanelWidget(QWidget):
             try:
                 self.update_top_btn.setEnabled(False)
                 self.update_top_btn.setText("正在下载更新…")
+                # 文案变了，min 宽度跟着 sizeHint 走（窄面板下宁可挤品牌字也不裁下载提示）
+                self.update_top_btn.setMinimumWidth(max(0, self.update_top_btn.sizeHint().width()))
+                self.update_top_btn.setToolTip("正在后台下载并校验新版本，完成后自动安装并重启后端…")
+                self.update_top_btn.setAccessibleName("正在下载更新，请稍候")
             except BaseException:  # noqa: BLE001
                 pass
             self.status.setText("正在后台下载并校验新版本（完成后自动安装并重启后端）…")
@@ -2132,11 +2839,40 @@ class AgentPanelWidget(QWidget):
             self.status.setText(f"自动更新启动失败：{type(exc).__name__}（未改动任何文件）")
 
     def _restore_top_update_btn(self):
+        """下载/应用失败后复位成「当前版本 v{V}」（**不是**「一键更新」），并补一句上次失败。never-raise。"""
         try:
             btn = getattr(self, "update_top_btn", None)
-            if btn is not None and btn.isVisible():
+            self._update_apply_requested = False
+            self._update_latest_available = ""
+            self._update_current_version = ""   # 契约 §2：复位按本地版本 v{V} 显示
+            self._note_top_update_error("上次更新失败，未改动安装")
+            self._show_top_update("")
+            if btn is not None:
                 btn.setEnabled(True)
-                btn.setText("一键更新")
+                tip = str(btn.toolTip() or "")
+                if "上次更新失败" not in tip:
+                    btn.setToolTip((tip + " 上次更新失败，未改动安装。").strip())
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _set_top_btn_applied(self, version: str):
+        """更新完成：顶栏显示新版本号 ``v{applied_version}``（仍常驻、可点）。never-raise。"""
+        try:
+            btn = getattr(self, "update_top_btn", None)
+            if btn is None:
+                return
+            label = self._v_label(version)
+            if label:
+                btn.setText(label)
+                btn.setToolTip(f"已更新到 {label}，正在自动重启后端…")
+                btn.setAccessibleName(f"已更新到 {label}")
+            else:
+                btn.setText("检查更新")
+                btn.setToolTip("更新已完成，正在自动重启后端…点击可检查版本")
+                btn.setAccessibleName("更新已完成，点击检查更新")
+            btn.setEnabled(True)
+            self._apply_update_btn_style(green=False)   # 已装上：回到扁平文字态
+            btn.show()
         except BaseException:  # noqa: BLE001
             pass
 
@@ -2147,7 +2883,12 @@ class AgentPanelWidget(QWidget):
             status = str(data.get("status") or "").strip()
             if status == "applied":
                 version = str(data.get("applied_version") or "")
-                self._show_top_update("")   # 更新完成，按钮收起
+                if version:
+                    # 已装上的是新版本：后续顶栏显示以它为准，直到下一次检查刷新。
+                    self._update_current_version = version
+                self._update_top_state = "up_to_date"
+                self._update_latest_available = ""
+                self._set_top_btn_applied(version)   # 常驻显示新版本号，不再收起
                 self.status.setText(f"已更新到 v{version}，正在自动重启后端…")
                 # 复用 1.3.4 的后端重启链路（核对身份 → taskkill → 拉起 → 健康检查）
                 self._restart_backend_async()
@@ -2197,6 +2938,8 @@ class AgentPanelWidget(QWidget):
             worker.start()
         except BaseException:  # noqa: BLE001
             self._update_preparing = False
+            # 别把顶栏按钮卡死在「正在下载更新…」：按契约 §2 复位成 v{V} 且可点。
+            self._restore_top_update_btn()
             try:
                 self.update_status_label.setText("准备更新启动失败（面板内部错误），未下载任何文件。")
             except BaseException:  # noqa: BLE001
@@ -2217,12 +2960,11 @@ class AgentPanelWidget(QWidget):
             data = data or {}
             if data.get("backend_old"):
                 self._offer_backend_restart()
+                self._restore_top_update_btn()   # 常驻按钮：失败也要回到 v{V}，不能卡在「正在下载」
                 self._update_state("error", data.get("error", ""))
                 return
             if "error" in data and "status" not in data:
-                if getattr(self, "_update_apply_requested", False):
-                    self._update_apply_requested = False
-                    self._restore_top_update_btn()
+                self._restore_top_update_btn()
                 self._update_state("error", data.get("error", ""))
                 return
             status = str(data.get("status") or "").strip()
@@ -2244,8 +2986,19 @@ class AgentPanelWidget(QWidget):
                 except BaseException:  # noqa: BLE001
                     pass
             elif status == "up_to_date":
+                # 后端复检说「其实已经是最新」（update_service._prepare_locked 会重新 _check）：
+                # 顶栏必须从「正在下载更新…」复位成「当前版本 v{current}」并恢复可点
+                # （契约 §2 up_to_date 行：可见、可点、文案 v{current}）。
+                self._update_apply_requested = False
+                self._update_latest_available = ""
+                self._update_top_state = "up_to_date"
+                if current:
+                    self._update_current_version = current   # 取不到就退回本地 PLUGIN_VERSION
                 self._update_state(status, message, current, latest)
+                self._show_top_update("")
+                self.update_top_btn.setEnabled(True)
             else:
+                self._restore_top_update_btn()   # 准备失败：顶栏回到 v{V}，不卡在「正在下载」
                 self._update_state("error", message or "准备更新失败，未修改任何文件")
         except BaseException:  # noqa: BLE001
             pass
@@ -2471,6 +3224,26 @@ class AgentPanelWidget(QWidget):
             self.sidebar.setMaximumWidth(w)
         self.logo.setVisible(w >= U.px(440))
         self.subtitle.setVisible(w >= U.px(400))
+        # 品牌标题（ADS Agent）**任何宽度都显示**（2026-11-04 用户反馈：红框处要能看到
+        # ADS Agent 黑字）；它已改为 min 宽 0 + 省略号的可伸缩项，窄面板下显示 ADS Age…
+        # 而不是消失，也绝不挤压右侧的更新键/设置键。
+        self.title.setVisible(True)
+        # 顶栏：面板最小宽度 330 时常驻的更新键会把「模型设置」挤出右边界 ——
+        # 窄宽下收紧顶栏间距 + 更新键水平内边距（不隐藏按钮、不动设置键宽度）。
+        top_compact = 0 < w < U.px(400)
+        if getattr(self, "_top_row", None) is not None and top_compact != self._top_compact:
+            self._top_compact = top_compact
+            try:
+                self._top_row.setSpacing(U.px(2) if top_compact else U.P("sm"))
+                # 紧凑态把设置键收窄 8px（「模型设置」四字仍放得下），给品牌字和更新键腾空间
+                self.settings_btn.setFixedWidth(U.px(84) if top_compact else U.px(92))
+                self._apply_update_btn_style(compact=top_compact)
+                # 紧凑态绿色文案只显示版本号，需按新宽度刷新一次按钮文字
+                self._show_top_update(str(getattr(self, "_update_latest_available", "") or ""))
+            except BaseException:  # noqa: BLE001
+                pass
+        # 布局算完再省略品牌字（此刻 title 宽度才是最终值）
+        QTimer.singleShot(0, self._elide_title)
         # 模型清单高度跟着面板高度走，小面板也不会把设置区顶出屏幕
         rows = max(2, min(self.model_list.count(), 3))
         self.model_list.setFixedHeight(U.px(rows * 36 + 12))
@@ -2725,8 +3498,14 @@ class AgentPanelWidget(QWidget):
                            else self._active_model)
         # The chat history is shared. Another model's old measured request no
         # longer describes it after new messages arrive; recompute on switch.
-        self._context_usage = {k: v for k, v in self._context_usage.items()
-                               if k[0] != target or k[1] == producing_model}
+        # 但「本次会话」累计与历史内容无关：换模型/加消息都要留着（各算各的）。
+        kept = {}
+        for key, value in self._context_usage.items():
+            if key[0] != target or key[1] == producing_model:
+                kept[key] = value
+            elif isinstance(value.get("session"), dict):
+                kept[key] = {"session": value["session"]}
+        self._context_usage = kept
         return True
 
     def _refresh_project_list(self):
@@ -3766,12 +4545,17 @@ class AgentPanelWidget(QWidget):
         active = getattr(self, "projects_data", {}).get("active")
         key = (active, self._active_model)
         usage = self._context_usage.get(key)
+        # 「本次会话」累计与当前上下文估算相互独立：实测用量被历史变更作废后，
+        # 累计仍继续显示（只有清空历史/切换项目时随 _context_usage 一起丢弃）。
+        session = usage.get("session") if isinstance(usage, dict) else None
         draft = self.input.toPlainText()
         metadata = self._model_contexts.get(self._active_model)
-        if (usage and usage.get("unit") == "tokens") or metadata:
+        measured = (bool(usage) and usage.get("unit") == "tokens"
+                    and _usage_int(usage.get("used")) is not None)
+        if measured or metadata:
             import pathbridge
             accounting = pathbridge.load_backend_module("model_context.py", "ads_agent_model_context")
-            if usage and usage.get("unit") == "tokens":
+            if measured:
                 usage = dict(usage)
                 if draft:
                     usage["used"] += accounting.estimate_text(draft) + 8
@@ -3784,14 +4568,18 @@ class AgentPanelWidget(QWidget):
                 if draft:
                     usage["used"] += accounting.estimate_text(draft) + 8
                 usage["used"] += (self._context_generated.get(key, 0) + 1) // 2
+                if isinstance(session, dict):
+                    usage["session"] = session
             usage.update(unit="tokens", model=self._active_model, character_budget=self._context_budget_chars)
             self.context_usage.set_usage(usage)
             return
-        if usage:
+        if usage and _usage_int(usage.get("used")) is not None:
             usage = dict(usage)
             if draft:
                 usage["used"] += len(draft) + 24
                 usage["estimated"] = True
+            if isinstance(session, dict):
+                usage.setdefault("session", session)
         elif self._context_budget_chars > 0:
             proj = getattr(self, "projects_data", {}).get("projects", {}).get(active, {})
             used = sum(len(str(m.get("content") or ""))
@@ -3802,6 +4590,8 @@ class AgentPanelWidget(QWidget):
                 used += len(draft) + 24
             usage = {"used": used, "max": self._context_budget_chars,
                      "estimated": True, "unit": "chars"}
+            if isinstance(session, dict):
+                usage["session"] = session
         self.context_usage.set_usage(usage)
 
     def _load_context_editor(self, name=None):
@@ -5626,7 +6416,9 @@ class AgentPanelWidget(QWidget):
                       'read_dataset': '正在读取数据', 'read_traces': '正在读取曲线',
                       'get_workspace_info': '正在读取工作区', 'list_designs': '正在读取电路',
                       'get_design_variables': '正在读取电路参数', 'build_schematic': '正在构建电路',
-                      'set_design_variables': '正在修改电路参数', 'run_python': '正在执行脚本'}
+                      'set_design_variables': '正在修改电路参数', 'run_python': '正在执行脚本',
+                      'create_workspace': '正在新建工作区',
+                      'list_workspaces': '正在查找工作区'}
             text = phases.get(self._tool_name, '正在执行工具') + '…'
             elapsed = re.search(r'已用 (\d+)s', raw)
             if elapsed:
@@ -5873,12 +6665,8 @@ class AgentPanelWidget(QWidget):
                     if metadata and any(model_usage.get(f) != metadata.get(f)
                                         for f in ("max", "source", "connection")):
                         return  # late event for old model settings
-                    normalized = dict(model_usage)
-                    for field in ("prompt_tokens", "completion_tokens"):
-                        value = normalized.get(field)
-                        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                            normalized[field] = None
-                    self._context_usage[(project, model)] = normalized
+                    self._context_usage[(project, model)] = _usage_normalize_event(
+                        self, model_usage, ev, project, model)
                     if foreground:
                         self._sync_context_usage()
                 return

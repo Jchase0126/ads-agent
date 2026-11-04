@@ -59,6 +59,10 @@ DEFAULTS = {
     # 解释器，解析在子进程里跑同一份代码（backend/pdf_worker.py）。
     # 留空 = 只用进程内引擎 + 受限降级扫描。
     "datasheet_runtime_python": "",
+    # create_workspace 未给 root/path 时的默认父目录（[agent] workspace_root）。
+    # 只由 backend/tools.py 的 call() 注入 —— ADS 进程拿不到后端配置，
+    # 所以不能在 ADS 端读这个键。留空 = 交给 ADS 端按自己的根目录规则解析。
+    "workspace_root": "",
     # ---- 独立计算 worker（run_compute，2026-10-30）------------------------
     # NumPy/SciPy 优化、拟合、大规模数据处理在后端计算子进程里执行，
     # 不占 ADS 主线程。以下键都在 [agent] 段。
@@ -134,6 +138,8 @@ def load() -> dict:
     get("agent", "context_budget_chars", "context_budget_chars", gi)
     get_bool("agent", "sim_off_main_thread", "sim_off_main_thread")
     get("agent", "sim_cancel_grace_s", "sim_cancel_grace_s", gf)
+    # create_workspace 未给 root/path 时作为默认父目录（见 backend/tools.py）
+    get("agent", "workspace_root", "workspace_root")
     # 独立计算 worker（run_compute，2026-10-30）
     get("agent", "compute_max_workers", "compute_max_workers", gi)
     get("agent", "compute_queue_capacity", "compute_queue_capacity", gi)

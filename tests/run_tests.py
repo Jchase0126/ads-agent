@@ -41,6 +41,16 @@ CASES = [
     # 2026-10-14 B 阶段：实测符号盒 + 引脚感知的三端封装布局走线
     ("test_three_terminal_layout.py", "三端封装布局走线 / 端点豁免 / 实测符号盒", "logic", False),
     ("test_model_context.py", "模型上下文容量来源 / 独立上限 / 实测与估算", "logic", False),
+    # ---- 2026-11-04 上下文用量环补全（输入/输出/缓存命中/会话累计）----
+    ("test_usage_capture.py", "流式 usage 捕获：stream_options 注入 / 400 降级 / 多块合并", "logic", False),
+    ("test_model_context_cache.py", "缓存用量规范化 / usage() 新字段 / 会话累加不变量", "logic", False),
+    ("test_context_usage_flow.py", "上下文用量全链路：后端 usage → 事件 → 面板归一化", "logic", False),
+    ("test_context_usage_ui.py", "用量环详情浮层 / tooltip 缺字段降级 / 会话累计", "qt", True),
+    # ---- 2026-11-04 工作区对话式创建与打开（离线 fake de，不需要 ADS 实机）----
+    ("test_workspace_create.py", "工作区新建：目录/首个库创建与拒绝原因", "logic", False),
+    ("test_workspace_discovery.py", "工作区发现：有界扫描/最近记录/根目录解析", "logic", False),
+    ("test_workspace_tools.py", "工作区工具：schema 参数/超时/默认根注入", "logic", False),
+    ("test_workspace_e2e.py", "工作区对话链路端到端（若改用 Qt 需改为 qt/True）", "logic", False),
     ("test_python_helpers.py", "跨调用脚本助手恢复 / 用户变量保留", "logic", False),
     # ---------------- logic ----------------
     ("test_token_migration.py", "令牌生成 / 迁移 / 两端一致 / 并发收敛", "logic", False),
@@ -107,6 +117,9 @@ CASES = [
     ("test_ui_navigation.py", "设置返回 / 草稿保留 / 小窗滚动 / 侧栏恢复 / 关闭面板", "qt", True),
     ("test_model_attachments.py", "模型包附件：拖放 / 上传 / 卡片状态 / 项目隔离与恢复", "qt", True),
     ("test_rfcalc_panel.py", "RF 计算器窗口：页面树/表单栈/冒烟计算/基片填值", "qt", True),
+    # ---- 2026-11-04 顶栏更新按键常驻（无新版本时显示当前版本号；本目录既有的
+    # test_update_ui.py / test_update_service.py 未登记，故接在 qt 组末尾）----
+    ("test_update_top_btn_version.py", "顶栏更新按键：常驻显示当前版本号 / 点击分流 / never-raise", "qt", True),
 ]
 
 DEFAULT_TIMEOUT_S = 240

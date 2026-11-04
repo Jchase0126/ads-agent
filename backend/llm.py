@@ -79,6 +79,10 @@ def _build_body(cfg: dict, messages: list, tools: list | None, stream: bool) -> 
         "temperature": 0.3,
         "stream": bool(stream),
     }
+    if stream:
+        # 流式响应默认不带 token 统计；OpenAI 兼容协议要靠 stream_options 打开，
+        # 否则输入/输出/缓存命中用量永远拿不到（面板只能退化成估算）。
+        body["stream_options"] = {"include_usage": True}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
@@ -89,6 +93,30 @@ def _build_body(cfg: dict, messages: list, tools: list | None, stream: bool) -> 
     return body
 
 
+def _merge_usage(base: dict | None, extra: dict | None) -> dict | None:
+    """把流式响应里分散在多块的 usage 合并成一个（provider 原始结构，不改名）。
+
+    有的服务先发 ``total_tokens``、再单独发 ``prompt_tokens_details``；整体替换
+    会丢掉前面的字段，所以逐键合并，嵌套 dict（prompt_tokens_details /
+    completion_tokens_details 等）再递归合并一层。空值（None / "" / {} / []）
+    不覆盖已有值，非空新值覆盖旧值。
+    """
+    if not isinstance(extra, dict) or not extra:
+        return base
+    merged = dict(base) if isinstance(base, dict) else {}
+    for key, value in extra.items():
+        if value is None or value == "" or value == {} or value == []:
+            continue
+        if isinstance(value, dict):
+            nested = _merge_usage(merged.get(key) if isinstance(merged.get(key), dict) else None,
+                                  value)
+            if nested:
+                merged[key] = nested
+            continue
+        merged[key] = value
+    return merged
+
+
 def chat_stream(cfg: dict, messages: list, tools: list | None = None, timeout: int = 240,
                 on_reasoning=None, on_content=None) -> tuple:
     """流式请求一次对话补全，返回拼装完成的 (assistant message, usage)。
@@ -96,8 +124,11 @@ def chat_stream(cfg: dict, messages: list, tools: list | None = None, timeout: i
     on_reasoning / on_content 收到的都是**增量**文本（思考内容 / 正文），
     不关心传 None 即可。返回的 message 与 OpenAI 非流式结构一致：
       {"role": "assistant", "content": str, "tool_calls": [...]?, "complete": bool}
-    思考内容只走回调，不拼进 message。``usage`` 取流中最后带 usage 的块
-    （DeepSeek / GLM 都在收尾块里带；个别服务没有则为 None，调用方估算兜底）。
+    思考内容只走回调，不拼进 message。``usage`` 是流里各块 usage 的**合并**结果
+    （provider 原始结构不改名；DeepSeek / GLM 在收尾块里带，个别服务没有则为
+    None，调用方估算兜底）。为拿到 token 统计，流式请求默认带
+    ``stream_options.include_usage``；网关不认这个字段（HTTP 400）时自动去掉
+    重试一次，不影响整轮对话。
 
     完整性（2026-10-02）：
       * 正常结束 = 收到 [DONE] 结束标志；message["complete"] 如实标注；
@@ -119,7 +150,6 @@ def chat_stream(cfg: dict, messages: list, tools: list | None = None, timeout: i
 
     url = base_url + "/chat/completions"
     body = _build_body(cfg, messages, tools, stream=True)
-    use_thinking = "thinking" in body
 
     def _headers() -> dict:
         h = {"Content-Type": "application/json"}
@@ -149,6 +179,31 @@ def chat_stream(cfg: dict, messages: list, tools: list | None = None, timeout: i
         return isinstance(e, (urllib.error.URLError, TimeoutError,
                               ConnectionError, OSError))
 
+    # 网关/模型不认识的**可选**请求字段：见到 400 就逐个去掉重试一次，
+    # 绝不让整轮对话因为一个附加字段失败。顺序沿用历史行为（先 thinking），
+    # 再降级新增的 stream_options。
+    _droppable = ("thinking", "stream_options")
+
+    def _open_adaptive():
+        body_try = body
+        while True:
+            try:
+                return _open(body_try)
+            except urllib.error.HTTPError as e:
+                if e.code != 400:
+                    raise
+                drop = next((k for k in _droppable if k in body_try), None)
+                if drop is None:
+                    raise
+                try:
+                    e.close()  # 丢弃的中间响应不再读，及早放掉连接
+                except Exception:  # noqa: BLE001
+                    pass
+                body_try = {k: v for k, v in body_try.items() if k != drop}
+                if drop == "thinking":
+                    # 思考模式本来不带 temperature（GLM 约束），去掉后恢复默认值
+                    body_try["temperature"] = 0.3
+
     message: dict = {"role": "assistant", "content": "", "complete": False}
     calls: dict = {}
     usage = None
@@ -158,25 +213,13 @@ def chat_stream(cfg: dict, messages: list, tools: list | None = None, timeout: i
         message = {"role": "assistant", "content": "", "complete": False}
         calls, usage = {}, None
         try:
-            body_try = body
-            resp = _open(body_try)
+            resp = _open_adaptive()
         except urllib.error.HTTPError as e:
-            if e.code == 400 and use_thinking:
-                # 该模型/网关不认识 thinking 字段：去掉后降级重试一次
-                body_try = {k: v for k, v in body.items() if k != "thinking"}
-                body_try["temperature"] = 0.3
-                try:
-                    resp = _open(body_try)
-                except urllib.error.HTTPError as e2:
-                    raise _http_error(e2) from e2
-                except urllib.error.URLError as e2:
-                    raise LLMError(f"无法连接 LLM 接口 {url}: {e2.reason}") from e2
-            elif _transient(e) and attempt < _TRANSIENT_RETRIES:
+            if _transient(e) and attempt < _TRANSIENT_RETRIES:
                 last_err = e
                 time.sleep(_TRANSIENT_BACKOFF * (attempt + 1))
                 continue
-            else:
-                raise _http_error(e) from e
+            raise _http_error(e) from e
         except _transient_error_types() as e:
             if attempt < _TRANSIENT_RETRIES:
                 last_err = e
@@ -201,7 +244,9 @@ def chat_stream(cfg: dict, messages: list, tools: list | None = None, timeout: i
                 except json.JSONDecodeError:
                     continue
                 if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
-                    usage = chunk["usage"]
+                    # 各块可能只带一部分字段（total_tokens / details 分块发），
+                    # 合并而不是整体替换，避免前面的字段被丢掉。
+                    usage = _merge_usage(usage, chunk["usage"])
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
