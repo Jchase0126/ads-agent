@@ -458,8 +458,19 @@ def _publish_device_model_locked(record: dict, *, vendor: str, part_number: str,
             # 修订目录从第一刻起就是完整的（没有"目录在了但清单没到"的中间态）。
             _write_json(os.path.join(staging_dir, "manifest.json"), manifest)
             os.makedirs(os.path.dirname(final_dir), exist_ok=True)
-            if os.path.exists(final_dir):      # 并发发布同内容：已有人入库
-                reused = True
+            if os.path.exists(final_dir):
+                if os.path.isfile(os.path.join(final_dir, "manifest.json")):
+                    reused = True          # 并发发布同内容：已有人入库
+                else:
+                    # 残缺修订目录（历史中断 / 磁盘事故 / 杀进程遗留）：
+                    # 没有清单的修订不可用，也永远等不来内容。本调用持有库锁，
+                    # 并发方不可能处于半写入态（入库是同锁下的整目录原子改名），
+                    # 所以这只能是损坏遗留 —— 换名留档、本次用暂存补齐，让库
+                    # 自愈，而不是让同内容的发布从此永远 FileNotFoundError。
+                    os.rename(final_dir, final_dir + ".corrupt-"
+                              + os.urandom(4).hex())
+                    os.rename(staging_dir, final_dir)   # 同卷目录改名 = 原子入库
+                    staging_dir = None
             else:
                 os.rename(staging_dir, final_dir)   # 同卷目录改名 = 原子入库
                 staging_dir = None

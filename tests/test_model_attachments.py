@@ -211,9 +211,18 @@ def _teardown():
             if isinstance(widget, panel.AgentPanelWidget):
                 for timer in widget.findChildren(QTimer):
                     timer.stop()
-                for worker in list(widget._attach_workers):
-                    if isinstance(worker, QThread):
-                        worker.wait(5000)
+                # 所有真实 QThread 都要等完 —— 不止附件上传 worker，
+                # ConfigWorker（模型列表 / 更新检查）也是 QThread：线程没跑完
+                # 就析构 QThread 会触发 Qt abort，进程以非零退出码死在
+                # 「QThread: Destroyed while thread is still running」上，
+                # 全量回归里 61 项全 ok 也会被判成整个文件失败。
+                for registry in ("_attach_workers", "_cfg_workers",
+                                 "_update_workers"):
+                    for worker in list(getattr(widget, registry, []) or []):
+                        try:
+                            worker.wait(10000)
+                        except (AttributeError, RuntimeError):
+                            pass
                 widget.close()
                 widget.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
@@ -447,7 +456,11 @@ def test_attach_button_exists_next_to_send():
 
 
 def test_non_zip_drop_is_reported_not_silently_ignored():
-    """拖入非 ZIP：必须明确提示"首版只支持 ZIP"，不能装作没发生。"""
+    """拖入不支持文件：必须明确提示支持的类型，不能装作没发生。
+
+    （1.3.0 起产品文案扩为「SPICE 网表、ZIP 模型包和 PDF 数据手册」，
+    断言随文案更新——notes.txt 仍不在支持列表内，语义不变。）
+    """
     w = _new_panel(("A",))
     path = os.path.join(_TMP, "notes.txt")
     with open(path, "w", encoding="utf-8") as f:
@@ -456,7 +469,7 @@ def test_non_zip_drop_is_reported_not_silently_ignored():
     accepted = w._drop_filter.eventFilter(w.chat, _drop_event(_mime_for([path])))
     eq(accepted, True, "过滤器应接管这次放下")
     texts = " | ".join(e["text"] for e in _entries(w, "A"))
-    contains(texts, "支持 ZIP 模型包和 PDF", "拖入不支持文件应给出明确提示")
+    contains(texts, "ZIP 模型包和 PDF 数据手册", "拖入不支持文件应给出明确提示")
     contains(texts, "notes.txt", "提示里应说明收到的是哪个文件")
 
 
@@ -468,7 +481,7 @@ def test_pick_zip_rejects_non_zip_path():
         f.write("x")
     w._start_zip_upload(path)
     eq(len(_entries(w, "A")), 1, "非 ZIP 不应建卡片，只留一条提示")
-    contains(_entries(w, "A")[0]["text"], "支持 ZIP 模型包和 PDF")
+    contains(_entries(w, "A")[0]["text"], "ZIP 模型包和 PDF 数据手册")
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +539,7 @@ def test_pasting_zip_creates_removable_composer_card_without_path_text():
     w._on_send()
     eq(len(w.history), 0, "上传未完成时不能把消息单独发出")
     eq(w.input.toPlainText(), "请使用这个模型", "等待上传时应保留用户输入")
-    contains(w.status.text(), "还在上传")
+    contains(w.status.text(), "仍在上传或解析")
     w.input.clear()
 
     remove = next(btn for btn in w.composer_attachment_strip.findChildren(

@@ -465,7 +465,13 @@ def _publish_and_place(ctx, tag):
     import device_library as DL
     import datasheet_curves
     import doc_assets
-    root = DL.devices_root({}, tempfile.mkdtemp(prefix="rv_lib_" + tag + "_"))
+    # 场景独立的基础目录：workspace 放在 base 之下，library_root 按
+    # 「workspace 同级 libraries」推导 → 每个场景/每次运行都是全新库，
+    # 不再共用全局 %TEMP%\libraries（那里的历史残缺修订目录曾让发布链
+    # 稳定复现 FileNotFoundError；产品侧现已自愈，测试侧也不再共用）。
+    base = tempfile.mkdtemp(prefix="rv_base_" + tag + "_")
+    workspace = tempfile.mkdtemp(prefix="rv_ws_" + tag + "_", dir=base)
+    root = DL.devices_root({}, workspace)
     record = M.get_model_record(ctx["model_id"])
     # 合成模型没有真实上传字节；发布要求原文件可审计。补一份最小 PDF 资产，
     # 并把模型/曲线记录的 document_id 指向它的真实 SHA（否则资产按 SHA 找不到）。
@@ -494,7 +500,6 @@ def _publish_and_place(ctx, tag):
                                   library_root=root)
     manifest = DL.load_manifest(root, pub["device_id"], pub["model_id"],
                                 pub["revision_id"])
-    workspace = tempfile.mkdtemp(prefix="rv_ws_" + tag + "_")
     ctx["workspace"] = workspace
     calls = []
     fake = _fake_ads(calls)

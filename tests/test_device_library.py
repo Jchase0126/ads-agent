@@ -269,6 +269,47 @@ def test_same_content_reuses_revision_new_content_new_revision():
     eq(len(revisions), 2, "旧修订保留不被覆盖")
 
 
+def test_corrupt_revision_dir_without_manifest_self_heals():
+    """修订目录存在但没有 manifest.json（中断/磁盘事故遗留）→ 发布自愈。
+
+    旧实现把「目录存在」当「已入库」，随后的 _read_json 直接
+    FileNotFoundError，同内容从此永远发不出去；现在无清单 = 残缺：
+    换名留档、用本次暂存补齐，之后再发布恢复正常复用。
+    """
+    record = _make_record()
+    pkg = _package(record)
+    root = DL.devices_root({}, "")
+    pub = DL.publish_device_model(record, vendor="Fairchild",
+                                  part_number="J310-HEAL",
+                                  component_plan=pkg["component_plan"],
+                                  deps=pkg["deps"], allow_unverified=True,
+                                  library_root=root)
+    rev_dir = os.path.join(root, pub["device_id"], pub["model_id"],
+                           "revisions", pub["revision_id"])
+    ok(os.path.isfile(os.path.join(rev_dir, "manifest.json")), "首次发布清单落盘")
+    os.remove(os.path.join(rev_dir, "manifest.json"))   # 模拟中断 / 损坏遗留
+    pub2 = DL.publish_device_model(record, vendor="Fairchild",
+                                   part_number="J310-HEAL",
+                                   component_plan=pkg["component_plan"],
+                                   deps=pkg["deps"], allow_unverified=True,
+                                   library_root=root)
+    eq(pub2["revision_id"], pub["revision_id"], "同内容 → 同修订（内容不可变）")
+    ok(not pub2["reused"], "残缺目录不得当成已入库复用")
+    healed = DL.load_manifest(root, pub["device_id"], pub["model_id"],
+                              pub["revision_id"])
+    ok(healed.get("manifest_sha256"), "自愈后清单完整可读")
+    ok(os.path.isdir(rev_dir), "自愈后修订目录回到完整状态")
+    leftovers = [n for n in os.listdir(os.path.dirname(rev_dir))
+                 if n.startswith(pub["revision_id"] + ".corrupt-")]
+    eq(len(leftovers), 1, "损坏目录换名留档（不悄悄销毁证据）")
+    pub3 = DL.publish_device_model(record, vendor="Fairchild",
+                                   part_number="J310-HEAL",
+                                   component_plan=pkg["component_plan"],
+                                   deps=pkg["deps"], allow_unverified=True,
+                                   library_root=root)
+    ok(pub3["reused"], "自愈后的第三次发布恢复正常复用")
+
+
 def test_validated_record_publishes_as_published():
     record = _make_record(validated=True)
     pkg = _package(record)
