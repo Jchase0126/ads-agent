@@ -525,7 +525,11 @@ class ContextUsagePopup(QFrame):
     """上下文用量详情浮层（不是超长 tooltip）：分组显示、贴屏幕边缘自动收敛。"""
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        # Tool | StaysOnTop 而不是 ToolTip：Windows 上 Qt 会对 ToolTip 标志的
+        # 窗口做原生自动关闭（任何按下/激活变化都可能把它收走），绕过本类的
+        # 显隐逻辑造成"弹一下就消失"；Tool 没有这个行为，仍不进任务栏。
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint)
         self.setObjectName("contextUsagePopup")
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         # 不抢鼠标事件，也不抢焦点：浮层只是"看"，点击/键盘都留在面板里。
@@ -659,6 +663,11 @@ class ContextUsageIndicator(QToolButton):
         self._hover_timer.setSingleShot(True)
         self._hover_timer.setInterval(250)
         self._hover_timer.timeout.connect(self._show_popup)
+        # 移出按钮后的宽限期：边缘抖动（光标越界 1px 又回来）不闪收浮层。
+        self._leave_timer = QTimer(self)
+        self._leave_timer.setSingleShot(True)
+        self._leave_timer.setInterval(200)
+        self._leave_timer.timeout.connect(self._hide_popup)
         self.clicked.connect(self._toggle_popup)
         self.set_usage(None)
 
@@ -891,15 +900,34 @@ class ContextUsageIndicator(QToolButton):
 
     def _show_popup(self):
         self._hover_timer.stop()
+        self._leave_timer.stop()
         popup = self._popup_widget()
         popup.set_palette(self._pal)
         popup.set_groups(self.detail_groups())
+        # show_at 内部是 move+show+raise；已可见时 Qt 对 show() 幂等，不会闪烁。
         popup.show_at(self)
+        # Tool 窗口没有 ToolTip 的"点哪都自动关"原生行为：自己装过滤器补上。
+        QtWidgets.QApplication.instance().installEventFilter(self)
 
     def _hide_popup(self):
+        self._leave_timer.stop()
+        if self._popup is not None and self._popup.isVisible():
+            QtWidgets.QApplication.instance().removeEventFilter(self)
         self._hover_timer.stop()
         if self._popup is not None:
             self._popup.hide()
+
+    def eventFilter(self, obj, event):
+        # 浮层开着时点在按钮/浮层之外 → 收起（等价 ToolTip 的原生行为）。
+        if (event.type() == QtCore.QEvent.Type.MouseButtonPress
+                and self._popup is not None and self._popup.isVisible()):
+            widget = QtWidgets.QApplication.widgetAt(event.globalPosition().toPoint())
+            inside = widget in (self, self._popup) or (
+                widget is not None
+                and (self.isAncestorOf(widget) or self._popup.isAncestorOf(widget)))
+            if not inside:
+                self._hide_popup()
+        return super().eventFilter(obj, event)
 
     def _toggle_popup(self):
         if self._popup is not None and self._popup.isVisible():
@@ -924,14 +952,17 @@ class ContextUsageIndicator(QToolButton):
 
     def enterEvent(self, event):
         super().enterEvent(event)
+        self._leave_timer.stop()    # 宽限期内回到按钮上：取消收起
         self._hover_timer.start()
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
-        self._hide_popup()
+        # 不立即收起：200ms 宽限期内回来就当没离开过（消灭边缘抖动闪收）。
+        self._leave_timer.start()
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
+        self._leave_timer.stop()
         self._show_popup()
 
     def focusOutEvent(self, event):
