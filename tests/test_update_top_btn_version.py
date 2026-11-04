@@ -246,7 +246,9 @@ def test_error_and_offline_keep_version_and_recheck():
         # 5a 后端检查失败（status=error + message）
         widget._on_update_checked({
             "status": "error",
-            "current_version": "1.3.5",
+            # 后端回报的 current_version 应等于它自己读到的 PLUGIN_VERSION，
+            # 这里动态取本地版本，避免版本号升级后夹具过期（v1.3.6 发布教训）。
+            "current_version": local_plugin_version() or "1.3.5",
             "latest_version": "",
             "message": "后端未启动",
         })
