@@ -99,7 +99,12 @@ def _event(model="m1", prompt=1000, completion=100, hit=750, miss=250, phase="re
 
 # ------------------------------------------------------------------ (a)
 def test_full_fields_popup_and_tooltip():
-    ind = panel.ContextUsageIndicator()
+    host = QtWidgets.QWidget()
+    host.resize(1000, 700)
+    ind = panel.ContextUsageIndicator(host)
+    host.show()
+    ind.show()
+    APP.processEvents()
     ind.set_usage(_full_usage())
     tip = ind.toolTip()
     eq(ind.accessibleDescription(), tip, "tooltip 与无障碍描述必须同步")
@@ -305,7 +310,10 @@ def test_session_survives_history_append_but_measured_usage_does_not():
 
 
 def test_popup_never_captures_pointer_or_focus_and_stays_on_screen():
-    ind = panel.ContextUsageIndicator()
+    host = QtWidgets.QWidget()
+    host.resize(1000, 700)
+    host.show()
+    ind = panel.ContextUsageIndicator(host)
     ind.set_usage(_full_usage())
     ind.move(0, 0)
     ind.show()
@@ -328,16 +336,70 @@ def test_popup_never_captures_pointer_or_focus_and_stays_on_screen():
     ok(ind.event(QtCore.QEvent(QtCore.QEvent.Type.ToolTip)), "ToolTip 事件由浮层接管")
     ok(popup.isVisible(), "悬浮应打开浮层")
 
-    # 贴屏幕右下角时自动收敛回可视区。
-    area = QtWidgets.QApplication.primaryScreen().availableGeometry()
-    ind.move(area.right() - 10, area.bottom() - 10)
+    # 浮层必须是宿主窗口内的子控件，并收敛到宿主可视区。
+    ok(not popup.isWindow(), "浮层不得创建顶层窗口")
+    eq(popup.parentWidget(), host)
+    ind.move(host.width() - ind.width(), host.height() - ind.height())
     ind._show_popup()
-    ok(popup.x() >= area.left(), "浮层左边不得越界")
-    ok(popup.y() >= area.top(), "浮层上边不得越界")
-    ok(popup.x() + popup.width() <= area.right() + 1, "浮层右边不得越界")
-    ok(popup.y() + popup.height() <= area.bottom() + 1, "浮层下边不得越界")
+    ok(popup.x() >= 0 and popup.y() >= 0, "浮层左上不能越界")
+    ok(popup.x() + popup.width() <= host.width(), "浮层右边不得越界")
+    ok(popup.y() + popup.height() <= host.height(), "浮层下边不得越界")
     ind._hide_popup()
     ind.hide()
+
+
+def test_hover_leave_and_refresh_timer_lifecycle():
+    from PySide6.QtTest import QTest
+    host = QtWidgets.QWidget()
+    host.resize(1000, 700)
+    ind = panel.ContextUsageIndicator(host)
+    ind.move(400, 400)
+    host.show()
+    ind.show()
+    APP.processEvents()
+    ind._hide_popup()
+    enter = QtGui.QEnterEvent(QtCore.QPointF(5, 5), QtCore.QPointF(5, 5), QtCore.QPointF(5, 5))
+    APP.sendEvent(ind, enter)
+    QTest.qWait(100)
+    APP.sendEvent(ind, QtCore.QEvent(QtCore.QEvent.Type.Leave))
+    QTest.qWait(350)
+    ok(ind._popup is None or not ind._popup.isVisible(), "离开后不可迟到弹出")
+
+    ind._show_popup()
+    popup = ind._popup
+    ok(not popup.isWindow(), "浮层不能是原生顶层窗口")
+    old_label = popup._labels[0]
+    ind.set_usage(_full_usage())
+    # 重建内容时旧标签不得变成独立顶层窗口。
+    ok(old_label.parentWidget() is popup, "刷新不得将标签脱离宿主")
+    APP.sendEvent(ind, QtCore.QEvent(QtCore.QEvent.Type.Leave))
+    ok(ind._leave_timer.isActive(), "离开后应开始关闭倒计时")
+    QTest.qWait(80)
+    ind.set_usage(dict(_full_usage(), used=63000))
+    ok(ind._leave_timer.isActive(), "实时刷新不得取消关闭倒计时")
+    QTest.qWait(250)
+    ok(not popup.isVisible(), "离开且持续刷新时仍须关闭")
+    host.close()
+    APP.processEvents()
+
+
+def test_first_mouse_click_opens_popup_and_host_hide_closes_it():
+    from PySide6.QtTest import QTest
+    host = QtWidgets.QWidget()
+    host.resize(800, 600)
+    ind = panel.ContextUsageIndicator(host)
+    ind.move(300, 300)
+    host.show()
+    ind.show()
+    APP.processEvents()
+    ind._hide_popup()
+    ind.clearFocus()
+    QTest.mouseClick(ind, QtCore.Qt.MouseButton.LeftButton)
+    ok(ind._popup is not None and ind._popup.isVisible(), "首次鼠标点击应打开浮层")
+    host.hide()
+    APP.processEvents()
+    ok(not ind._popup.isVisible(), "宿主隐藏时浮层应关闭")
+    host.close()
 
 
 if __name__ == "__main__":

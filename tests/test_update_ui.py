@@ -172,6 +172,8 @@ def test_up_to_date_state():
 def test_ready_state_never_claims_installed():
     widget = make_panel()
     try:
+        widget.general_settings_tab.click()
+        APP.processEvents()
         widget._on_update_prepared(dict(READY))
         text = widget.update_status_label.text()
         contains(text, "尚未安装", "prepare 只是暂存，必须明说尚未安装")

@@ -311,11 +311,42 @@ def test_points_inherit_theme_and_remain_read_only():
 def test_python_setting_is_accessible_in_compact_settings():
     widget = make()
     widget.settings_btn.click()
+    widget.general_settings_tab.click()
+    APP.processEvents()
+    ok(widget.python_setting.isVisible())
     widget.python_setting.setChecked(False)
     ok(not widget.allow_python.isChecked())
     widget.allow_python.setChecked(True)
     ok(widget.python_setting.isChecked())
     widget.close()
+
+
+def test_settings_categories_keep_drafts_and_save_independently():
+    for width in (330, 600):
+        widget = make(width, 600)
+        widget.settings_btn.click()
+        widget.provider_name_edit.setText('未保存的供应商')
+        widget.general_settings_tab.click()
+        APP.processEvents()
+        eq(widget.settings_sections.currentIndex(), 1)
+        ok(widget.python_setting.isVisible() and widget.update_auto_check.isVisible())
+        ok(not widget.save_btn.isVisible())
+        eq(widget.general_settings_scroll.horizontalScrollBar().maximum(), 0)
+        calls = []
+        widget._save_update_settings = lambda: calls.append('general') or True
+        widget.general_save_btn.click()
+        eq(calls, ['general'])
+        ok('已保存' in widget.general_save_status.text())
+        widget._save_update_settings = lambda: False
+        widget.general_save_btn.click()
+        ok('失败' in widget.general_save_status.text())
+        widget.model_settings_tab.click()
+        APP.processEvents()
+        eq(widget.settings_sections.currentIndex(), 0)
+        eq(widget.provider_name_edit.text(), '未保存的供应商')
+        ok(widget.save_btn.isVisible() and not widget.python_setting.isVisible())
+        widget.settings_close.click()
+        widget.close()
 
 
 def test_send_arrow_is_centered_at_multiple_ui_scales():
@@ -348,7 +379,7 @@ def test_header_settings_label_and_actions_fit_narrow_panel():
     from PySide6.QtCore import QPoint
     for width in (330, 400, 440, 520, 600):
         widget = make(width, 700)
-        eq(widget.settings_btn.text(), '模型设置')
+        eq(widget.settings_btn.text(), '设置')
         eq(widget.settings_btn.toolButtonStyle(), Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         previous_right = -1
         ok(not hasattr(widget, 'collapse_btn'))

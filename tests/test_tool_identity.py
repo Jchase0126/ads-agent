@@ -287,13 +287,67 @@ def test_unreachable_gives_install_hint():
     port = _free_port()  # 没人监听
     cfg = dict(config.load())
     cfg["ads_host"], cfg["ads_port"] = "127.0.0.1", port
-    try:
-        tools.call(cfg, "run_python", {"code": "print(1)"})
-    except tools.AdsToolError as e:
-        contains(str(e), "无法连接", "连不上要保留原来的排查指引")
-        contains(str(e), "Tools > ADS Agent", "要提示怎么把插件开起来")
-    else:
-        raise AssertionError("没人监听时应当报错")
+    from unittest.mock import patch
+    with patch.object(tools.instance, "probe", return_value={
+            "reachable": False, "payload": None, "error": "ConnectionRefusedError: refused"}):
+        try:
+            tools.call(cfg, "run_python", {"code": "print(1)"})
+        except tools.AdsToolError as e:
+            contains(str(e), "无法连接", "连不上要保留原来的排查指引")
+            contains(str(e), "Tools > ADS Agent", "要提示怎么把插件开起来")
+        else:
+            raise AssertionError("没人监听时应当报错")
+
+
+def test_health_timeout_is_not_misreported_as_stopped_service():
+    from unittest.mock import patch
+    _clear_verdict_cache()
+    cfg = dict(config.load(), ads_host="127.0.0.1", ads_port=8763)
+    with patch.object(tools.instance, "probe", return_value={
+            "reachable": False, "payload": None, "error": "TimeoutError: timed out"}):
+        try:
+            tools.call(cfg, "get_workspace_info", {})
+        except tools.AdsToolError as exc:
+            contains(str(exc), "健康检查超时")
+            contains(str(exc), "不等于 ADS 未启动")
+            contains(str(exc), "多个 ADS")
+        else:
+            raise AssertionError("健康检查超时必须停止派发")
+
+
+def test_transport_timeout_retains_job_id_and_invalidates_verdict():
+    from unittest.mock import patch
+    _clear_verdict_cache()
+    cfg = dict(config.load(), ads_host="127.0.0.1", ads_port=8763)
+    url = tools.ads_base_url(cfg)
+    tools._TOOLSERVER_VERDICT[url] = (__import__('time').monotonic(), {"usable": True})
+    with patch.object(tools._LOOPBACK, "open", side_effect=urllib.error.URLError(socket.timeout("timed out"))):
+        try:
+            tools.call(cfg, "get_workspace_info", {}, job_id="job-timeout-test")
+        except tools.AdsToolTimeout as exc:
+            eq(exc.job_id, "job-timeout-test")
+            contains(str(exc), "切勿盲目重复")
+        else:
+            raise AssertionError("发送后的超时必须保留作业状态未知")
+    ok(url not in tools._TOOLSERVER_VERDICT, "通信故障应清除身份缓存")
+
+
+def test_transport_failure_does_not_claim_request_never_started():
+    from unittest.mock import patch
+    _clear_verdict_cache()
+    cfg = dict(config.load(), ads_host="127.0.0.1", ads_port=8763)
+    url = tools.ads_base_url(cfg)
+    tools._TOOLSERVER_VERDICT[url] = (__import__('time').monotonic(), {"usable": True})
+    with patch.object(tools._LOOPBACK, "open", side_effect=urllib.error.URLError("connection lost")):
+        try:
+            tools.call(cfg, "get_workspace_info", {}, job_id="job-disconnect-test")
+        except tools.AdsToolError as exc:
+            contains(str(exc), "job-disconnect-test")
+            contains(str(exc), "尚不确定")
+            contains(str(exc), "切勿盲目重复")
+        else:
+            raise AssertionError("通信失败必须保留作业状态未知")
+    ok(url not in tools._TOOLSERVER_VERDICT)
 
 
 def test_verdict_is_cached_within_ttl():

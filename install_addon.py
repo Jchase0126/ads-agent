@@ -272,8 +272,10 @@ def register(xml_path: str, target_init: str, note: list | None = None,
     before_snapshot = entry_snapshot(entries)
     existing = entries.get(ADDON_NAME)
 
-    if existing is not None and _same_path(existing[0], target_init):
-        return "unchanged", f"已注册且路径正确：{target_init}"
+    desired_enabled = "1" if enabled else "0"
+    same_path = existing is not None and _same_path(existing[0], target_init)
+    if same_path and existing[1].get("Enabled") == desired_enabled:
+        return "unchanged", f"已注册且路径及启用状态正确：{target_init}"
 
     if tree is None:
         root = ET.Element("EESof_Addons")
@@ -289,8 +291,9 @@ def register(xml_path: str, target_init: str, note: list | None = None,
 
     now = {ADDON_NAME: None}
     element.set("Name", ADDON_NAME)
-    element.set("FilePath", target_init)
-    element.set("Enabled", "1" if enabled else "0")
+    if not same_path:
+        element.set("FilePath", target_init)
+    element.set("Enabled", desired_enabled)
     del now, detail_old
 
     backup = backup_file(xml_path, note)

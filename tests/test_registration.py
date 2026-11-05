@@ -141,6 +141,33 @@ def test_register_is_idempotent():
         ok(install_addon._same_path(target, target), "路径比较应忽略大小写与分隔符差异")
 
 
+def test_reinstall_syncs_enabled_and_remains_idempotent():
+    with FakeAds(clean=True, body=SAMPLE) as ads:
+        target = _target_init(r"D:\\位置 A\\ADSAgent")
+        install_addon.register(ads.xml, target, enabled=False)
+        for enabled, value in ((True, "1"), (False, "0")):
+            action, _ = install_addon.register(ads.xml, target, enabled=enabled)
+            eq(action, "updated")
+            eq(ads.entry(install_addon.ADDON_NAME)[1].get("Enabled"), value)
+            _others_untouched(ads, "（启用状态更新）")
+            before = ads.text()
+            action, _ = install_addon.register(ads.xml, target, enabled=enabled)
+            eq(action, "unchanged")
+            eq(ads.text(), before, "状态一致时不应写文件")
+
+
+def test_reinstall_sets_missing_enabled_attribute():
+    body = SAMPLE.replace('</EESof_Addons>',
+                          '<Addon Name="ADS Agent" FilePath="same" Extra="keep" />\n</EESof_Addons>')
+    with FakeAds(clean=False, body=body) as ads:
+        action, _ = install_addon.register(ads.xml, "same", enabled=True)
+        eq(action, "updated")
+        record = ads.entry(install_addon.ADDON_NAME)[1]
+        eq(record.get("Enabled"), "1")
+        eq(record.get("Extra"), "keep")
+        _others_untouched(ads, "（补齐启用状态）")
+
+
 def test_reinstall_updates_only_our_path():
     with FakeAds() as ads:
         target_a = _target_init(r"D:\位置 A\ADSAgent")

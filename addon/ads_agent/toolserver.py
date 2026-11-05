@@ -26,6 +26,7 @@ import itertools
 import json
 import os
 import queue
+import socket
 import threading
 import time
 import sys
@@ -334,6 +335,10 @@ class BusyError(RuntimeError):
 _jobs: "queue.Queue" = queue.Queue()
 _server = None
 _server_thread = None
+_server_ready = None
+_server_stop_thread = None
+_server_lock = threading.RLock()
+_SERVER_STOP_TIMEOUT = 2.0
 _pump_timer = None  # QTimer, created on the Qt main thread
 
 # 正在执行的作业：job_id -> {"name", "started", "timed_out", "client_id", "cancel_requested"}
@@ -1232,11 +1237,61 @@ def ensure_started() -> str:
     # 无 Qt 事件循环时（后端进程/测试）返回 None，pump 兜底刷新仍有效。
     ensure_heartbeat_timer()
 
+    with _server_lock:
+        _ensure_server_started()
+        host, port = _server.server_address[:2]
+        return f"http://{host}:{port}"
+
+
+def _retire_dead_server() -> None:
+    """Release only a confirmed-dead listener, without touching any jobs."""
+    global _server, _server_thread, _server_ready, _server_stop_thread
+    if _server_thread is not None and _server_thread.is_alive():
+        raise RuntimeError("工具服务线程仍在运行，不能释放监听端口")
+    if _server is not None:
+        _server.server_close()
+        _server = None
+        _clear_instance()
+    _server_thread = None
+    _server_ready = None
+    _server_stop_thread = None
+
+
+def _create_http_server(host, port):
+    """Windows 必须独占监听：SO_REUSEADDR 允许多个进程绑定同一端口。"""
+    server = ThreadingHTTPServer((host, port), _Handler, bind_and_activate=False)
+    try:
+        if os.name == "nt":
+            server.allow_reuse_address = False
+            server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        server.server_bind()
+        server.server_activate()
+    except BaseException:
+        server.server_close()
+        raise
+    return server
+
+
+def _ensure_server_started() -> None:
+    global _server, _server_thread, _server_ready, _server_stop_thread
+    if _server is not None:
+        if _server_thread is not None and _server_thread.is_alive():
+            if _server_stop_thread is not None:
+                raise RuntimeError("工具服务正在停止，无法重新启动")
+            configured = (_setting("ads", "host", "127.0.0.1"), int(_setting("ads", "port", "8761")))
+            if configured != _server._ads_config_address:
+                actual = _server.server_address
+                raise RuntimeError(f"工具服务仍监听 {actual[0]}:{actual[1]}，但配置已改为 "
+                                   f"{configured[0]}:{configured[1]}；请先保存工作，关闭 ADS 后重启插件和后端。")
+            return
+        _retire_dead_server()
+
     if _server is None:
         host = _setting("ads", "host", "127.0.0.1")
         port = int(_setting("ads", "port", "8761"))
         try:
-            _server = ThreadingHTTPServer((host, port), _Handler)
+            _server = _create_http_server(host, port)
+            _server._ads_config_address = (host, port)
         except OSError as e:
             # 裸 OSError([WinError 10048]) 对用户毫无信息量：说不出是多开了一个
             # ADS、装了两份插件，还是别的软件占了端口。这里翻译成人话再抛。
@@ -1244,16 +1299,61 @@ def ensure_started() -> str:
             _log("ERROR", f"工具服务启动失败: {detail}")
             raise RuntimeError(detail) from e
         _server.daemon_threads = True
+        # service_actions is reached only inside serve_forever's try/finally;
+        # from then on shutdown() is guaranteed to have its completion event set
+        # even if the loop exits unexpectedly.
+        _server_ready = threading.Event()
+        ready = _server_ready
+        service_actions = _server.service_actions
+        def mark_ready():
+            ready.set()
+            service_actions()
+        _server.service_actions = mark_ready
         _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
-        _server_thread.start()
+        try:
+            _server_thread.start()
+        except BaseException:
+            # No registration was written, so do not clear another instance's record.
+            if not _server_thread.is_alive():
+                _server.server_close()
+                _server = _server_thread = _server_ready = None
+            raise
         _register_instance(host, port)
         _log("INFO", f"工具服务已监听 {host}:{port}")
 
-    return f"http://{_setting('ads', 'host', '127.0.0.1')}:{_setting('ads', 'port', '8761')}"
-
 
 def shutdown() -> None:
-    global _server, _server_thread, _pump_timer, _heartbeat_timer
+    global _server_stop_thread, _pump_timer, _heartbeat_timer
+    with _server_lock:
+        if _server is not None:
+            thread = _server_thread
+            deadline = time.monotonic() + _SERVER_STOP_TIMEOUT
+            # Never call BaseServer.shutdown before serve_forever has entered
+            # its loop: its completion event starts unset and would deadlock.
+            while thread is not None and thread.is_alive() and not (
+                    _server_ready is not None and _server_ready.is_set()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("工具服务尚未进入运行循环，未关闭存活服务")
+                if _server_ready is not None:
+                    _server_ready.wait(min(remaining, 0.05))
+                else:
+                    thread.join(min(remaining, 0.05))
+            if thread is not None and thread.is_alive():
+                if _server_stop_thread is None:
+                    _server_stop_thread = threading.Thread(target=_server.shutdown, daemon=True)
+                    try:
+                        _server_stop_thread.start()
+                    except BaseException:
+                        if not _server_stop_thread.is_alive():
+                            _server_stop_thread = None
+                        raise
+                _server_stop_thread.join(timeout=_SERVER_STOP_TIMEOUT)
+                thread.join(timeout=_SERVER_STOP_TIMEOUT)
+                if thread.is_alive():
+                    raise RuntimeError("工具服务停止超时，保留存活服务及作业")
+            _retire_dead_server()
+            _log("INFO", "工具服务已停止")
     if _pump_timer is not None:
         _pump_timer.stop()
         _pump_timer.deleteLater()
@@ -1265,12 +1365,3 @@ def shutdown() -> None:
         except Exception:  # noqa: BLE001 — 关停路径不抛异常
             pass
         _heartbeat_timer = None
-    if _server is not None:
-        _server.shutdown()
-        _server.server_close()
-        _server = None
-        _server_thread = None
-        # 正常退出必须清掉登记：否则下一次启动会看到一个 pid 已死的陈旧记录，
-        # 只能靠 pid 存活兜底清理（能清，但没必要留这个坑）
-        _clear_instance()
-        _log("INFO", "工具服务已停止")

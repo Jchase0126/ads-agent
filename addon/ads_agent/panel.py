@@ -525,11 +525,8 @@ class ContextUsagePopup(QFrame):
     """上下文用量详情浮层（不是超长 tooltip）：分组显示、贴屏幕边缘自动收敛。"""
 
     def __init__(self, parent=None):
-        # Tool | StaysOnTop 而不是 ToolTip：Windows 上 Qt 会对 ToolTip 标志的
-        # 窗口做原生自动关闭（任何按下/激活变化都可能把它收走），绕过本类的
-        # 显隐逻辑造成"弹一下就消失"；Tool 没有这个行为，仍不进任务栏。
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint)
+        # 宿主窗口内的普通子控件，不创建独立的原生顶层窗口，避免干扰 ADS 激活状态。
+        super().__init__(parent)
         self.setObjectName("contextUsagePopup")
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         # 不抢鼠标事件，也不抢焦点：浮层只是"看"，点击/键盘都留在面板里。
@@ -553,16 +550,18 @@ class ContextUsagePopup(QFrame):
             f"color:{pal['text']};{U.font_css()}}}")
 
     def set_palette(self, pal):
-        if pal:
+        if pal and pal != self._pal:
             self._pal = pal
             self._apply_style()
             self._render()
             self.adjustSize()
 
     def set_groups(self, groups):
-        self._groups = list(groups or [])
-        self._render()
-        self.adjustSize()
+        groups = list(groups or [])
+        if groups != self._groups:
+            self._groups = groups
+            self._render()
+            self.adjustSize()
 
     def text(self):
         """纯文本（测试与无障碍读取用）。"""
@@ -575,7 +574,8 @@ class ContextUsagePopup(QFrame):
 
     def _clear(self):
         for widget in self._labels + self._bars:
-            widget.setParent(None)
+            self._layout.removeWidget(widget)
+            widget.hide()
             widget.deleteLater()
         self._labels = []
         self._bars = []
@@ -591,7 +591,7 @@ class ContextUsagePopup(QFrame):
             for line in group.get("lines") or []:
                 label = QLabel(str(line))
                 label.setFont(U.qfont("small"))
-                label.setWordWrap(False)
+                label.setWordWrap(True)
                 self._layout.addWidget(label)
                 self._labels.append(label)
             if group.get("bar") is not None:
@@ -603,28 +603,28 @@ class ContextUsagePopup(QFrame):
                 label = QLabel(str(note))
                 label.setFont(U.qfont("micro"))
                 label.setStyleSheet(f"color:{self._pal['subtle']};border:none;")
-                label.setWordWrap(False)
+                label.setWordWrap(True)
                 self._layout.addWidget(label)
                 self._labels.append(label)
 
     def show_at(self, anchor):
-        """贴在锚点上方显示；屏幕边缘（含多显示器）自动收敛回可视区。"""
+        """在宿主窗口内定位；不创建或置顶原生窗口。"""
+        host = self.parentWidget()
+        self.setMaximumWidth(max(1, host.width() - U.px(8)))
         self.adjustSize()
-        center = anchor.mapToGlobal(QPoint(anchor.width() // 2, 0))
-        screen = (QtWidgets.QApplication.screenAt(center)
-                  or QtWidgets.QApplication.primaryScreen())
-        area = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 800)
+        center = host.mapFromGlobal(anchor.mapToGlobal(QPoint(anchor.width() // 2, 0)))
         width, height = self.width(), self.height()
         margin = U.px(4)
         x = center.x() - width // 2
         y = center.y() - height - U.px(6)
-        if y < area.top() + margin:
-            y = anchor.mapToGlobal(QPoint(0, anchor.height())).y() + U.px(6)
-        x = max(area.left() + margin, min(x, area.right() - width - margin))
-        y = max(area.top() + margin, min(y, area.bottom() - height - margin))
+        if y < margin:
+            y = center.y() + anchor.height() + U.px(6)
+        x = max(0, min(x, host.width() - width - margin))
+        y = max(0, min(y, host.height() - height - margin))
         self.move(x, y)
-        self.show()
-        self.raise_()
+        if not self.isVisible():
+            self.show()
+            self.raise_()
 
 
 def _context_ring_color(pct: float, base: str) -> str:
@@ -678,7 +678,9 @@ class ContextUsageIndicator(QToolButton):
         self.setToolTip(tip)
         self.setAccessibleDescription(tip)
         if self._popup is not None and self._popup.isVisible():
-            self._show_popup()      # 浮层开着时实况刷新，不用重新点一次
+            # 刷新内容不改变悬浮/离开计时，也不反复置顶。
+            self._popup.set_groups(self.detail_groups())
+            self._popup.show_at(self)
         self.update()
 
     def _tooltip_text(self):
@@ -893,9 +895,14 @@ class ContextUsageIndicator(QToolButton):
         return "\n\n".join(block for block in blocks if block)
 
     def _popup_widget(self):
+        host = self.window()
         if self._popup is None:
-            self._popup = ContextUsagePopup(self)
+            self._popup = ContextUsagePopup(host)
+            self._popup.hide()
             self._popup.set_palette(self._pal)
+        elif self._popup.parentWidget() is not host:
+            self._popup.hide()
+            self._popup.setParent(host)
         return self._popup
 
     def _show_popup(self):
@@ -904,15 +911,14 @@ class ContextUsageIndicator(QToolButton):
         popup = self._popup_widget()
         popup.set_palette(self._pal)
         popup.set_groups(self.detail_groups())
-        # show_at 内部是 move+show+raise；已可见时 Qt 对 show() 幂等，不会闪烁。
         popup.show_at(self)
-        # Tool 窗口没有 ToolTip 的"点哪都自动关"原生行为：自己装过滤器补上。
         QtWidgets.QApplication.instance().installEventFilter(self)
 
     def _hide_popup(self):
         self._leave_timer.stop()
-        if self._popup is not None and self._popup.isVisible():
-            QtWidgets.QApplication.instance().removeEventFilter(self)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         self._hover_timer.stop()
         if self._popup is not None:
             self._popup.hide()
@@ -957,13 +963,17 @@ class ContextUsageIndicator(QToolButton):
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
-        # 不立即收起：200ms 宽限期内回来就当没离开过（消灭边缘抖动闪收）。
-        self._leave_timer.start()
+        # 先取消待打开计时器，避免鼠标离开后迟到弹出。
+        self._hover_timer.stop()
+        if self._popup is not None and self._popup.isVisible():
+            self._leave_timer.start()
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
         self._leave_timer.stop()
-        self._show_popup()
+        # 鼠标点击由 clicked 打开，避免焦点事件先打开、点击又立即关掉。
+        if event.reason() != Qt.FocusReason.MouseFocusReason:
+            self._show_popup()
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
@@ -2152,7 +2162,7 @@ class AgentPanelWidget(QWidget):
         self.theme_btn = self._round_tool_button("🌙", "深色 / 浅色主题")
         self.theme_btn.clicked.connect(self._toggle_theme)
         top.addWidget(self.theme_btn)
-        self.settings_btn = self._round_tool_button("", "模型与连接设置", checkable=True)
+        self.settings_btn = self._round_tool_button("", "打开模型设置和通用设置", checkable=True)
         self.settings_btn.setFixedWidth(U.px(92))
         self.settings_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.settings_btn.toggled.connect(self._toggle_settings)
@@ -3841,7 +3851,7 @@ class AgentPanelWidget(QWidget):
             button.setText("")
             button.setIcon(_draw_icon(name, pal['text'], U.px(16)))
             button.setIconSize(QSize(U.px(16), U.px(16)))
-        self.settings_btn.setText("模型设置")
+        self.settings_btn.setText("设置")
         self.settings_btn.setAccessibleName("模型设置：配置连接、模型和工具权限")
         self.settings_btn.setStyleSheet(
             f"QToolButton{{color:{pal['text']};background:{pal['card_bg']};"
@@ -3880,13 +3890,47 @@ class AgentPanelWidget(QWidget):
         page_layout = QVBoxLayout(self.settings_page)
         page_layout.setContentsMargins(0, 0, 0, 0)
         header = QHBoxLayout()
-        self.settings_heading = QLabel("模型设置")
+        self.settings_heading = QLabel("设置")
         self.settings_heading.setFont(U.qfont("title", bold=True))
         header.addWidget(self.settings_heading, 1)
         self.settings_close = self._round_tool_button("", "关闭设置，返回对话 (Esc)")
         self.settings_close.clicked.connect(lambda: self.settings_btn.setChecked(False))
         header.addWidget(self.settings_close)
         page_layout.addLayout(header)
+        navigation = QHBoxLayout()
+        navigation.setSpacing(U.px(8))
+        self.model_settings_tab = QPushButton("模型设置")
+        self.general_settings_tab = QPushButton("通用设置")
+        for tab in (self.model_settings_tab, self.general_settings_tab):
+            tab.setCheckable(True)
+            tab.setCursor(Qt.CursorShape.PointingHandCursor)
+            navigation.addWidget(tab, 1)
+        self.model_settings_tab.setAccessibleName("模型设置：供应商、连接和模型")
+        self.general_settings_tab.setAccessibleName("通用设置：工具权限、软件更新与诊断")
+        self.model_settings_tab.clicked.connect(lambda: self._select_settings_section(0))
+        self.general_settings_tab.clicked.connect(lambda: self._select_settings_section(1))
+        page_layout.addLayout(navigation)
+        self.settings_sections = QStackedWidget()
+        page_layout.addWidget(self.settings_sections, 1)
+        self.model_settings_page = QWidget()
+        model_page_layout = QVBoxLayout(self.model_settings_page)
+        model_page_layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_sections.addWidget(self.model_settings_page)
+        self.general_settings_scroll = QScrollArea()
+        self.general_settings_scroll.setWidgetResizable(True)
+        self.general_settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.general_settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.general_settings_box = QWidget()
+        self.general_settings_box.setObjectName("settingsCard")
+        gv = QVBoxLayout(self.general_settings_box)
+        gv.setContentsMargins(U.px(18), U.px(18), U.px(18), U.px(18))
+        gv.setSpacing(U.px(10))
+        general_heading = QLabel("通用设置")
+        general_heading.setFont(U.qfont("title", bold=True))
+        gv.addWidget(general_heading)
+        self.general_settings_scroll.setWidget(self.general_settings_box)
+        self.settings_sections.addWidget(self.general_settings_scroll)
+        self.model_settings_tab.setChecked(True)
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -3935,7 +3979,7 @@ class AgentPanelWidget(QWidget):
         side.addWidget(self.saved_model_list, 1)
         self.settings_columns.addWidget(self.models_sidebar)
         self.settings_columns.addWidget(self.settings_scroll, 1)
-        page_layout.addLayout(self.settings_columns, 1)
+        model_page_layout.addLayout(self.settings_columns, 1)
         self.settings_box = QWidget()
         self.settings_box.setObjectName("settingsCard")
         sv = QVBoxLayout(self.settings_box)
@@ -4094,41 +4138,44 @@ class AgentPanelWidget(QWidget):
         self.model_list_hint = QLabel("勾选多个模型并保存，即可在输入栏切换；也可手动添加。")
         self.model_list_hint.setWordWrap(True)
         self.model_list_hint.hide()
+        self.shared_connection_hint = QLabel("同一供应商的模型共用 API 地址和密钥。")
+        self.shared_connection_hint.setWordWrap(True)
+        sv.addWidget(self.shared_connection_hint)
+
         self.permission_heading = QLabel("工具权限")
-        sv.addWidget(self.permission_heading)
+        gv.addWidget(self.permission_heading)
         self.python_setting = QCheckBox("允许执行 ADS Python")
         self.python_setting.setChecked(self.allow_python.isChecked())
         self.python_setting.setToolTip("启用脚本工具，用于读取和修改 ADS 设计")
         self.python_setting.toggled.connect(self.allow_python.setChecked)
         self.allow_python.toggled.connect(self.python_setting.setChecked)
-        sv.addWidget(self.python_setting)
-
-        self.shared_connection_hint = QLabel("同一供应商的模型共用 API 地址和密钥。")
-        self.shared_connection_hint.setWordWrap(True)
-        sv.addWidget(self.shared_connection_hint)
+        gv.addWidget(self.python_setting)
+        self.permission_hint = QLabel("仅控制 ADS Python 脚本工具，对后续请求立即生效；其他工具仍可能修改设计。")
+        self.permission_hint.setWordWrap(True)
+        gv.addWidget(self.permission_hint)
 
         # ---- 崩溃/卡死诊断：已改为后端静默自动上传（联网时），UI 不再显示任何开关；
         # 菜单「报告问题 / 反馈崩溃…」仍可手动生成报告。
         self.feedback_heading = QLabel("崩溃与诊断")
-        sv.addWidget(self.feedback_heading)
+        gv.addWidget(self.feedback_heading)
         self.feedback_hint = QLabel(
-            "出现崩溃或卡死时，插件会自动在后端生成脱敏诊断报告；联网时自动上传给作者用于修复，"
-            "并在本机保留副本。此过程不需要你登录或操作。")
+            "出现崩溃或卡死时会在本机生成脱敏诊断报告；满足自动上传配置及凭据等条件时可能上传，"
+            "上传失败时保留本机记录。也可通过菜单手动报告问题。")
         self.feedback_hint.setObjectName("settings.feedback.hint")
         self.feedback_hint.setWordWrap(True)
-        sv.addWidget(self.feedback_hint)
+        gv.addWidget(self.feedback_hint)
 
         # ---- 软件更新（只下载与校验安装包；真正的安装要用户关掉 ADS 后自己运行）
         self.update_heading = QLabel("软件更新")
-        sv.addWidget(self.update_heading)
+        gv.addWidget(self.update_heading)
         self.update_status_label = QLabel("还没有检查过更新。")
         self.update_status_label.setObjectName("settings.update.status")
         self.update_status_label.setWordWrap(True)
-        sv.addWidget(self.update_status_label)
+        gv.addWidget(self.update_status_label)
         self.update_auto_check = QCheckBox("启动时自动检查更新")
         self.update_auto_check.setObjectName("settings.update.auto_check")
         self.update_auto_check.setToolTip("只查询版本号，不下载、不安装；关掉后仅在你点按钮时才检查。")
-        sv.addWidget(self.update_auto_check)
+        gv.addWidget(self.update_auto_check)
         update_btn_row = QVBoxLayout()
         update_btn_row.setSpacing(U.px(8))
         self.update_check_btn = QPushButton("检查更新")
@@ -4154,7 +4201,7 @@ class AgentPanelWidget(QWidget):
         self.update_reveal_btn.setEnabled(False)
         self.update_reveal_btn.clicked.connect(self._reveal_update_package)
         update_btn_row.addWidget(self.update_reveal_btn)
-        sv.addLayout(update_btn_row)
+        gv.addLayout(update_btn_row)
         self.update_instruction_view = QPlainTextEdit()
         self.update_instruction_view.setObjectName("settings.update.instruction")
         self.update_instruction_view.setReadOnly(True)
@@ -4164,14 +4211,24 @@ class AgentPanelWidget(QWidget):
         self.update_instruction_view.setFixedHeight(U.px(120))
         self.update_instruction_view.setPlainText("")
         self.update_instruction_view.hide()
-        sv.addWidget(self.update_instruction_view)
+        gv.addWidget(self.update_instruction_view)
         self.update_hint = QLabel(
-            "面板只负责下载与校验安装包；安装需要你关闭全部 ADS 窗口后手动运行安装器，"
-            "面板不会自动替换任何文件。")
+            "此处的准备更新只下载并校验安装包，安装需关闭 ADS 后手动运行安装器。"
+            "顶栏出现新版本时的一键更新会自动应用更新并重启后端。")
         self.update_hint.setObjectName("settings.update.hint")
         self.update_hint.setWordWrap(True)
-        sv.addWidget(self.update_hint)
+        gv.addWidget(self.update_hint)
         self._load_update_settings()
+        self.general_save_btn = QPushButton("保存通用设置")
+        self.general_save_btn.setToolTip("保存启动时自动检查更新的选项；工具权限立即生效")
+        self.general_save_btn.clicked.connect(self._save_general_settings)
+        gv.addWidget(self.general_save_btn)
+        self.general_save_status = QLabel("工具权限立即生效；修改更新选项后请保存。")
+        self.general_save_status.setWordWrap(True)
+        gv.addWidget(self.general_save_status)
+        self.update_auto_check.toggled.connect(
+            lambda _: self.general_save_status.setText("更新选项有修改，请点击保存通用设置。"))
+        gv.addStretch(1)
 
         sv.addStretch(1)
         self.settings_scroll.setWidget(self.settings_box)
@@ -4184,7 +4241,7 @@ class AgentPanelWidget(QWidget):
         self.save_btn.setMinimumWidth(U.px(140))
         self.save_btn.setMaximumWidth(U.px(190))
         footer.addWidget(self.save_btn)
-        page_layout.addLayout(footer)
+        model_page_layout.addLayout(footer)
         self.pages.addWidget(self.settings_page)
         self.settings_page.installEventFilter(self)
         QKeySequence, QShortcut = QtGui.QKeySequence, QtGui.QShortcut
@@ -4194,12 +4251,37 @@ class AgentPanelWidget(QWidget):
         self.settings_escape.setEnabled(False)
         self._refresh_saved_models(_model_choices())
 
+    def _select_settings_section(self, index):
+        """切换设置分类，不重建表单或丢弃尚未保存的修改。"""
+        self.settings_sections.setCurrentIndex(index)
+        self.model_settings_tab.setChecked(index == 0)
+        self.general_settings_tab.setChecked(index == 1)
+        self.key_eye.setChecked(False)
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+
+    def _save_general_settings(self):
+        if self._save_update_settings():
+            self.general_save_status.setText("通用设置已保存；工具权限在后续请求生效。")
+        else:
+            self.general_save_status.setText("保存失败，请检查配置文件权限后重试。")
+
     def _style_settings(self, pal: dict):
         """设置区：模型侧栏、参数卡片与固定保存操作。"""
         base = U.font_css()
-        self.settings_scroll.setStyleSheet(
-            f"QScrollArea{{background:transparent; border:none;}}" + _scrollbar_css(pal)
-        )
+        for scroll in (self.settings_scroll, self.general_settings_scroll):
+            scroll.setStyleSheet(f"QScrollArea{{background:transparent; border:none;}}" + _scrollbar_css(pal))
+        for tab in (self.model_settings_tab, self.general_settings_tab):
+            tab.setStyleSheet(
+                f"QPushButton{{background:transparent;color:{pal['text']};border:1px solid {pal['card_border']};"
+                f"border-radius:{U.R('sm')}px;padding:{U.px(7)}px;{base}}}"
+                f"QPushButton:hover{{background:{pal['hover']};}}"
+                f"QPushButton:checked{{background:{pal['accent_soft']};border-color:{pal['accent']};"
+                f"color:{pal['text']};font-weight:bold;}}")
+        self.general_settings_box.setStyleSheet(
+            f"QWidget#settingsCard{{background:{pal['panel_bg']};border:1px solid {pal['card_border']};"
+            f"border-radius:{U.R('md')}px;}}"
+            f"QLabel{{color:{pal['text']};background:transparent;{base}}}")
+        self.general_save_btn.setStyleSheet(_button_css(pal, "primary"))
         self.settings_box.setStyleSheet(
             f"QWidget#settingsCard{{background:{pal['panel_bg']};border:1px solid {pal['card_border']};"
             f"border-radius:{U.R('md')}px;}}"
@@ -4257,8 +4339,8 @@ class AgentPanelWidget(QWidget):
             section.setStyleSheet(f"color:{pal['text']};font-size:{U.fs('small')}px;font-weight:bold;"
                                  f"padding-top:{U.px(8)}px;")
         for hint in (self.cfg_hint, self.model_list_hint, self.model_editor_hint, self.shared_connection_hint,
-                     self.settings_save_hint, self.feedback_hint,
-                     self.update_status_label, self.update_hint):
+                     self.settings_save_hint, self.feedback_hint, self.permission_hint,
+                     self.general_save_status, self.update_status_label, self.update_hint):
             hint.setStyleSheet(
                 f"color:{pal['subtle']}; font-size:{U.fs('tiny')}px;"
                 "background:transparent;" + base
@@ -4596,7 +4678,10 @@ class AgentPanelWidget(QWidget):
         self.side_btn.setEnabled(not checked)
         self.settings_escape.setEnabled(checked)
         if checked:
-            self.provider_name_edit.setFocus()
+            if self.settings_sections.currentIndex() == 0:
+                self.provider_name_edit.setFocus()
+            else:
+                self.general_settings_tab.setFocus()
         else:
             target = getattr(self, "_settings_return_focus", None) or self.input
             target.setFocus()
@@ -4940,9 +5025,8 @@ class AgentPanelWidget(QWidget):
     def _save_settings(self):
         if self._profile_loading:
             return
-        # 反馈开关是纯本机行为，先落盘；后端没起或模型没填也照样生效。
+        # 模型保存只处理模型；通用设置有独立的保存入口。
         self._persist_feedback_settings()
-        self._save_update_settings()
         model = self.model_combo.currentText().strip()
         if not model or not self.base_url_edit.text().strip():
             self.cfg_hint.setText("请填写模型名称和 API 地址。")
