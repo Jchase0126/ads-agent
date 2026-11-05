@@ -98,9 +98,11 @@ DesignMode：_pde/db/__init__.pyi L2301，READ_ONLY(0)/WRITE(1)/APPEND(2)
 import datetime
 import itertools
 import json
+import math
 import os
 import re
 import threading
+import time
 
 # ---------------------------------------------------------------------------
 # 锁：同一工作区的挂接/卸载必须串行
@@ -246,6 +248,157 @@ def _instance_library(inst):
     return master.split(":", 1)[0] if ":" in master else ""
 
 
+def _instance_master_cell(inst):
+    """实例的 master cell 名（'lib:cell:symbol' 里的 cell）。"""
+    lcv = getattr(inst, "master_lcv_name", None)
+    cell = str(getattr(lcv, "cell_name", "") or "")
+    if cell:
+        return cell
+    master = str(getattr(inst, "master_name", "") or "")
+    parts = master.split(":")
+    return parts[1] if len(parts) > 1 else ""
+
+
+def _include_role(inst):
+    """实例是不是"网表包含件"，以及是哪一种。
+
+    * ``vendor``  —— 原厂 ``<lib>_Include`` 元件：netlist 回调自己遍历
+      ``circuit/models`` 里所有 .net，带 ``#ifndef <libname>`` 守卫。
+    * ``generic`` —— ``ads_simulation:NetlistInclude``：参数
+      ``IncludeFiles`` 是 ``[[文件, 说明], ...]``，**空表时网表里一个
+      ``#include`` 都不会出现**，仿真才会报 undefined model。
+    """
+    cell = _instance_master_cell(inst)
+    if not re.search(r"include(?:_|$)", cell, re.I):
+        return ""
+    return "generic" if cell.lower() == "netlistinclude" else "vendor"
+
+
+def _include_param(inst, *names):
+    wanted = {n.lower() for n in names}
+    for p in inst.parameters:
+        if str(getattr(p, "name", "") or "").lower() in wanted:
+            return p
+    return None
+
+
+def _include_pairs(value):
+    """把 NetlistInclude 的 IncludeFiles 值归一成 [(文件, 说明), ...]。
+
+    SDK 有时给 list，有时给它的字符串形式 ``[['', '']]``；两种都只采信
+    "第一项非空"的条目 —— 空串是 ADS 给新实例的占位，不是真文件。
+    """
+    data = value
+    if isinstance(data, str):
+        try:
+            import ast as _ast
+            data = _ast.literal_eval(data.strip() or "[]")
+        except (ValueError, SyntaxError):
+            data = []
+    if not isinstance(data, (list, tuple)):
+        return []
+    pairs = []
+    for item in data:
+        if isinstance(item, str):
+            file, note = item, ""
+        elif isinstance(item, (list, tuple)) and item:
+            file = item[0]
+            note = item[1] if len(item) > 1 else ""
+        else:
+            continue
+        file = str(file or "").strip()
+        if file:
+            pairs.append((file, str(note or "")))
+    return pairs
+
+
+def _include_files(inst):
+    """实例当前会写进网表的文件列表（已去占位空串）。"""
+    param = _include_param(inst, "IncludeFiles", "IncludeFile", "File")
+    if param is None:
+        return []
+    return [file for file, _note in _include_pairs(param.value)]
+
+
+def _file_key(path):
+    """比较路径用的规范键（大小写无关、分隔符统一、尽量 realpath）。"""
+    raw = str(path or "").strip().strip('"')
+    if not raw:
+        return ""
+    try:
+        raw = os.path.realpath(raw)
+    except (OSError, ValueError):
+        pass
+    return os.path.normcase(raw.replace("/", os.sep))
+
+
+def _netlist_includes(netlist):
+    """网表里所有 ``#include "..."`` 的文件（保持原样，不解析存在性）。"""
+    return [m.group(1) for m in
+            re.finditer(r'^\s*#include\s+"([^"\r\n]+)"', str(netlist or ""), re.M | re.I)]
+
+
+def _include_entry_path(ws_path: str, path: str) -> str:
+    """NetlistInclude 的 IncludeFiles 该写的路径形式。
+
+    实测（ADS 2027）：这一栏**按工作区相对路径**解释，生成网表时 ADS
+    自己拼上工作区根目录。写绝对路径会被再拼一次，变成
+    ``<ws>\\E:\\...`` 这种不存在的路径（仿真报文件不存在）。只有不在
+    工作区内的文件才退回绝对路径。
+    """
+    file = str(path or "").strip().strip('"')
+    if not file:
+        return ""
+    try:
+        rel = os.path.relpath(file, ws_path)
+    except ValueError:
+        return file
+    if rel.startswith("..") or os.path.isabs(rel):
+        return file
+    return rel.replace("\\", "/")
+
+
+def _resolve_include_path(ws_path: str, path: str) -> str:
+    """把 IncludeFiles 里记的值还原成真实文件路径（相对项按工作区展开）。"""
+    file = str(path or "").strip().strip('"')
+    if not file:
+        return ""
+    if not os.path.isabs(file):
+        file = os.path.join(ws_path, file)
+    try:
+        return os.path.realpath(file)
+    except (OSError, ValueError):
+        return file
+
+
+def _vendor_net_files(ws_path: str, library_names):
+    """库 -> 该库 ``circuit/models`` 下所有 .net 的绝对路径。
+
+    原厂 Include 回调用 ``get_dir_files(<LIB>_CIRCUIT_MODEL_DIR, "net")``
+    遍历同一个目录，所以这里的清单就是"原厂 Include 会包含什么"。
+    """
+    entries = _load_record(ws_path).get("entries") or {}
+    out = {}
+    for name in sorted({str(n) for n in library_names if str(n)}):
+        rec = entries.get(name)
+        if not isinstance(rec, dict):
+            continue
+        root = str(rec.get("kit_root") or "")
+        if not root:
+            continue
+        models = os.path.join(root, "circuit", "models")
+        if not os.path.isdir(models):
+            continue
+        files = []
+        for entry in sorted(os.listdir(models)):
+            path = os.path.join(models, entry)
+            if entry.lower().endswith(".net") and os.path.isfile(path):
+                files.append(os.path.realpath(path))
+        if files:
+            out[name] = files[:64]
+    return out
+
+
 def check_simulation_netlist(plan: dict, netlist: str) -> dict:
     """Check encoded namespaces and recursively included factory netlists.
 
@@ -299,18 +452,91 @@ def check_simulation_netlist(plan: dict, netlist: str) -> dict:
 
 
 def prepare_design_dependencies(design, ws_path: str, *, place_includes=False) -> dict:
-    """Add unique factory Include components during an authorized design build.
+    """解析/补齐原厂模型的网表包含件（Include）。
 
-    During read-only simulation preflight, report missing/ambiguous includes
-    instead of editing an existing schematic. Candidates are restricted to the
-    used registered library and must have a real symbol and model definition.
+    ADS 2027 实测有两套机制，语义不同：
+
+    * 原厂 ``<lib>_Include`` 元件：netlist 回调遍历
+      ``circuit/models`` 下所有 .net，输出 ``#ifndef <lib>`` +
+      ``#include "<绝对路径>"``；
+    * 通用 ``ads_simulation:NetlistInclude``：只有 ``IncludeFiles`` 里
+      有真实文件时才输出 ``#include``；默认占位 ``[['', '']]`` 时网表
+      里**一条都没有**，仿真只会报 undefined model / coded model 加载失败。
+
+    因此先认设计里**已有的** Include 元件：空的 NetlistInclude 就地补上
+    该库 ``circuit/models`` 下的 .net（构建时 place_includes=True），只有
+    一种机制都没有、且没有文件被覆盖时才添加原厂 Include 元件。同一批
+    模型文件绝不重复包含（同一模型定义被包含两次，hpeesofsim 会报重复
+    定义），所以存在未覆盖文件的 NetlistInclude 时改为如实报问题，让
+    调用方决定，而不是悄悄再塞一个 Include。
     """
     insts = list(design.instances)
     names = {_instance_library(i) for i in insts} - {""}
     plan = simulation_dependency_plan(ws_path, names)
     plan["include_instances"] = []
+    plan["filled_includes"] = []
+    plan["include_files"] = []
+    plan["include_sources"] = {}
     registered = _load_record(ws_path).get("entries") or {}
-    for name in sorted(names & set(registered)):
+    vendor_libs = sorted(names & set(registered))
+    needed = _vendor_net_files(ws_path, vendor_libs)
+
+    generic = []
+    covered = set()
+    for inst in insts:
+        role = _include_role(inst)
+        if not role:
+            continue
+        if role == "generic":
+            # IncludeFiles 里存的是工作区相对路径，比较前必须还原成真实
+            # 文件路径 —— 否则第二次构建会以为"没覆盖"，重复加原厂 Include。
+            files = [_resolve_include_path(ws_path, f) for f in _include_files(inst)]
+            generic.append((inst, files))
+        else:
+            # 原厂 Include 元件自己遍历该库 circuit/models 下所有 .net，
+            # 所以它的"覆盖范围"就是这个库的模型文件全集（参数里看不到）。
+            owner = _instance_library(inst)
+            files = needed.get(owner) or []
+            plan["include_sources"][owner] = str(inst.inst_name)
+        covered.update(_file_key(f) for f in files)
+
+    # 1) 空的 NetlistInclude 就地补文件：SDK 没有删除实例的 API，而占位
+    #    实例在网表里是"零 include"，留着不管就是仿真失败的直接原因。
+    if place_includes and needed:
+        all_files = sorted({f for files in needed.values() for f in files})
+        # 优先用空的那个；已经有文件的也允许**追加**缺的文件 —— 同一份模型
+        # 定义被两个包含件各引一次会报重复定义，所以宁可原地补齐。
+        target = next((i for i, fs in generic if not fs), None)
+        if target is None and generic:
+            target = generic[0][0]
+        if target is not None and all_files:
+            param = _include_param(target, "IncludeFiles")
+            if param is not None:
+                pairs = _include_pairs(param.value)
+                have = {_file_key(_resolve_include_path(ws_path, f)) for f, _n in pairs}
+                missing = [f for f in all_files if _file_key(f) not in have]
+                if missing:
+                    param.value = ([[_include_entry_path(ws_path, f), n] for f, n in pairs] +
+                                   [[_include_entry_path(ws_path, f), ""] for f in missing])
+                    try:
+                        target.invoke_item_parameter_changed_callback([str(param.name)])
+                    except Exception:  # noqa: BLE001 - 回调失败不该掩盖已写入的值
+                        pass
+                    covered.update(_file_key(f) for f in all_files)
+                    plan["filled_includes"].append(str(target.inst_name))
+                    plan["include_sources"]["netlist_include"] = str(target.inst_name)
+
+    existing_vendor = {}
+    for inst in insts:
+        if _include_role(inst) == "vendor":
+            existing_vendor[(_instance_library(inst), _instance_master_cell(inst))] = \
+                str(inst.inst_name)
+
+    for name in vendor_libs:
+        files = needed.get(name) or []
+        if files and all(_file_key(f) in covered for f in files):
+            plan["include_sources"].setdefault(name, "include_present")
+            continue
         lib = _library_for(name)
         candidates = []
         for cell in list(lib.cells):
@@ -318,19 +544,39 @@ def prepare_design_dependencies(design, ws_path: str, *, place_includes=False) -
             if re.search(r"include(?:_|$)", cn, re.I) and \
                     getattr(cell, "model_def", None) is not None and cell.view_exists("symbol"):
                 candidates.append(cn)
-        existing = {str(getattr(getattr(i, "master_lcv_name", None), "cell_name", "") or
-                        str(getattr(i, "master_name", "") or "").split(":")[-1])
-                    for i in insts if _instance_library(i) == name}
-        if existing & set(candidates):
-            continue
         if not candidates:
             continue  # No Include requirement can be inferred for self-contained models.
         if len(candidates) != 1:
             plan["problems"].append(f"库 {name} 有多个 Include 元件，请明确选用：{candidates}")
             continue
         master = f"{name}:{candidates[0]}:symbol"
+        # 原厂 Include 元件已经在设计里：不管参数里看不看得到文件（它遍历
+        # circuit/models 目录），都不要再放第二个 —— 同一批模型定义被包含
+        # 两次，hpeesofsim 会报重复定义。
+        if (name, candidates[0]) in existing_vendor:
+            plan["include_sources"].setdefault(name, existing_vendor[(name, candidates[0])])
+            continue
+        overlap = [f for f in files if _file_key(f) in covered]
         if not place_includes:
-            plan["problems"].append(f"设计缺少原厂 Include 元件 {master}；请先放置该元件")
+            if files:
+                empty_hint = ""
+                empty_generic = [str(i.inst_name) for i, fs in generic if not fs]
+                if empty_generic:
+                    empty_hint = (
+                        f"（设计里的 {'/'.join(empty_generic)} 是 NetlistInclude，"
+                        f"IncludeFiles 还是空的 —— 空表不会产生任何 #include）")
+                plan["problems"].append(
+                    f"设计里没有会包含 {files[0]} 的 Include：缺原厂元件 {master}"
+                    f"{empty_hint}。缺了它仿真会报 undefined model；"
+                    f"可调用 repair_model_includes 就地补上")
+            else:
+                plan["problems"].append(f"设计缺少原厂 Include 元件 {master}；请先放置该元件")
+            continue
+        if overlap:
+            plan["problems"].append(
+                f"库 {name} 的模型文件已被现有的 NetlistInclude 包含"
+                f"（{overlap[0]}），但还有文件没覆盖；"
+                f"为避免同一模型定义被包含两次，未自动追加原厂 Include 元件 {master}")
             continue
         used = {str(getattr(i, "inst_name", "")) for i in insts}
         serial = 1
@@ -341,7 +587,11 @@ def prepare_design_dependencies(design, ws_path: str, *, place_includes=False) -
         if list(inst.inst_pins):
             raise RuntimeError(f"候选 Include {master} 带电气引脚，不能作为无连接模型包含件自动添加")
         insts.append(inst)
+        covered.update(_file_key(f) for f in files)
         plan["include_instances"].append(str(inst.inst_name))
+        plan["include_sources"][name] = str(inst.inst_name)
+
+    plan["include_files"] = sorted({f for files in needed.values() for f in files})
     plan["ok"] = not plan["problems"]
     if not plan["ok"]:
         raise RuntimeError("原厂模型依赖未就绪：\n- " + "\n- ".join(plan["problems"]))
@@ -931,15 +1181,26 @@ _PARAM_RANGE_REASON = (
 )
 
 
-def _model_param_entries(model_def, limit: int = 200) -> dict:
+def _model_param_entries(model_def, limit: int = 200,
+                         include_choices: bool = True,
+                         choices_limit: int = 5,
+                         max_choice_params: int = 8) -> dict:
     """把 model_def.parameters 读成可序列化 dict。
 
     只报**真实读到**的：name / label / unit / param_type / default /
     is_editable / is_discrete_value / is_netlistable / is_optimizable。
+
+    ``include_choices`` 时再补两样**从 formset 真实枚举**出来的东西：
+      * ``selection``：该参数是不是「只能从常量选项表里选」（如原厂料号）；
+      * ``choices``：选项表前几项（form 名/料号/Value/Tolerance/…）。
+    展开是**有预算的**（max_choice_params 个参数 × choices_limit 项），
+    未展开的参数明确写 skipped，不假装它没有选项表。
+
     取值范围一律 null + 原因（见 _PARAM_RANGE_REASON）。
     """
     out: dict = {"available": False, "parameters": [], "count": None,
-                 "error": "", "range_note": _PARAM_RANGE_REASON}
+                 "error": "", "range_note": _PARAM_RANGE_REASON,
+                 "selector_params": [], "selection_note": ""}
     try:
         params = list(model_def.parameters)
     except Exception as e:  # noqa: BLE001
@@ -947,6 +1208,7 @@ def _model_param_entries(model_def, limit: int = 200) -> dict:
         return out
     out["available"] = True
     out["count"] = len(params)
+    by_name: dict = {}
     for p in params[:max(1, int(limit))]:
         try:
             nm = str(p.name or "")
@@ -954,6 +1216,8 @@ def _model_param_entries(model_def, limit: int = 200) -> dict:
             continue
         if not nm:
             continue
+        by_name[nm] = p
+        sel = _param_selection(p)
         out["parameters"].append({
             "name": nm,
             "label": str(getattr(p, "label", "") or ""),
@@ -967,13 +1231,69 @@ def _model_param_entries(model_def, limit: int = 200) -> dict:
             "is_discrete_value": _param_bool(p, "is_discrete_value"),
             "is_netlistable": _param_bool(p, "is_netlistable"),
             "is_optimizable": _param_bool(p, "is_optimizable"),
+            "formset": (sel.get("formset") or ""),
         })
     if len(params) > len(out["parameters"]):
         out["truncated"] = len(params) - len(out["parameters"])
+
+    if include_choices:
+        budget = max(0, int(max_choice_params or 0))
+        per = max(1, int(choices_limit or 1))
+        for entry in out["parameters"]:
+            p = by_name.get(entry["name"])
+            if p is None or not entry.get("formset"):
+                continue
+            info = _param_selection(p, with_count=True)
+            if not info:
+                continue
+            entry["selection"] = info
+            out["selector_params"].append({
+                "param": entry["name"],
+                "formset": info.get("formset") or "",
+                "option_count": info.get("count"),
+                "selectable": info.get("selectable"),
+                "free_text_allowed": info.get("free_text_allowed"),
+            })
+            if budget <= 0:
+                entry["choices"] = {
+                    "skipped": True,
+                    "note": "为控制输出体积未展开；对该参数单独查询，"
+                            "或用 search_model_parts 按目标值检索料号。"}
+                continue
+            budget -= 1
+            choices = _enumerate_choices(p, limit=per)
+            preview = []
+            for item in (choices.get("items") or []):
+                if item.get("kind") != "constant" or item.get("placeholder"):
+                    continue
+                preview.append({k: item.get(k) for k in
+                                ("form", "part_number", "value", "tolerance",
+                                 "rated_current", "freq_range",
+                                 "netlist_value")})
+            count = int(choices.get("count") or 0)
+            entry["choices"] = {
+                "formset": choices.get("formset") or "",
+                "count": count,
+                "items": preview,
+                "truncated": max(0, len([i for i in (choices.get("items") or [])
+                                         if i.get("kind") == "constant"
+                                         and not i.get("placeholder")])
+                                 - len(preview))
+                + max(0, count - len(choices.get("items") or [])),
+                "note": "料号参数只能给 form 名/料号（或其网表序号），"
+                        "不能自填数值；Value/Tolerance 等派生字段由原厂回调填，"
+                        "不要手填。",
+            }
+        if out["selector_params"]:
+            out["selection_note"] = (
+                "以下参数是**离散选项表**（原厂料号等），只能从选项里选："
+                + ", ".join(f"{s['param']}({s['option_count']} 项)"
+                            for s in out["selector_params"])
+                + "。用 search_model_parts 按目标值/容差/电流反查料号。")
     return out
 
 
-def _model_def_info(model_def) -> dict:
+def _model_def_info(model_def, **entry_kwargs) -> dict:
     """model_def 的标量属性 + 参数定义。"""
     out: dict = {}
     for key, attr in (("name", "name"), ("label", "label"),
@@ -985,7 +1305,37 @@ def _model_def_info(model_def) -> dict:
             out[key] = None
             out[key + "_error"] = f"{type(e).__name__}: {e}"
     out["impl_class"] = type(model_def).__name__
-    out.update(_model_param_entries(model_def))
+    out.update(_model_param_entries(model_def, **entry_kwargs))
+    return out
+
+
+def _selector_params_summary(model_def) -> list:
+    """便宜版：只报「哪些参数是离散选项表」与选项数，不展开选项内容。
+
+    列表类工具（几百个 cell）用它给出**足够判断**的信息：调用方知道
+    「这个元件的 PartNumber 要从 100 项里选」，再对具体 cell 调
+    inspect_component_model 看选项表。
+    """
+    out: list = []
+    try:
+        params = list(model_def.parameters)
+    except Exception:  # noqa: BLE001
+        return out
+    for p in params:
+        try:
+            nm = str(p.name or "")
+        except Exception:  # noqa: BLE001
+            continue
+        if not nm:
+            continue
+        info = _param_selection(p, with_count=True)
+        if not info:
+            continue
+        out.append({"param": nm, "formset": info.get("formset") or "",
+                    "option_count": info.get("count"),
+                    "selectable": info.get("selectable"),
+                    "free_text_allowed": info.get("free_text_allowed"),
+                    "example": info.get("example") or ""})
     return out
 
 
@@ -1046,6 +1396,23 @@ def _library_kind(lib, ws_path: str) -> str:
     if ws and (p == ws or p.startswith(ws + os.sep)):
         return "workspace"
     return "design_kit"
+
+
+def _is_attached_vendor_lib(lib, ws_path: str) -> bool:
+    """这个库是不是 attach_design_kit 解压到工作区里的原厂包。
+
+    判据是真实路径：``<workspace>/ads_agent_models/...``。不按库名猜，
+    因为库名由原厂包自己决定（muRataLibWeb_L、TDK_... 等各不相同）。
+    """
+    try:
+        p = _norm_path(getattr(lib, "path", "") or getattr(lib, "lib_path", ""))
+    except Exception:  # noqa: BLE001
+        return False
+    ws = _norm_path(ws_path)
+    if not p or not ws:
+        return False
+    root = os.path.join(ws, "ads_agent_models")
+    return p == root or p.startswith(root + os.sep)
 
 
 def _find_cell(lib, cell_name: str):
@@ -2623,6 +2990,15 @@ def list_library_components(args: dict, ctx=None) -> dict:
     want_kind = str(args.get("kind") or "").strip().lower()
     include_params = args.get("include_params")
     include_params = True if include_params is None else bool(include_params)
+    include_choices = bool(args.get("include_choices"))
+    try:
+        choices_limit = max(1, int(args.get("choices_limit") or 3))
+    except (TypeError, ValueError):
+        choices_limit = 3
+    try:
+        max_choice_params = max(0, int(args.get("max_choice_params") or 4))
+    except (TypeError, ValueError):
+        max_choice_params = 4
     try:
         max_items = max(1, int(args.get("max_items") or 100))
     except (TypeError, ValueError):
@@ -2685,7 +3061,9 @@ def list_library_components(args: dict, ctx=None) -> dict:
                     entry["params"] = None
                     entry["params_error"] = md["error"]
                 else:
-                    info = _model_def_info(md)
+                    info = _model_def_info(md, include_choices=include_choices,
+                                           choices_limit=choices_limit,
+                                           max_choice_params=max_choice_params)
                     entry["model_def"] = {
                         "impl_class": info.get("impl_class"),
                         "name": info.get("name"),
@@ -2694,6 +3072,15 @@ def list_library_components(args: dict, ctx=None) -> dict:
                     }
                     entry["params"] = info.get("parameters")
                     entry["params_available"] = info.get("available")
+                    selectors = ([s for s in (info.get("selector_params") or [])
+                                  if s.get("param")] if include_choices
+                                 else _selector_params_summary(md))
+                    if selectors:
+                        entry["selector_params"] = selectors
+                        entry["selection_note"] = (
+                            "该元件有离散选项表参数（如原厂料号）：只能从选项里选，"
+                            "不能自填数值。对具体 cell 调 inspect_component_model "
+                            "看选项表，或用 search_model_parts 按目标值检索料号。")
                     if info.get("error"):
                         entry["params_error"] = info["error"]
                     if info.get("truncated"):
@@ -2784,7 +3171,9 @@ def _probe_symbol_pins(cell, view_name: str = "schematic") -> dict:
 def inspect_component_model(args: dict, ctx=None) -> dict:
     """单个元件的详细信息：库模式、视图、model_def 参数定义、符号引脚。
 
-    参数：library / cell（也接受 master='lib:cell[:view]'）/ view
+    参数：library / cell（也接受 master='lib:cell[:view]'）/ view /
+          include_choices（默认 True，枚举离散选项表）/ choices_limit（默认 5）/
+          max_choice_params（默认 8，控制选项表展开预算）
     """
     ws, ws_path, _expected, mismatch = _workspace_guard(args, "查看元件详情")
     if mismatch:
@@ -2796,6 +3185,17 @@ def inspect_component_model(args: dict, ctx=None) -> dict:
     view = view or str(args.get("view") or "schematic")
     if not library or not cell_name:
         raise RuntimeError("需要 library 与 cell（或 master='lib:cell[:view]'）")
+
+    include_choices = args.get("include_choices")
+    include_choices = True if include_choices is None else bool(include_choices)
+    try:
+        choices_limit = max(1, int(args.get("choices_limit") or 5))
+    except (TypeError, ValueError):
+        choices_limit = 5
+    try:
+        max_choice_params = max(0, int(args.get("max_choice_params") or 8))
+    except (TypeError, ValueError):
+        max_choice_params = 8
 
     lib = _library_for(library)
     cell = _find_cell(lib, cell_name)
@@ -2839,7 +3239,9 @@ def inspect_component_model(args: dict, ctx=None) -> dict:
         out["parameters"] = None
         out["parameters_error"] = md["error"]
     else:
-        info = _model_def_info(md)
+        info = _model_def_info(md, include_choices=include_choices,
+                               choices_limit=choices_limit,
+                               max_choice_params=max_choice_params)
         out["model_def"] = {
             "impl_class": info.get("impl_class"),
             "name": info.get("name"),
@@ -2851,10 +3253,31 @@ def inspect_component_model(args: dict, ctx=None) -> dict:
         out["parameters"] = info.get("parameters")
         out["parameters_available"] = info.get("available")
         out["range_note"] = info.get("range_note")
+        out["selector_params"] = info.get("selector_params") or []
+        out["include_choices"] = include_choices
+        if info.get("selection_note"):
+            out["selection_note"] = info["selection_note"]
         if info.get("error"):
             out["parameters_error"] = info["error"]
         if info.get("truncated"):
             out["parameters_truncated"] = info["truncated"]
+
+    selectors = [s for s in (out.get("selector_params") or []) if s.get("param")]
+    if selectors:
+        out["usage"] = {
+            "selector_params": [s["param"] for s in selectors],
+            "how_to_select": (
+                "这些参数是**离散选项表**（原厂料号），只能把 form 名/料号"
+                "（或其网表序号）赋给它；不要用 Value/Tolerance 之类的数值，"
+                "那不会被接受。派生字段（Value/Tolerance/RatedCurrent/FreqRange）"
+                "由原厂 AEL 回调自动填，且不进网表，不要手填。"),
+            "search_tool": ("search_model_parts：按 value / tolerance / "
+                            "rated_current_min / freq_min / freq_max / part_number "
+                            "在已挂接库里反查料号。"),
+            "simulation_note": ("原厂套件仿真还需要库自带的 *_Include 元件："
+                                "build_schematic 放置时会自动补，"
+                                "validate_model_import 的冒烟仿真也会自动补。"),
+        }
 
     out["symbol_pins"] = _probe_symbol_pins(cell, view)
 
@@ -2862,6 +3285,375 @@ def inspect_component_model(args: dict, ctx=None) -> dict:
     out["note"] = ("以上全部是**读到的定义**，不是仿真结果。"
                    "这个元件能不能真正放进电路里跑，"
                    "只有 validate_model_import 能给结论。")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 工具：search_model_parts（按目标参数反查原厂料号）
+# ---------------------------------------------------------------------------
+#
+# 场景：用户说「要一个 18nH 的电感」，但库里只能选料号。此前只能人肉翻
+# 选项表；这里把**所有已挂接库的常量选项表**扫一遍，按物理量检索。
+#
+# 只报**真实枚举到**的项：选项表来自 ModelParam.formset 的常量 form，
+# 物理量来自 form.label 的解析（_parse_choice_label）。标签解析不出的字段
+# 就是 null，不按料号编码规则猜。
+
+def _search_hit(library: str, cell: str, param: str, item: dict) -> dict:
+    return {
+        "library": library,
+        "cell": cell,
+        "master": f"{library}:{cell}",
+        "param": param,
+        "form": item.get("form") or "",
+        "part_number": item.get("part_number") or "",
+        "part_type": item.get("part_type") or "",
+        "value": item.get("value") or "",
+        "value_si": item.get("value_si"),
+        "unit": item.get("unit") or "",
+        "family": item.get("family") or "",
+        "tolerance": item.get("tolerance") or "",
+        "rated_current": item.get("rated_current") or "",
+        "freq_range": item.get("freq_range") or "",
+        "netlist_value": item.get("netlist_value") or "",
+        "index": item.get("index"),
+        "label": item.get("label") or "",
+    }
+
+
+def _value_tolerance_spec(target: dict, text: str) -> tuple:
+    """把 value_tolerance 拆成 (相对容差, 绝对容差)。
+
+    支持 ``'5%'``（相对目标值的百分比）与 ``'0.5[nH]'``（同族绝对量）。
+    解析不了就退回「几乎相等」，并让调用方在 notes 里如实说明。
+    """
+    rel, absolute = 1e-9, 0.0
+    raw = _strip_quotes(text)
+    if not raw:
+        return rel, absolute
+    m = re.match(r"^\s*([-+]?\d+(?:\.\d+)?)\s*%\s*$", raw)
+    if m:
+        return max(0.0, float(m.group(1)) / 100.0) + 1e-9, 0.0
+    q = _parse_quantity(raw)
+    if q and q.get("family") and target.get("family") \
+            and q["family"] == target["family"]:
+        return rel, abs(q["value"])
+    return rel, absolute
+
+
+def _search_matches(item: dict, spec: dict) -> bool:
+    """按 spec 里的条件判断一个选项是否命中（条件全为 AND）。"""
+    if item.get("kind") != "constant":
+        return False
+    if item.get("placeholder") and not spec.get("include_placeholder"):
+        return False
+
+    pn = str(item.get("part_number") or "")
+    form = str(item.get("form") or "")
+    if spec.get("part_number"):
+        needle = spec["part_number"].casefold()
+        if needle not in pn.casefold() and needle not in form.casefold():
+            return False
+    if spec.get("query"):
+        blob = " ".join(str(item.get(k) or "") for k in
+                        ("label", "part_number", "part_type", "value",
+                         "tolerance", "rated_current", "freq_range")).casefold()
+        if spec["query"].casefold() not in blob:
+            return False
+    if spec.get("part_type"):
+        if spec["part_type"].casefold() not in str(item.get("part_type") or "").casefold():
+            return False
+
+    target = spec.get("value")
+    if target:
+        have = item.get("value_si")
+        if have is None:
+            return False
+        if target.get("family") and item.get("family") \
+                and target["family"] != item["family"]:
+            return False
+        rel, absolute = spec.get("value_tolerance") or (1e-9, 0.0)
+        if abs(float(have) - target["value"]) > \
+                max(absolute, rel * abs(target["value"])):
+            return False
+
+    tol = spec.get("tolerance")
+    if tol:
+        text = str(item.get("tolerance") or "")
+        if isinstance(tol, dict):
+            have = item.get("tolerance_si")
+            if have is None:
+                return False
+            # 公差按量级比较（'±0.5[nH]' 与 '0.5[nH]' 是同一档）；
+            # 不能用固定的 1e-9 容差 —— 那样 0.5nH 与 0.2nH 会被当成相同。
+            want = abs(float(tol["value"]))
+            if abs(abs(float(have)) - want) > 1e-6 * max(want, 1e-18):
+                return False
+        elif tol.casefold() not in text.casefold():
+            return False
+
+    rc = spec.get("rated_current_min")
+    if rc:
+        have = item.get("rated_current_si")
+        if have is None or float(have) + 1e-12 < rc["value"]:
+            return False
+
+    fmin = spec.get("freq_min")
+    fmax = spec.get("freq_max")
+    if fmin or fmax:
+        start = item.get("freq_start_si")
+        stop = item.get("freq_stop_si")
+        if start is None or stop is None:
+            return False
+        if fmin and float(start) > fmin["value"] * (1 + 1e-9):
+            return False
+        if fmax and float(stop) < fmax["value"] * (1 - 1e-9):
+            return False
+    return True
+
+
+def search_model_parts(args: dict, ctx=None) -> dict:
+    """在已挂接库里按目标参数检索料号（原厂套件的「选型」入口）。
+
+    参数
+      library            限定某个库；留空扫工作区里的 design_kit 库
+      include_builtin    是否连内置库一起扫，默认 False
+      cell / cells       限定 cell（字符串或列表）
+      name_prefix        cell 名前缀
+      param              限定参数名（如 PartNumber）；留空扫所有有选项表的参数
+      part_number        料号/形式名子串
+      query              在 label/料号/Value/Tolerance 等文本里搜子串
+      value              目标值，如 '18nH'、'100nF'、'0.85mm'
+      value_tolerance    值的容差：'5%' 或 '0.5[nH]'，默认几乎相等
+      tolerance          容差子串或量（如 '+/-0.5[nH]'）
+      part_type          Type 子串（如 'Wound'、'X7R'）
+      rated_current_min  额定电流下限，如 '700mA'
+      freq_min/freq_max  工作频段要求，如 '50MHz' / '6GHz'
+      max_results        返回上限，默认 20
+      budget_s           扫描时间上限，默认 30 秒（超时如实报 stopped_early）
+      refresh            清空选项表缓存后重扫
+    """
+    ws, ws_path, _expected, mismatch = _workspace_guard(args, "检索料号")
+    if mismatch:
+        return {"ok": False, "kind": "workspace_mismatch", "error": mismatch,
+                "hits": []}
+
+    library = str(args.get("library") or "").strip()
+    include_builtin = bool(args.get("include_builtin"))
+    name_prefix = str(args.get("name_prefix") or "").strip()
+    prefix_low = name_prefix.lower()
+    cells_arg = args.get("cells")
+    want_cells = {str(c) for c in cells_arg} if isinstance(cells_arg, (list, tuple)) \
+        else {str(cells_arg)} if cells_arg else set()
+    single_cell = str(args.get("cell") or "").strip()
+    param_filter = str(args.get("param") or "").strip()
+    part_number = str(args.get("part_number") or "").strip()
+    query = str(args.get("query") or "").strip()
+    part_type = str(args.get("part_type") or args.get("kind") or "").strip()
+    value_text = str(args.get("value") or "").strip()
+    tolerance_text = str(args.get("tolerance") or "").strip()
+    rc_text = str(args.get("rated_current_min") or "").strip()
+    fmin_text = str(args.get("freq_min") or "").strip()
+    fmax_text = str(args.get("freq_max") or "").strip()
+    try:
+        max_results = max(1, int(args.get("max_results") or 20))
+    except (TypeError, ValueError):
+        max_results = 20
+    try:
+        budget_s = max(1.0, float(args.get("budget_s") or 30))
+    except (TypeError, ValueError):
+        budget_s = 30.0
+    include_placeholder = bool(args.get("include_placeholder"))
+    if args.get("refresh"):
+        with _CHOICE_CACHE_LOCK:
+            _CHOICE_CACHE.clear()
+
+    notes: list = []
+    target_value = _parse_quantity(value_text) if value_text else None
+    if value_text and not target_value:
+        notes.append(f"value={value_text!r} 解析不出数值/单位，未按数值过滤。")
+    tol_spec = None
+    if tolerance_text:
+        parsed_tol = _parse_quantity(tolerance_text)
+        tol_spec = parsed_tol if parsed_tol else tolerance_text
+    rc_min = _parse_quantity(rc_text) if rc_text else None
+    fmin = _parse_quantity(fmin_text) if fmin_text else None
+    fmax = _parse_quantity(fmax_text) if fmax_text else None
+    if rc_text and not rc_min:
+        notes.append(f"rated_current_min={rc_text!r} 解析不出数值，未按电流过滤。")
+
+    spec = {
+        "part_number": part_number,
+        "query": query,
+        "part_type": part_type,
+        "value": target_value,
+        "value_tolerance": (_value_tolerance_spec(target_value,
+                                                  str(args.get("value_tolerance") or ""))
+                            if target_value else None),
+        "tolerance": tol_spec,
+        "rated_current_min": rc_min,
+        "freq_min": fmin,
+        "freq_max": fmax,
+        "include_placeholder": include_placeholder,
+    }
+
+    if library:
+        libs = [_library_for(library)]
+    else:
+        try:
+            libs = list(ws.libraries or [])
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"读取工作区库列表失败: {type(e).__name__}: {e}") from e
+        if not include_builtin:
+            kinds = {}
+            for lb in libs:
+                name = str(getattr(lb, "name", "") or "")
+                try:
+                    kinds[name] = _library_kind(lb, ws_path)
+                except Exception:  # noqa: BLE001
+                    kinds[name] = "unknown"
+            design = [lb for lb in libs
+                      if kinds.get(str(getattr(lb, "name", "") or "")) == "design_kit"]
+            attached = [lb for lb in libs
+                        if kinds.get(str(getattr(lb, "name", "") or "")) == "workspace"
+                        and _is_attached_vendor_lib(lb, ws_path)]
+            if design:
+                extra = [lb for lb in attached if lb not in design]
+                libs = design + extra
+                notes.append("默认扫描工作区 Design Kit 库"
+                             + ("与已挂接原厂包" if extra else "")
+                             + "；需要连 ADS 内置库一起扫时传 include_builtin=true。")
+            elif attached:
+                libs = attached
+                notes.append("默认只扫**已挂接的原厂模型包**（工作区 "
+                             "ads_agent_models 下的解压目录）；需要连其它库一起扫时"
+                             "传 include_builtin=true。")
+            else:
+                kept = [lb for lb in libs
+                        if kinds.get(str(getattr(lb, "name", "") or "")) != "builtin"]
+                if kept:
+                    libs = kept
+                    notes.append("没有识别到原厂模型包，已排除 ADS 内置库；"
+                                 "需要连内置库一起扫时传 include_builtin=true。")
+
+    started = time.monotonic()
+    hits: list = []
+    seen: set = set()
+    searched = {"libraries": [], "cells": 0, "params": 0, "choices": 0}
+    stopped_early = False
+    deadline = started + budget_s
+
+    for lib in libs:
+        try:
+            lname = str(lib.name)
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            cells = list(lib.cells or [])
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"库 {lname} 的 cell 列表读不到: {type(e).__name__}: {e}")
+            continue
+        searched["libraries"].append(lname)
+        for cell in cells:
+            if time.monotonic() > deadline:
+                stopped_early = True
+                break
+            try:
+                cname = str(cell.name)
+            except Exception:  # noqa: BLE001
+                continue
+            if prefix_low and not cname.lower().startswith(prefix_low):
+                continue
+            if single_cell and cname != single_cell:
+                continue
+            if want_cells and cname not in want_cells:
+                continue
+            md = _read_model_def(cell)
+            if md is None or (isinstance(md, dict) and "error" in md):
+                continue
+            try:
+                params = list(md.parameters)
+            except Exception:  # noqa: BLE001
+                continue
+            searched["cells"] += 1
+            for p in params:
+                try:
+                    pname = str(p.name or "")
+                except Exception:  # noqa: BLE001
+                    continue
+                if not pname:
+                    continue
+                if param_filter and pname != param_filter:
+                    continue
+                choices = _enumerate_choices(p)
+                if not choices.get("available"):
+                    continue
+                constants = [i for i in (choices.get("items") or [])
+                             if i.get("kind") == "constant"]
+                if not constants:
+                    continue
+                searched["params"] += 1
+                searched["choices"] += len(constants)
+                for item in constants:
+                    if not _search_matches(item, spec):
+                        continue
+                    key = (lname, cname, pname, item.get("form"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    hits.append(_search_hit(lname, cname, pname, item))
+            if len(hits) >= max_results:
+                stopped_early = len(hits) > max_results
+                break
+        if stopped_early:
+            break
+
+    truncated = max(0, len(hits) - max_results)
+    if truncated:
+        notes.append(f"命中 {len(hits)} 项，只返回前 {max_results} 项；"
+                     f"请缩小条件或用 part_number/name_prefix 精确检索。")
+
+    out = {
+        "ok": True,
+        "workspace": ws_path,
+        "searched": searched,
+        "filters": {
+            "library": library,
+            "cell": single_cell or sorted(want_cells),
+            "name_prefix": name_prefix,
+            "param": param_filter,
+            "part_number": part_number,
+            "query": query,
+            "value": value_text,
+            "value_tolerance": str(args.get("value_tolerance") or ""),
+            "tolerance": tolerance_text,
+            "part_type": part_type,
+            "rated_current_min": rc_text,
+            "freq_min": fmin_text,
+            "freq_max": fmax_text,
+        },
+        "total_matches": len(hits),
+        "hits": hits[:max_results],
+        "truncated": truncated,
+        "stopped_early": stopped_early,
+        "elapsed_s": round(time.monotonic() - started, 3),
+        "notes": notes,
+    }
+    if not hits:
+        note = ("没有符合条件的选择项。选项表全部来自 ModelParam.formset 的"
+                "常量 form；若这个库的参数都是自由文本（如 S2P 的 File），"
+                "本来就没有料号可选，直接用 inspect_component_model 看参数。")
+        if not searched["cells"]:
+            note = ("没有扫到任何有 model_def 的 cell；请先确认库已挂接"
+                    "（list_vendor_models / list_readonly_libraries）。")
+        out["note"] = note
+    else:
+        out["usage"] = (
+            "把命中的 form（或 part_number）写进对应参数即可，例如 "
+            'parameters={"PartNumber": "LQW18AN18NJ00"}；Value/Tolerance/'
+            "RatedCurrent 由原厂回调自动派生且不进网表，不要手填。"
+            "仿真还需要库自带 *_Include：build_schematic 与 "
+            "validate_model_import 会自动补。")
     return out
 
 
@@ -2892,6 +3684,418 @@ def _parse_number(text: str):
         return None, s
 
 
+# ---------------------------------------------------------------------------
+# 离散选项表（常量 form）：原厂库「只能选料号、不能自填数值」的通用解法
+# ---------------------------------------------------------------------------
+#
+# 现场取证（本机 ADS 2027 + muRataLibWeb_L，2026-10-31 实跑）：
+#   PartNumber.param_type=string、is_discrete_value=**False**（对本版本无判别力），
+#   formset.name="LQW18AN_00_list_opt"，101 个 form = 100×ConstForm + 1×CompoundForm：
+#     ConstForm name='LQW18AN2N2D00'
+#               label='1:LQW18AN2N2D00, Wound, 2.2[nH], +/-0.5[nH], 700[mA], 50[MHz]-20[GHz]:1'
+#               net_format='1'（网表值，即序号）  display_format='LQW18AN2N2D00'
+#   其余 Type/Value/Tolerance/... 的 formset 是 StdFormSet + StringForm（自由文本），
+#   LandLayer 的 smt_pad_layer 是 StringFormWithAELCallbacks，net_format='%d'
+#   只是模板 —— 所以「按 net_format 反查」必须先排除带 % 的模板。
+#
+# 放置时**必须**把料号写进 form_name（p.form_name = 'LQW18AN3N6C00'）再触发
+# invoke_item_parameter_changed_callback(['PartNumber'])；写 value='18nH' 无效，
+# 这正是「选料号卡住」的根因。派生字段由原厂 AEL 回调填、且不进网表。
+#
+# 所以这里做三件事，全部只报真实枚举到的：
+#   1) _enumerate_choices    枚举任意参数的常量选项表（带进程内缓存）；
+#   2) _check_parameters     把「不在选项表里」判成真问题，并给出最接近的料号；
+#   3) search_model_parts    按 目标值/容差/额定电流/频段 反查料号（新工具）。
+
+_SI_PREFIXES = {"": 1.0, "p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6,
+                "μ": 1e-6, "m": 1e-3, "k": 1e3, "K": 1e3, "M": 1e6,
+                "G": 1e9, "T": 1e12}
+
+# 长的放前面：'MHz' 必须命中 'Hz' 而不是被其它规则截断
+_SI_BASE_UNITS = (
+    ("ohm", "resistance"), ("Ohm", "resistance"), ("Ω", "resistance"),
+    ("Hz", "frequency"), ("H", "inductance"), ("F", "capacitance"),
+    ("A", "current"), ("V", "voltage"), ("W", "power"),
+    ("s", "time"), ("m", "length"),
+)
+
+_QUANTITY_RE = re.compile(
+    r"^\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*"
+    r"(?:\[\s*([^\]]+?)\s*\])?\s*([A-Za-zµμΩ]*)\s*$")
+
+_UNQUOTE_RE = re.compile(r'^\s*(["\'])(.*)\1\s*$')
+
+
+def _strip_quotes(text) -> str:
+    s = str(text if text is not None else "").strip()
+    m = _UNQUOTE_RE.match(s)
+    return m.group(2).strip() if m else s
+
+
+def _unit_family(unit) -> tuple:
+    """'nH' -> ('inductance', 1e-9, 'H')；认不出就 ('', 1.0, 原单位)。"""
+    u = str(unit or "").strip()
+    if not u:
+        return "", 1.0, ""
+    for base, family in _SI_BASE_UNITS:
+        if u.endswith(base):
+            prefix = u[: len(u) - len(base)]
+            if prefix in _SI_PREFIXES:
+                return family, _SI_PREFIXES[prefix], base
+    return "", 1.0, u
+
+
+def _parse_quantity(text) -> dict:
+    """把 '2.2[nH]' / '0.85 mm' / '+/-0.5[nH]' / '50[MHz]' 拆成 SI 数值。
+
+    只做**单位前缀换算**（n/u/m/k/M/G…），不做量纲换算（不把 H 换成别的）；
+    认不出单位时 family 为空串、value 仍是纯数字 —— 调用方据此判断可比性。
+    """
+    raw = _strip_quotes(text)
+    if not raw:
+        return None
+    plus_minus = bool(re.match(r"^(?:\+/-|±)", raw))
+    body = re.sub(r"^(?:\+/-|±)\s*", "", raw)
+    m = _QUANTITY_RE.match(body)
+    if not m:
+        return None
+    try:
+        number = float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    unit = (m.group(2) or m.group(3) or "").strip()
+    family, factor, base = _unit_family(unit)
+    return {"value": number * factor, "number": number, "unit": unit,
+            "unit_base": base, "family": family,
+            "plus_minus": plus_minus, "raw": raw}
+
+
+def _split_quantity_range(text) -> tuple:
+    """'50[MHz]-20[GHz]' -> ('50[MHz]', '20[GHz]')；拆不出返回 ('', '')。"""
+    s = _strip_quotes(text)
+    if not s:
+        return "", ""
+    m = re.match(r"^(.*?)\s*(?:-|~|–|—|\.\.|\bto\b)\s*(.+)$", s, re.I)
+    if not m:
+        return "", ""
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def _parse_choice_label(label) -> dict:
+    """解析原厂常量 form 的 label，得到选型字段。
+
+    MuRata 的 label 形如::
+
+        '1:LQW18AN2N2D00, Wound, 2.2[nH], +/-0.5[nH], 700[mA], 50[MHz]-20[GHz]:1'
+
+    解析失败不抛异常：把解析到的部分留下、parsed=False，绝不编造字段。
+    """
+    out = {"part_number": "", "part_type": "", "value": "", "value_si": None,
+           "unit": "", "family": "", "tolerance": "", "tolerance_si": None,
+           "rated_current": "", "rated_current_si": None,
+           "freq_range": "", "freq_start_si": None, "freq_stop_si": None,
+           "index": None, "parsed": False}
+    text = _strip_quotes(label)
+    if not text or text.upper() == "NULL":
+        return out
+    m = re.match(r"^(\d+)\s*:\s*", text)
+    if m:
+        out["index"] = int(m.group(1))
+        text = text[m.end():]
+    m = re.search(r"\s*:\s*(\d+)\s*$", text)
+    if m:
+        out["index"] = int(m.group(1)) if out["index"] is None else out["index"]
+        text = text[: m.start()]
+    parts = [p.strip() for p in text.split(",")]
+    if parts and parts[0]:
+        pn = parts[0]
+        if ":" in pn:
+            pn = pn.split(":", 1)[-1]
+        out["part_number"] = pn.strip()
+    if len(parts) > 1:
+        out["part_type"] = parts[1]
+    if len(parts) > 2:
+        out["value"] = parts[2]
+    if len(parts) > 3:
+        out["tolerance"] = parts[3]
+    if len(parts) > 4:
+        out["rated_current"] = parts[4]
+    if len(parts) > 5:
+        out["freq_range"] = parts[5]
+    q = _parse_quantity(out["value"])
+    if q:
+        out["value_si"] = q["value"]
+        out["unit"] = q["unit"]
+        out["family"] = q["family"]
+    q = _parse_quantity(out["tolerance"])
+    if q:
+        out["tolerance_si"] = q["value"]
+    q = _parse_quantity(out["rated_current"])
+    if q:
+        out["rated_current_si"] = q["value"]
+    start, stop = _split_quantity_range(out["freq_range"])
+    q = _parse_quantity(start)
+    if q:
+        out["freq_start_si"] = q["value"]
+    q = _parse_quantity(stop)
+    if q:
+        out["freq_stop_si"] = q["value"]
+    out["parsed"] = bool(out["part_number"]) and out["part_number"].upper() != "NULL"
+    return out
+
+
+def _param_formset(p):
+    """参数的选项表。ModelParam 直接走 .formset；实例上的 Param 走 .definition。"""
+    for holder in (p, getattr(p, "definition", None)):
+        if holder is None:
+            continue
+        try:
+            fs = getattr(holder, "formset", None)
+        except Exception:  # noqa: BLE001
+            fs = None
+        if fs is not None:
+            return fs
+    return None
+
+
+def _form_kind(form) -> str:
+    check = getattr(form, "is_constant_form", None)
+    try:
+        if callable(check) and check(form):
+            return "constant"
+    except Exception:  # noqa: BLE001 — 判不出来就按类名继续判
+        pass
+    cls = type(form).__name__.lower()
+    if "compound" in cls:
+        return "compound"
+    if "string" in cls:
+        return "string"
+    return "other"
+
+
+def _form_netlist_value(form) -> str:
+    """常量 form 的网表值（MuRata 是序号 '1'）；带 % 的是模板，不算值。"""
+    for attr in ("net_format", "display_format"):
+        try:
+            val = getattr(form, attr, "")
+        except Exception:  # noqa: BLE001
+            continue
+        text = "" if val is None else str(val).strip()
+        if text and "%" not in text:
+            return text
+    return ""
+
+
+def _form_display_value(form) -> str:
+    for attr in ("display_format", "label", "name"):
+        try:
+            val = getattr(form, attr, "")
+        except Exception:  # noqa: BLE001
+            continue
+        text = "" if val is None else str(val).strip()
+        if text:
+            return text
+    return ""
+
+
+_CHOICE_CACHE: dict = {}
+_CHOICE_CACHE_LOCK = threading.Lock()
+_CHOICE_CACHE_MAX_FORMS = 4000
+
+
+def _enumerate_choices(p, limit: int = 0, refresh: bool = False) -> dict:
+    """枚举一个参数的选项表。返回**真实枚举结果**，枚举不了就说明原因。
+
+    limit=0 表示不截断（内部缓存永远存全量，截断只发生在返回时）。
+    """
+    out = {"available": False, "formset": "", "count": 0, "items": [],
+           "truncated": 0, "free_text_allowed": None, "kinds": {},
+           "source": "formset", "reason": ""}
+    formset = _param_formset(p)
+    if formset is None:
+        out["reason"] = "该参数没有 formset（自由取值，不是选项表）"
+        return out
+    try:
+        fname = str(getattr(formset, "name", "") or "")
+    except Exception:  # noqa: BLE001
+        fname = ""
+    out["formset"] = fname
+    key = fname or ("anon:%d" % id(formset))
+    with _CHOICE_CACHE_LOCK:
+        cached = None if refresh else _CHOICE_CACHE.get(key)
+    if cached is None:
+        try:
+            forms = list(formset.forms)
+        except Exception as e:  # noqa: BLE001
+            out["reason"] = (f"读取 formset.forms 失败: {type(e).__name__}: {e}"
+                             "（本工具的选项表来自 ModelParam.formset，"
+                             "读不到时不做任何猜测）")
+            return out
+        items, kinds = [], {}
+        for form in forms[:_CHOICE_CACHE_MAX_FORMS]:
+            kind = _form_kind(form)
+            kinds[kind] = kinds.get(kind, 0) + 1
+            entry = {
+                "form": str(getattr(form, "name", "") or ""),
+                "label": str(getattr(form, "label", "") or ""),
+                "display": _form_display_value(form),
+                "netlist_value": _form_netlist_value(form),
+                "kind": kind,
+            }
+            if kind == "constant":
+                entry.update(_parse_choice_label(entry["label"]))
+                if not entry.get("part_number"):
+                    entry["part_number"] = entry["form"]
+                if str(entry.get("part_number", "")).upper() == "NULL":
+                    entry["placeholder"] = True
+            items.append(entry)
+        cached = {"formset": fname, "items": items, "kinds": kinds,
+                  "free_text_allowed": bool(kinds.get("string") or kinds.get("other"))}
+        with _CHOICE_CACHE_LOCK:
+            _CHOICE_CACHE[key] = cached
+    items = cached["items"]
+    out.update({"available": bool(items), "count": len(items),
+                "kinds": dict(cached["kinds"]),
+                "free_text_allowed": cached["free_text_allowed"]})
+    if not items:
+        out["reason"] = (f"formset {fname!r} 里没有 form —— 该参数不是离散选型")
+        return out
+    take = len(items) if not limit else min(len(items), max(1, int(limit)))
+    out["items"] = items[:take]
+    out["truncated"] = max(0, len(items) - take)
+    return out
+
+
+def _param_selection(p, with_count: bool = False) -> dict:
+    """判断这个参数是不是「只能从选项表里选」的选型参数（便宜版）。
+
+    判据：formset 里存在**常量 form**。StdFormSet 只有 StringForm，
+    所以普通字符串参数不会被误判成选型参数。
+    """
+    formset = _param_formset(p)
+    if formset is None:
+        return {}
+    try:
+        fname = str(getattr(formset, "name", "") or "")
+    except Exception:  # noqa: BLE001
+        return {}
+    if not fname:
+        return {}
+    info = {"param": str(getattr(p, "name", "") or ""), "formset": fname}
+    if not with_count:
+        return info
+    choices = _enumerate_choices(p)
+    kind_const = int((choices.get("kinds") or {}).get("constant") or 0)
+    if not kind_const:
+        return {}
+    selectable = [i for i in (choices.get("items") or [])
+                  if i.get("kind") == "constant" and not i.get("placeholder")]
+    info.update({
+        "count": kind_const,
+        "selectable": len(selectable),
+        "free_text_allowed": bool(choices.get("free_text_allowed")),
+        "example": (selectable[0].get("form") if selectable else ""),
+        "examples": [str(i.get("form")) for i in selectable[:3]],
+        "enumeration_error": choices.get("reason") or "",
+    })
+    return info
+
+
+def _choice_indexes(choices: dict) -> tuple:
+    """(按 form 名, 按料号, 按网表值) 三张查找表；模板值不进网表表。"""
+    by_name, by_pn, by_net = {}, {}, {}
+    for item in (choices.get("items") or []):
+        if item.get("kind") != "constant":
+            continue
+        form = str(item.get("form") or "")
+        if form:
+            by_name.setdefault(form.casefold(), item)
+        pn = str(item.get("part_number") or "")
+        if pn:
+            by_pn.setdefault(pn.casefold(), item)
+        net = str(item.get("netlist_value") or "")
+        if net and "%" not in net:
+            by_net.setdefault(net, item)
+    return by_name, by_pn, by_net
+
+
+def _choice_suggestions(raw: str, constants: list) -> dict:
+    """给不合法的选值找最接近的料号：先按名字近似，再按目标物理值。"""
+    import difflib
+
+    out = {"part_numbers": [], "by_value": [], "note": ""}
+    names = [str(c.get("form") or "") for c in constants if c.get("form")]
+    if raw:
+        out["part_numbers"] = difflib.get_close_matches(raw, names, n=5,
+                                                        cutoff=0.55)
+    target = _parse_quantity(raw)
+    if target and target.get("family") and target.get("value"):
+        ranked = []
+        for c in constants:
+            if not c.get("family") or c["family"] != target["family"]:
+                continue
+            value = c.get("value_si")
+            if not value:
+                continue
+            ranked.append((abs(math.log(value / target["value"])),
+                           str(c.get("part_number") or c.get("form"))))
+        ranked.sort(key=lambda x: x[0])
+        out["by_value"] = [pn for _, pn in ranked[:5]]
+    if not out["part_numbers"] and not out["by_value"]:
+        out["note"] = "选项表里没有名字或数值接近的候选"
+    return out
+
+
+def _match_choice(name: str, text, choices: dict) -> dict:
+    """判断一个请求值是否能对应到选项表里的 form。"""
+    out = {"is_selection": False, "matched": None, "selected_form": "",
+           "problems": [], "warnings": [], "hint": {}}
+    if not choices.get("available"):
+        return out
+    constants = [i for i in (choices.get("items") or [])
+                 if i.get("kind") == "constant"]
+    if not constants:
+        return out
+    out["is_selection"] = True
+    free = bool(choices.get("free_text_allowed"))
+    raw = _strip_quotes(text)
+    folded = raw.casefold()
+    by_name, by_pn, by_net = _choice_indexes(choices)
+    hit = by_name.get(folded) or by_pn.get(folded)
+    via_net = False
+    if hit is None and raw in by_net:
+        hit = by_net[raw]
+        via_net = True
+    if hit is not None:
+        out["matched"] = hit
+        out["selected_form"] = str(hit.get("form") or "")
+        if out["selected_form"].casefold() != folded:
+            out["warnings"].append(
+                f"参数 {name!r} 的请求值 {raw!r} 已按"
+                + ("网表序号" if via_net else "料号/显示值")
+                + f" 对应到选项 form {out['selected_form']!r}"
+                f"（放置时会写成这个 form 名）。")
+        return out
+    if free:
+        # 该参数既有常量选项又允许自由文本：不判错（用户可能真的想填文本）
+        return out
+
+    hint = _choice_suggestions(raw, constants)
+    out["hint"] = hint
+    shown = [str(c.get("form")) for c in constants[:6]]
+    detail = (f"参数 {name!r} 的值 {raw!r} 不在它的选项表里"
+              f"（formset={choices.get('formset')!r}，"
+              f"共 {len(constants)} 个可选 form，例如 {shown}）。"
+              f"该参数只能选 form 名/料号，不能自填数值。")
+    if hint.get("by_value"):
+        detail += f" 按目标值最接近的料号: {hint['by_value']}。"
+    if hint.get("part_numbers"):
+        detail += f" 名字最接近: {hint['part_numbers']}。"
+    detail += " 可用 search_model_parts 按 value/tolerance/rated_current 检索料号。"
+    out["problems"].append(detail)
+    return out
+
+
 def _check_parameters(model_def, requested: dict) -> dict:
     """校验请求参数与元件定义是否一致。
 
@@ -2899,11 +4103,14 @@ def _check_parameters(model_def, requested: dict) -> dict:
       * 参数名不在定义里 -> 问题（ADS 会忽略或报错，取决于元件）
       * 定义说real/int 而给的是非数字 -> 问题
       * 定义说 string 而给的是纯数字 -> 提醒（不是硬错，ADS 允许）
-    取值范围**不校验** —— 本ADS 版本的 ModelParam 没有 min/max
-    （见 _PARAM_RANGE_REASON），拿不到就明说，不假装校验过。
+      * 参数是**离散选项表**（formset 里有常量 form，如原厂料号）而请求值
+        既不是 form 名也不是料号 -> 问题，并给出最接近的料号
+    连续参数的取值范围**不校验** —— 本ADS 版本的 ModelParam 没有 min/max
+    （见 _PARAM_RANGE_REASON），拿不到就明说，不假装校验过；但离散选项表
+    是从 formset **真实枚举**出来的，可以也必须核对。
     """
     out = {"checked": False, "matched": [], "problems": [], "warnings": [],
-           "unknown_params": [], "range_checked": False,
+           "unknown_params": [], "range_checked": False, "choice_checked": False,
            "range_note": _PARAM_RANGE_REASON}
     if not isinstance(requested, dict) or not requested:
         return out
@@ -2938,6 +4145,7 @@ def _check_parameters(model_def, requested: dict) -> dict:
                  "default": _param_default(p)}
         num, unit = _parse_number(text)
         ltype = ptype.lower()
+        numeric_text = False
         if ltype in _NUMERIC_TYPES:
             if num is None:
                 out["problems"].append(
@@ -2952,10 +4160,40 @@ def _check_parameters(model_def, requested: dict) -> dict:
                     f"参数 {key!r} 定义为数组类型 {ptype}，"
                     f"但给的值 {text!r} 看起来是单个值 —— 请确认写法。")
         elif ltype == "string":
-            if num is not None and not unit:
-                out["warnings"].append(
-                    f"参数 {key!r} 定义为 string，却给了纯数字 {text!r}；"
-                    f"若原值带引号请一并给出。")
+            # 纯数字的 string 值可能是「网表序号」写法（MuRata 料号就是），
+            # 先记下，等选项表核对完再决定要不要提醒。
+            numeric_text = num is not None and not unit
+        # 离散选项表：原厂套件的料号参数只能选 form，不能自填数值。
+        # 只有真的枚举到常量 form 才判定（StdFormSet 的自由文本参数不受影响）。
+        choices = _enumerate_choices(p)
+        if choices.get("available"):
+            match = _match_choice(str(key), text, choices)
+            if match.get("is_selection"):
+                out["choice_checked"] = True
+                matched_choice = match.get("matched") or {}
+                entry["selection"] = {
+                    "is_selection": True,
+                    "formset": choices.get("formset") or "",
+                    "option_count": choices.get("count") or 0,
+                    "free_text_allowed": bool(choices.get("free_text_allowed")),
+                    "selected_form": match.get("selected_form") or "",
+                }
+                if matched_choice.get("part_number"):
+                    entry["selected_part_number"] = matched_choice["part_number"]
+                if matched_choice.get("value"):
+                    entry["selected_value"] = matched_choice["value"]
+                out["problems"].extend(match.get("problems") or [])
+                out["warnings"].extend(match.get("warnings") or [])
+                if match.get("hint"):
+                    entry["suggestions"] = match["hint"]
+                if match.get("matched") is not None:
+                    # 命中选项表（含按网表序号命中）就不再说"纯数字"，
+                    # 那是原厂 form 的正常写法。
+                    numeric_text = False
+        if numeric_text:
+            out["warnings"].append(
+                f"参数 {key!r} 定义为 string，却给了纯数字 {text!r}；"
+                f"若原值带引号请一并给出。")
         out["matched"].append(entry)
     return out
 
@@ -3480,8 +4718,12 @@ def _dataset_report(dataset_path: str, ports: int,
 
     wanted = list(expressions or [])
     if not wanted:
-        wanted = [f"S({i},{j})" for i in range(1, max(1, int(ports or 0)) + 1)
-                  for j in range(1, max(1, int(ports or 0)) + 1)]
+        # 数据集里的**块名**由仿真控制器决定（实测 S_Param 是 `SP1.SP`），
+        # 块里的列才是 `S[1,1]`（新版）或 `S(1,1)`（旧版）。拿固定的
+        # `S(1,1)` 去当块名必然取不到 —— 先按真实存在的块名取，再在块里
+        # 认 S 列。2026-11-05 实测：仿真成功、数据集 47KB、S[1,1] 有限，
+        # 却因为这里用错命名被判成"取不到 S(1,1)"。
+        wanted = [str(v) for v in out["variables"] if str(v).strip()]
     if not wanted:
         wanted = ["S(1,1)"]
 
@@ -3529,14 +4771,32 @@ def _dataset_report(dataset_path: str, ports: int,
             entry["stats"] = stats
             if int(len(df)) < 2:
                 out["problems"].append(f"{expr} 只有 {len(df)} 个点，不足以构成曲线")
-            non_trivial = [c for c in cols if c not in ("index", "freq")
-                           and str(c).lower() not in ("index", "freq")]
-            flat = [c for c in non_trivial
+            # 块里的列名可能是 S[1,1] 也可能是 S(1,1)：两种写法都认。
+            s_cols = [c for c in cols
+                      if re.match(r"^S\s*[\[(]\s*\d+\s*,\s*\d+\s*[\])]$",
+                                  str(c).strip())]
+            if s_cols:
+                entry["s_columns"] = s_cols
+                bad = [c for c in s_cols
+                       if stats.get(c, {}).get("min") is None
+                       or stats.get(c, {}).get("max") is None
+                       or not math.isfinite(float(stats[c]["min"]))
+                       or not math.isfinite(float(stats[c]["max"]))]
+                if bad:
+                    out["problems"].append(
+                        f"{expr} 的 S 参数含 NaN/Inf（{bad}）—— "
+                        f"仿真没收敛或该模型不成立，不能算作可用证据")
+            expect = max(1, int(ports or 0)) ** 2 if int(ports or 0) >= 1 else 0
+            if expect and len(s_cols) < expect:
+                out["problems"].append(
+                    f"{expr} 里只找到 {len(s_cols)} 条 S 曲线，少于 "
+                    f"{ports} 端口应有的 {expect} 条（列: {cols}）")
+            flat = [c for c in s_cols
                     if abs(float(stats.get(c, {}).get("max", 0))
                            - float(stats.get(c, {}).get("min", 0))) < 1e-12]
-            if non_trivial and len(flat) == len(non_trivial):
+            if s_cols and len(flat) == len(s_cols):
                 out["problems"].append(
-                    f"{expr} 的所有列都是常数（{non_trivial}）—— 数据退化，"
+                    f"{expr} 的 S 参数全是常数（{s_cols}）—— 数据退化，"
                     f"仿真虽跑完但结果无信息量")
         except Exception as e:  # noqa: BLE001
             entry["error"] = f"{type(e).__name__}: {e}"
@@ -3767,10 +5027,39 @@ def _touchstone_smoke_test(ctx, ws, ws_path: str, *, model_file_abs: str = "",
                             f"（实际引脚: {dut_pins}）"]})
             return out
 
+        # 端口位置跟**被测件真实引脚坐标**走：左侧的引脚把端口摆到更左，
+        # 右侧的摆到更右，各留 2.54mm 水平走线。固定坐标 (-8, -4*i) 会让
+        # P1 的走线沿 y=0 横穿另一个引脚 —— 保存时 ADS 按几何重新提取网络，
+        # 两个信号引脚就被短接成一个节点（2026-11-05 实测：网表变成
+        # `X1  N__1 N__1`，数据集里取不到任何 S 参数）。走线允许失败，
+        # 但绝不能因为端点坐标把器件短死。
+        pin_xy: dict = {}
+        xs: list = []
+        for label in dut_pins:
+            try:
+                pin = ads_ops._find_pin_on(x1, label)
+                pt = ads_ops._xy_point(pin.snap_point)
+                pin_xy[str(label)] = (float(pt[0]), float(pt[1]))
+                xs.append(float(pt[0]))
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"读被测件引脚 {label} 的坐标失败，该端口退回兜底位置: "
+                             f"{type(e).__name__}: {e}")
+        mid_x = (sum(xs) / len(xs)) if xs else 0.0
+        same_x = len({round(x, 6) for x in xs}) <= 1
+        port_offset = 2.54      # 100 mil
+
         terms = []
         for i in range(1, resolved_ports + 1):
-            term = design.add_instance("ads_simulation:TermG", (-8.0, -4.0 * i),
-                                       name=f"P{i}")
+            xy = pin_xy.get(str(dut_pins[i - 1]))
+            if xy is not None:
+                if same_x:
+                    side = -1.0 if i == 1 else 1.0
+                else:
+                    side = -1.0 if xy[0] <= mid_x else 1.0
+                pos = (xy[0] + side * port_offset, xy[1])
+            else:
+                pos = (-8.0, -4.0 * i)
+            term = design.add_instance("ads_simulation:TermG", pos, name=f"P{i}")
             try:
                 ads_ops._set_param(term, "Num", str(i))
             except Exception as e:  # noqa: BLE001
@@ -3838,6 +5127,25 @@ def _touchstone_smoke_test(ctx, ws, ws_path: str, *, model_file_abs: str = "",
                                 "net": _net_label_of(getattr(pa, "net", None)),
                                 "wire_drawn": wire_drawn})
         out["connections"] = connections
+
+        # 保存前先自查：两个信号引脚必须落在**不同**网络上。走线是图形，
+        # 网络是电气 —— 一旦被绑成同一个节点，后面的仿真曲线一定没有意义，
+        # 在这里就说清，而不是等数据集读不出 S 参数再回头猜。
+        dut_nets: dict = {}
+        for label in dut_pins:
+            try:
+                p = ads_ops._find_pin_on(x1, label)
+                dut_nets[str(label)] = _net_label_of(getattr(p, "net", None))
+            except Exception:  # noqa: BLE001
+                continue
+        if len(dut_nets) >= 2 and len(set(dut_nets.values())) < len(dut_nets):
+            out.update({"ran": True,
+                        "stages": {"placed": True, "connected": False},
+                        "problems": [
+                            f"夹具把 {pick['master']} 的信号引脚短接了："
+                            f"{dut_nets}。端口之间必须隔着被测件，"
+                            f"否则测出来的不是这个器件。"]})
+            return out
 
         try:
             out["vendor_dependencies"] = prepare_design_dependencies(
@@ -3920,6 +5228,10 @@ def _touchstone_smoke_test(ctx, ws, ws_path: str, *, model_file_abs: str = "",
 
     def _finish(result, error):
         """后台/同步两条路都走这里：把仿真与数据集结论并回同一份返回体。"""
+        # 回填后这次冒烟就不再是"后台执行中"了：必须把占位标记清掉，
+        # 否则 _apply_smoke 仍按 deferred 分支把阶段写成 not_checked，
+        # 明明跑完的仿真永远不会被判成 simulated（2026-11-05 实测）。
+        out["deferred"] = False
         if error is not None:
             out.update({"ok": False,
                         "sim": {"ran": True, "ok": False,
@@ -4180,7 +5492,7 @@ def validate_model_import(args: dict, ctx=None) -> dict:
             out["problems"].append(md["error"])
             put_verification_stage(stages, "parsed", "fail", md["error"])
         else:
-            info = _model_def_info(md)
+            info = _model_def_info(md, include_choices=False)
             out["model_def"] = {
                 "impl_class": info.get("impl_class"),
                 "name": info.get("name"),
@@ -4189,6 +5501,7 @@ def validate_model_import(args: dict, ctx=None) -> dict:
                 "param_count": info.get("count"),
             }
             out["parameters"] = info.get("parameters")
+            out["selector_params"] = _selector_params_summary(md)
             out["component_def_fingerprint"] = _model_fingerprint(
                 library, cell_name, info)
             if not model_file:
@@ -4204,8 +5517,13 @@ def validate_model_import(args: dict, ctx=None) -> dict:
     out["parameter_check"] = param_check
     out["problems"].extend(param_check.get("problems") or [])
     out["warnings"].extend(param_check.get("warnings") or [])
-    out["unverified"].append(
-        "参数取值范围未校验（本 ADS 版本的 ModelParam 不提供 min/max）")
+    if param_check.get("choice_checked"):
+        out["unverified"].append(
+            "离散选项表已核对（料号/形式名必须在选项内）；"
+            "连续参数取值范围未校验（本 ADS 版本的 ModelParam 不提供 min/max）")
+    else:
+        out["unverified"].append(
+            "参数取值范围未校验（本 ADS 版本的 ModelParam 不提供 min/max）")
     if not variant:
         out["unverified"].append(
             "未声明变体（偏压/封装/温度）：同一型号若有多个变体，"
@@ -4218,6 +5536,10 @@ def validate_model_import(args: dict, ctx=None) -> dict:
     def _apply_smoke(smoke: dict) -> None:
         """把一次冒烟仿真的结果**单向**写进阶段表（只能把证明推进，不能冒领）。"""
         out["smoke_sim"] = smoke
+        if not smoke.get("deferred"):
+            # 后到的最终结果取代"后台执行中"的占位结论，不留下自相矛盾的痕迹。
+            out["unverified"] = [u for u in out["unverified"]
+                                 if "仿真仍在执行" not in str(u)]
         if smoke.get("netlist_path"):
             artifacts.append(smoke["netlist_path"])
             out.setdefault("netlist_path", smoke["netlist_path"])
@@ -4450,6 +5772,107 @@ def _variant_from_args(args: dict) -> dict:
     return variant
 
 
+def repair_model_includes(args: dict, ctx=None) -> dict:
+    """补齐设计里缺失/为空的模型 Include，并用**网表**证明它真的生效。
+
+    这是"能放置"和"能仿真"之间的那道缺口：设计里有
+    ``ads_simulation:NetlistInclude``、但 ``IncludeFiles`` 还是占位空表
+    时，网表里一条 ``#include`` 都没有，hpeesofsim 只会报 undefined
+    model / coded model 加载失败 —— 而静态校验一切正常。SDK 没有删除
+    实例的 API，所以这里**就地**把真实文件写进去（或补原厂 Include
+    元件），保存后重开只读、生成网表，逐个核对文件确实被 ``#include``。
+    """
+    library = str(args.get("library") or "").strip()
+    cell = str(args.get("cell") or "").strip()
+    view = str(args.get("view") or "schematic").strip() or "schematic"
+    dry_run = bool(args.get("dry_run"))
+    if not library or not cell:
+        return {"ok": False, "problems": ["repair_model_includes 需要 library 与 cell"],
+                "message": "缺少必填参数 library / cell"}
+    ws = _require_workspace()
+    ws_path = str(getattr(ws, "path", "") or "")
+    import ads_ops
+
+    out = {
+        "ok": False,
+        "workspace": ws_path,
+        "design": f"{library}:{cell}:{view}",
+        "dry_run": dry_run,
+        "problems": [],
+        "include_instances": [],
+        "filled_includes": [],
+        "include_sources": {},
+        "include_files": [],
+        "netlist_includes": [],
+        "missing": [],
+        "message": "",
+    }
+
+    design = ads_ops._open_design(library, cell, view, write=not dry_run)
+    try:
+        try:
+            plan = prepare_design_dependencies(design, ws_path,
+                                               place_includes=not dry_run)
+        except RuntimeError as e:  # 未就绪：把逐条问题原样交回调用方
+            lines = [ln.strip().lstrip("-").strip() for ln in str(e).splitlines()
+                     if ln.strip() and not ln.strip().endswith("：")]
+            out["problems"] = lines or [str(e)]
+            if dry_run:
+                needed = _vendor_net_files(
+                    ws_path, {_instance_library(i) for i in design.instances} - {""})
+                out["include_files"] = sorted({f for fs in needed.values() for f in fs})
+                out["would_fill"] = [str(i.inst_name) for i in design.instances
+                                     if _include_role(i) == "generic" and not _include_files(i)]
+            out["message"] = "设计里的模型 Include 还没就绪，未做任何修改"
+            return out
+        out["include_instances"] = plan.get("include_instances") or []
+        out["filled_includes"] = plan.get("filled_includes") or []
+        out["include_sources"] = plan.get("include_sources") or {}
+        out["include_files"] = plan.get("include_files") or []
+        if dry_run:
+            out["ok"] = not plan.get("problems")
+            out["message"] = ("只读预检完成：构建时会就地填入这些文件，未保存"
+                              if plan.get("include_files") else "该设计不需要原厂模型 Include")
+            return out
+        design.save_design()
+    finally:
+        ads_ops._close_design(design)
+
+    # 只读复核：以磁盘上的网表为准，不相信"参数已经写进去"这件事。
+    design2 = ads_ops._open_design(library, cell, view, write=False)
+    try:
+        try:
+            netlist = design2.generate_netlist()
+        except Exception as e:  # noqa: BLE001
+            out["problems"].append(f"保存后网表生成失败：{type(e).__name__}: {e}")
+            netlist = ""
+    finally:
+        ads_ops._close_design(design2)
+    included = _netlist_includes(netlist)
+    out["netlist_includes"] = included
+    expected = list(out["include_files"])
+    present = {_file_key(p) for p in included}
+    out["missing"] = [f for f in expected if _file_key(f) not in present]
+    if expected and not included:
+        out["problems"].append(
+            "保存后网表里仍然没有任何 #include —— Include 元件没有被网表采纳，"
+            "不能据此运行仿真")
+    if out["missing"]:
+        out["problems"].append("这些模型文件没有被 #include 引用："
+                               + ", ".join(out["missing"]))
+    out["ok"] = not out["problems"]
+    if out["ok"]:
+        if out["filled_includes"] or out["include_instances"]:
+            out["message"] = ("Include 已补齐并落盘：网表里已有 "
+                              + str(len(included)) + " 条 #include，"
+                              "可以进入仿真；这是「已准备好仿真」，还不是仿真结果")
+        else:
+            out["message"] = "设计里已有可用的模型 Include，无需修改"
+    else:
+        out["message"] = "Include 仍未就绪，已如实列出问题"
+    return out
+
+
 def _seal_evidence(workspace: str, package_id: str, model_id: str, model_ref: str,
                    variant: dict, parameters: dict, model_file_abs: str,
                    file_rel: str, header: dict, stages: dict,
@@ -4606,6 +6029,10 @@ HANDLERS = {
     "list_library_components": list_library_components,
     "inspect_component_model": inspect_component_model,
     "detach_design_kit": detach_design_kit,
+    # 按目标值/容差/电流/频段反查原厂料号（选项表检索）
+    "search_model_parts": search_model_parts,
+    # 补齐设计里缺失/为空的模型 Include，并用网表证明 #include 真的存在
+    "repair_model_includes": repair_model_includes,
     # 把已挂接的原厂包在 ADS 原生元件列表里打开/定位（只读定位，≠ 模型可用）
     "open_vendor_palette": open_vendor_palette,
 }

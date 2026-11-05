@@ -734,6 +734,39 @@ verdict=validated 才能成为 published；未达验证通过必须显式 allow_
     禁止**：把原厂元件悄悄换成通用 S2P / 通用 RLC 之后，仍对用户宣称"原厂元件
     调用成功" —— 那是另一个器件的验证，不是原厂元件的验证；一旦替换，必须
     明确说明替换了什么、为什么，以及原厂元件为何没能用上。
+26. **原厂料号是「选项表」，不是自由文本 —— 绝不自造型号字符串。** MuRata 等
+    套件的 PartNumber 是 STRING 参数，但它的取值必须来自库自带的常量选项表
+    （例如 `LQW18AN_00_list_opt`）：只能写 form 名/真实料号，写 `"18nH"`、
+    `"18nH电感"` 这类数值或描述会被拒绝（工具会报"不在选项表里"并给出最接近的
+    料号，照实转述即可，不要绕过去改别的参数）。正确流程：
+    (a) `get_vendor_model_info` / `inspect_component_model` 会返回
+        `selector_params` 与 `choices`（form / part_number / value / tolerance /
+        rated_current / freq_range）——先看它到底有哪些可选；
+    (b) 用户给的是**物理要求**（"18nH、±5%、额定电流≥300mA"）时，用
+        `search_model_parts`（value + value_tolerance，可加 tolerance、
+        rated_current_min、freq_min/freq_max）反查真实料号，再把命中项给用户确认；
+    (c) 放置时只写这一个选型参数（如 `params={"PartNumber": "LQW18AN18NG00"}`）。
+        Value / Tolerance / RatedCurrent / Size 等派生字段由原厂回调自动填，
+        **不要手填**，它们也不进网表（网表里只有 `PartNumber=<序号>`）；
+    (d) 用户明确要某个料号时直接写料号，但若工具回"选项表里没有"，就如实说
+        该料号不在本库版本里，并给最接近的候选，绝不擅自换成相近型号后宣称
+        就是用户要的那颗。
+27. **原厂模型必须有 Include 才能仿真 —— 空 Include 等于没有模型。** 原厂套件
+    （MuRata 等）的模型定义靠网表里的 `#include ".../circuit/models/*.net"`
+    （含 `encode.net`）加载；设计里放过 `ads_simulation:NetlistInclude` 但
+    `IncludeFiles` 还是占位 `[['', '']]` 时，网表里**一条 #include 都没有**，
+    仿真会报 undefined model / coded model 加载失败。处置顺序：
+    (a) 先看网表（`check_simulation_netlist` 或设计网表）里有没有真实
+        `#include`；没有就调 `repair_model_includes {library, cell}`
+        （带 `dry_run:true` 先看会改什么）；
+    (b) 该工具会把包内真实 `.net`（工作区相对路径）填进 Include，并用
+        "保存后重新生成网表"自证；返回 `missing` 非空就是还没修好；
+    (c) 不要手写绝对路径塞进 IncludeFiles —— 该栏按工作区相对路径解释，
+        绝对路径会被再拼一次工作区根目录，变成不存在的路径；
+    (d) **没跑出数据集之前不许说"能仿真"**：放置成功、落盘成功、料号能配，
+        都只是"能放置"；只有 `run_simulation` 返回数据集、且 `read_dataset`
+        读到有限的 S 曲线，才能说该模型在本机仿真通过。数据集块名通常是
+        `SP1.SP`，读列写成 `SP1.SP.S(1,1)`。
 
 ## 射频电路设计前置审查与理论约束（强制）
 

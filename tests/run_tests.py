@@ -69,6 +69,7 @@ CASES = [
     ("test_sp_traces.py", "S 参数矩阵表达式与 dB 曲线", "logic", False),
     ("test_rfcalc.py", "RF 计算引擎：传输线/噪声/杂散/偏置公式", "logic", False),
     ("test_toolserver_busy.py", "toolserver 忙碌状态 / 多作业互不干扰", "http", False),
+    ("test_toolserver_lifecycle.py", "工具服务线程恢复 / 独占端口 / 配置变化", "http", False),
     ("test_turn_budget.py", "轮次预算收尾 / 重复失败保护 / 总结取消", "logic", False),
     ("test_cancel_chain.py", "取消链路：排队取消 / 过期跳过 / 队列容量 / pump 预算", "logic", False),
     # ---- 2026-10-30 ADS 未响应修复（run_compute / 取消链贯通）----
@@ -106,6 +107,9 @@ CASES = [
     ("test_model_http.py", "模型包 HTTP：二进制上传 / 鉴权 / 中文名 / 工作区绑定 / 幂等", "http", True),
     ("test_model_ops.py", "模型包 ADS 侧纯逻辑：lib.defs 解析 / 路径解析 / 工具名齐全", "logic", False),
     ("test_model_ops_flow.py", "模型包 ADS 侧流程：挂接幂等 / 只读约束 / 卸载不越界 / 验证门禁", "logic", False),
+    ("test_model_part_choices.py", "料号选项表：物理量解析 / 枚举 / 选值核对 / 检索与容差", "logic", False),
+    ("test_model_dataset_report.py", "冒烟数据集核对：块名/列名 / NaN / 常数 / 端口数", "logic", False),    ("test_dataset_expr.py", "数据集读数：块.列表达式 / 列名等价 / 缺失列提示", "logic", False),
+    ("test_model_includes.py", "模型 Include：空表补齐 / 相对路径 / 不重复包含", "logic", False),
     ("test_model_import_flow.py", "模型包导入编排：操作恢复 / 用户选择 / 取消 / 幂等", "logic", False),
     ("test_model_open_http.py", "原生列表打开路由：可信上下文注入 / 越权拦截 / 失败如实报码", "http", False),
     ("test_model_deps_gate.py", "模型依赖指纹与仿真缓存/条件门禁", "logic", False),

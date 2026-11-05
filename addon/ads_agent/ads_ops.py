@@ -1645,31 +1645,67 @@ def _set_param(inst, name, value):
     Subst=MSUB1，hpeesofsim 会报
     "Expected a substrate model for parameter `Subst'"。
     按"原值是引号包着的"自动补引号。
+
+    **离散选项表参数**（原厂料号等）：只能选 form，不能自填数值。
+    此前实现里，值不是任何 form 名时会静默走 ``p.value = value`` ——
+    写错的料号被吞掉、到仿真才炸（或干脆变成一个合法但错误的自由文本）。
+    现在先按 form 名 / 料号 / 网表序号解析；解析不到且该参数**不允许自由
+    文本**就当场报错，并给出最接近的料号（问题在放置时就暴露）。
     """
-    value = str(value)
+    raw_value = str(value)
+    plain = (raw_value[1:-1] if raw_value.startswith('"') and raw_value.endswith('"')
+             else raw_value)
     for p in list(inst.parameters):
         if str(getattr(p, "name", "")) == str(name):
             try:
                 old = str(getattr(p, "value", "") or "")
             except Exception:  # noqa: BLE001
                 old = ""
-            # A constant form is selected by its *form name*, not its netlist
-            # value (e.g. a part number may netlist as an integer index).
             definition = getattr(p, "definition", None)
+            # 常量 form 用 *form 名* 选择，不是网表值
+            # （料号的网表值是序号，如 PartNumber=2）。
+            # 1) 先按 form 名精确选 —— 这是最可靠、也是原来就有的路径；
             forms = getattr(definition, "formset", None)
             lookup = getattr(forms, "find_form_by_name", None)
-            raw = value[1:-1] if value.startswith('"') and value.endswith('"') else value
-            selected = lookup(raw) if callable(lookup) else None
+            selected = lookup(plain) if callable(lookup) else None
             is_constant = getattr(selected, "is_constant_form", None)
-            if selected is not None and callable(is_constant) and is_constant(selected):
-                p.form_name = raw
-                value = raw
+            selected_form = (plain if (selected is not None
+                                       and callable(is_constant)
+                                       and is_constant(selected)) else "")
+            problems: list = []
+            match: dict = {}
+            if not selected_form:
+                # 2) 再按「料号 / 显示值 / 网表序号」解析到 form，
+                #    解析不到且该参数不允许自由文本 -> 当场报错（不用 p.value 兜底）
+                try:
+                    choices = model_ops._enumerate_choices(p)
+                except Exception:  # noqa: BLE001 — 判不了选项表就退回旧行为
+                    choices = {}
+                if choices.get("available"):
+                    try:
+                        match = model_ops._match_choice(str(name), plain, choices)
+                    except Exception:  # noqa: BLE001
+                        match = {}
+                    if match.get("is_selection"):
+                        selected_form = str(match.get("selected_form") or "")
+                        problems = list(match.get("problems") or [])
+            if selected_form:
+                p.form_name = selected_form
+                value = selected_form
+            elif problems:
+                # problems 里已经写清选项表名、示例 form、最接近的料号与
+                # search_model_parts 提示，不要再拼一遍。
+                raise ValueError(" ".join(problems))
             elif old.startswith('"') and old.endswith('"') and len(old) >= 2:
-                if not (value.startswith('"') and value.endswith('"')):
-                    value = f'"{value}"'
-                p.value = value
+                if not (raw_value.startswith('"') and raw_value.endswith('"')):
+                    raw_value = f'"{raw_value}"'
+                p.value = raw_value
+                value = raw_value
             else:
-                p.value = value
+                # 与旧行为一致：调用方给什么写什么（引号也照原样保留），
+                # 只有「常量 form 选择」那条路径才用剥了引号的名字。
+                p.value = raw_value
+                value = raw_value
             callback = getattr(inst, "invoke_item_parameter_changed_callback", None)
             if callable(callback):
                 callback([str(name)])
@@ -6622,6 +6658,7 @@ def build_schematic(args: dict, ctx=None) -> dict:
 
         def _apply():
             out = []
+            param_errors = []
             for spec in instances:
                 kw = {"name": str(spec["name"])}
                 if spec.get("angle") is not None:
@@ -6631,13 +6668,21 @@ def build_schematic(args: dict, ctx=None) -> dict:
                 inst = design.add_instance(
                     str(spec["master"]), (float(spec["x"]), float(spec["y"])), **kw)
                 for k, v in (spec.get("params") or {}).items():
-                    _set_param(inst, k, v)
+                    try:
+                        _set_param(inst, k, v)
+                    except (ValueError, KeyError) as e:
+                        # 聚合所有参数错误：一次报全，省得用户改一个撞一个。
+                        param_errors.append(f"{spec['name']}.{k}: {e}")
                 ann = spec.get("annot")
                 if ann:
                     # 文字避让偏移（相对默认位，v6 MTEE 同款机制）：
                     # 竖线下穿的元件把标注挪开，否则线穿字。
                     inst.move_annotation((float(ann[0]), float(ann[1])))
                 out.append(str(spec["name"]))
+            if param_errors:
+                # 一次报全（含建议），而不是改一个撞一个；此时尚未 save_design
+                raise ValueError("参数设置失败（本次放置未保存）：\n- "
+                                 + "\n- ".join(param_errors))
             if var_spec:
                 vname = str(var_spec.get("name") or "VAR1")
                 vinst = design.add_instance(
@@ -6723,6 +6768,26 @@ def build_schematic(args: dict, ctx=None) -> dict:
                 f"磁盘 {p['on_disk']!r}" for p in params_bad]
         problems.append(schematic_rules.format_violation(
             "R-22", "参数复核失败：\n" + "\n".join(rows)))
+    # 模型包含件复核（2026-11-05）：设计里"有一个 Include 实例"不等于
+    # "网表里真有 #include" —— 空的 NetlistInclude（占位 IncludeFiles）
+    # 一个 #include 都不产生，症状是仿真报 undefined model，而静态检查
+    # 一切正常。这里以磁盘网表为准。
+    _expected_includes = list((vendor_dependencies or {}).get("include_files") or [])
+    if _expected_includes:
+        _net_includes = model_ops._netlist_includes(_nl)
+        if not _net_includes:
+            problems.append(
+                "网表里没有任何 #include：模型包含件没有生效"
+                "（空 IncludeFiles 的 NetlistInclude，或缺原厂 Include 元件）。"
+                "这样仿真只会报 undefined model / coded model 加载失败；"
+                "调用 repair_model_includes 可把包内 .net 就地填进去。")
+        else:
+            _present = {model_ops._file_key(p) for p in _net_includes}
+            _lack = [f for f in _expected_includes
+                     if model_ops._file_key(f) not in _present]
+            if _lack:
+                problems.append("这些模型文件没有被网表 #include 引用："
+                                + ", ".join(_lack))
     conn_fail = [c for c in conn_results if c.get("status") == "failed"]
     if conn_fail:
         rows = [f"  - {c['a']} <-> {c['b']}: {c.get('reason', '')}" for c in conn_fail]
@@ -7442,6 +7507,26 @@ def run_simulation(args: dict, ctx=None) -> dict:
         # 依赖解析完（要开层次子图、要读 VAR），哈希留给 _simulate ——
         # 那样后台线程仿真时也不会占用 ADS 主线程去读大文件。
         audit["_model_dep_plan"] = _model_dep_plan(design, netlist, ws, library)
+        # 模型包含件复核：有 Include 实例 ≠ 网表里有 #include。空
+        # NetlistInclude 的网表一条 #include 都没有，仿真的第一句就会
+        # 报 undefined model。宁可在启动 hpeesofsim 前停下并点名。
+        _expected_includes = list(
+            (audit.get("_vendor_dependencies") or {}).get("include_files") or [])
+        if _expected_includes:
+            _net_includes = model_ops._netlist_includes(netlist)
+            _present = {model_ops._file_key(p) for p in _net_includes}
+            _lack = [f for f in _expected_includes
+                     if model_ops._file_key(f) not in _present]
+            if _lack:
+                raise RuntimeError(
+                    "仿真前检查未通过，已阻止本次仿真：\n\n- 设计用了原厂模型，"
+                    "但网表里没有被 #include 的模型文件：\n  "
+                    + "\n  ".join(_lack)
+                    + "\n\n 症状会是 undefined model / coded model 加载失败。"
+                    "\n 修复：调用 repair_model_includes {library, cell}"
+                    "（它会按包内 circuit/models 的真实 .net 就地填写 Include，"
+                    "并在保存后核对网表），或删除空的 NetlistInclude 让"
+                    "build_schematic 补原厂 Include 元件。")
     finally:
         _close_design(design)
 
@@ -7494,6 +7579,54 @@ def run_simulation(args: dict, ctx=None) -> dict:
                      note=getattr(ctx, "note", None), ctx=ctx)
 
 
+def _column_key(text) -> str:
+    """列名归一：大小写、空格、圆括号/方括号都视为同一种写法。
+
+    数据块里的 S 参数列名是 ``S[1,1]``，而 historically 文档/提示里写的是
+    ``S(1,1)``；两者必须都能命中，否则"读了却读不到"会伪装成数据集坏了。
+    """
+    raw = str(text or "").strip().lower()
+    raw = raw.replace("(", "[").replace(")", "]")
+    return re.sub(r"\s+", "", raw)
+
+
+def _same_column(name, wanted) -> bool:
+    if not wanted:
+        return False
+    return _column_key(name) == _column_key(wanted)
+
+
+def _resolve_dataset_expr(expr, all_names):
+    """把用户/模型给的表达式解析成 (数据块名, 块内列名)。
+
+    数据集顶层变量常常就是数据块（如 S 参数控制器块 ``SP1.SP``），块内列
+    才是 ``S[1,1]``。此前这里直接 ``data[expr]``，传 ``SP1.SP.S(1,1)`` 会
+    报"变量不存在"，看着像数据集没数据。现在按 "块名[.列名]" 拆一次：
+    命中块名就返回列，只给块名则返回空列（列整块统计量）。
+    """
+    name = str(expr or "").strip()
+    if not name:
+        return "", ""
+    known = {str(n) for n in (all_names or [])}
+    if name in known:
+        return name, ""
+    for sep in (".", ":"):
+        if sep in name:
+            head, tail = name.rsplit(sep, 1)
+            if head in known:
+                return head, tail
+    parts = name.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        head = ".".join(parts[:i])
+        if head in known:
+            return head, ".".join(parts[i:])
+    # 只给列名（如 "S(2,1)"）：数据集只有唯一块时就是它（与 read_traces 的
+    # 表达式语义一致）；有多个块则不猜，交给调用方写明块名。
+    if "." not in name and ":" not in name and len(known) == 1:
+        return next(iter(known)), name
+    return "", ""
+
+
 def read_dataset(args: dict, ctx=None) -> dict:
     path = args["path"]
     expressions = args.get("expressions") or []
@@ -7519,8 +7652,15 @@ def read_dataset(args: dict, ctx=None) -> dict:
     for expr in expressions:
         entry = {}
         try:
-            block = data[expr]
-            _block_key = str(expr)
+            block_name, column = _resolve_dataset_expr(expr, all_names)
+            if not block_name:
+                raise KeyError(expr)
+            block = data[block_name]
+            _block_key = str(block_name)
+            if block_name != expr:
+                entry["block"] = block_name
+                if column:
+                    entry["column"] = column
             try:
                 if _block_key in _df_cache:
                     df = _df_cache[_block_key]
@@ -7532,9 +7672,16 @@ def read_dataset(args: dict, ctx=None) -> dict:
 
             if df is not None:
                 cols = [str(c) for c in df.columns]
-                entry["columns"] = cols
+                want = [c for c in cols if _same_column(c, column)] if column else []
+                if column and not want:
+                    raise KeyError(f"{block_name}:{column}")
+                freq_col = next((c for c in cols if _column_key(c) == "freq"), "")
+                # 指定列时统计量连频率一起给（否则读到的 S 曲线没有横轴），
+                # 但 columns 只报命中的那一列，避免调用方以为整块都读了。
+                shown = ([freq_col] if freq_col else []) + want if column else cols
+                entry["columns"] = cols if not column else want
                 stats = {}
-                for col in cols:
+                for col in shown:
                     try:
                         series = df[col]
                         if hasattr(series, "min"):
@@ -7549,10 +7696,14 @@ def read_dataset(args: dict, ctx=None) -> dict:
                 entry["stats"] = stats
                 entry["n_rows"] = int(len(df))
                 sample = df.head(max_rows)
-                entry["sample_rows"] = [
-                    {str(c): _num(sample.iloc[i][c]) for c in sample.columns}
-                    for i in range(len(sample))
-                ]
+                if column:
+                    keys = shown
+                    rows = [{str(c): _num(sample.iloc[i][c]) for c in keys}
+                            for i in range(len(sample))]
+                else:
+                    rows = [{str(c): _num(sample.iloc[i][c]) for c in sample.columns}
+                            for i in range(len(sample))]
+                entry["sample_rows"] = rows
                 csv_path = os.path.join(
                     csv_dir, f"{expr.replace(',', '_').replace('(', '_').replace(')', '_').replace(' ', '')}.csv"
                 )
@@ -7568,6 +7719,9 @@ def read_dataset(args: dict, ctx=None) -> dict:
                 entry["values_head"] = [_num(v) for v in list(raw)[:max_rows]]
         except KeyError:
             entry["error"] = f"数据集中不存在变量 {expr}；可用: {all_names}"
+            if all_names:
+                entry["hint"] = (f"顶层变量是数据块名，块内列（如 S 参数的 S[1,1]）"
+                                 f"可写成 {all_names[0]}.S[1,1]；只写块名则列出整块统计量")
         except Exception as e:
             entry["error"] = f"{type(e).__name__}: {e}"
         out["expressions"][expr] = entry

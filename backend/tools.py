@@ -58,10 +58,18 @@ def _verify_toolserver(cfg: dict) -> None:
     # 顺序很重要：instance.evaluate 会给"另一份安装"也打上 conflict 标记，
     # 泛化的冲突分支必须先让位给具体的 reason，否则最该看到的那句话会被吞掉。
     if reason == "unreachable":
+        detail = str(verdict.get("detail") or "")
+        if "timed out" in detail.lower() or "timeouterror" in detail.lower():
+            raise AdsToolError(
+                f"ADS 工具服务健康检查超时（{url}）；这不等于 ADS 未启动。"
+                "请检查是否有多个 ADS 实例占用同一端口、工具服务或 ADS 是否无响应，"
+                "并核对 ADS 插件与后端使用的配置及端口。健康检查未派发工具，不要据此重复先前作业。"
+            )
         raise AdsToolError(
             "无法连接 ADS 端工具服务 "
             f"({url})。请确认：1) ADS 2027 已启动；2) 已安装并启用 ADS Agent 插件"
-            "（Tools > ADS Agent）；3) 面板打开过一次。"
+            "（Tools > ADS Agent）；3) 面板打开过一次；4) 插件与后端使用同一配置及端口。"
+            "也请检查是否有多个 ADS 实例竞争该端口。"
         )
     if reason in ("foreign_install", "no_install_id"):
         raise AdsToolError(
@@ -470,7 +478,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_dataset",
-            "description": "读取 .ds 数据集中指定表达式的数值：返回统计量（最小/最大/首/末）与样例行，并导出 CSV。数值结论必须来自本工具，不得臆造。",
+            "description": (
+                "读取 .ds 数据集中指定表达式的数值：返回统计量（最小/最大/首/末）与样例行，"
+                "并导出 CSV。数值结论必须来自本工具，不得臆造。"
+                "数据集顶层是**数据块**（如 S 参数控制器块 SP1.SP），块内列才是 S[1,1]；"
+                "表达式写成 \"块名\"（读整块）或 \"块名.列名\" 都行，"
+                "先不带 expressions 调一次可列出真实块名。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -478,7 +492,10 @@ TOOLS = [
                     "expressions": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "要读取的变量名列表，如 [\"AC1.S(1,1)\"]；留空则列出全部变量",
+                        "description": (
+                            "要读取的表达式，如 [\"SP1.SP\"] 或 [\"SP1.SP.S(1,1)\"]"
+                            "（S[1,1] 与 S(1,1) 等价）；留空则列出全部块名"
+                        ),
                     },
                     "max_rows": {"type": "integer", "description": "返回的样例行数，默认 5"},
                 },
@@ -763,6 +780,86 @@ TOOLS = [
                     "library": {"type": "string"},
                     "cell": {"type": "string"},
                     "view": {"type": "string", "description": "默认 schematic"},
+                },
+                "required": ["library", "cell"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_model_parts",
+            "description": (
+                "在已挂接的原厂模型库里**按目标参数反查料号**（选型）。\\n"
+                "原厂套件（村田/TDK/…）的元件参数常是「离散选项表」：例如电感 cell 的 "
+                "PartNumber 只能从上百个料号里选，**不能自填 18nH** —— 填数值会被拒绝，"
+                "派生字段（Value/Tolerance/RatedCurrent/FreqRange）由原厂回调自动填且不进网表。\\n"
+                "★ 需要某个值的元件时先用本工具：value='18nH'（可加 tolerance、"
+                "rated_current_min、freq_min/freq_max、part_type）→ 拿到真实料号与 form。\\n"
+                "把返回的 form（或 part_number）写进对应参数即可，例如 "
+                "parameters={'PartNumber': 'LQW18AN18NJ00'}。\\n"
+                "结果全部来自真实枚举的 ModelParam.formset 常量 form；没命中就如实说没有，"
+                "**绝不按料号编码规则猜型号**。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": {"type": "string",
+                                "description": "限定某个库；留空扫工作区里的 Design Kit 库"},
+                    "include_builtin": {"type": "boolean",
+                                        "description": "是否连内置库一起扫，默认 false"},
+                    "cell": {"type": "string", "description": "限定单个 cell"},
+                    "cells": {"type": "array", "items": {"type": "string"},
+                              "description": "限定多个 cell"},
+                    "name_prefix": {"type": "string", "description": "cell 名前缀，如 LQW18"},
+                    "param": {"type": "string",
+                              "description": "限定参数名，如 PartNumber；留空扫所有有选项表的参数"},
+                    "part_number": {"type": "string", "description": "料号/形式名子串"},
+                    "query": {"type": "string", "description": "在标签文本里搜子串"},
+                    "value": {"type": "string",
+                              "description": "目标值，如 '18nH' / '100nF' / '0.85mm'"},
+                    "value_tolerance": {"type": "string",
+                                        "description": "值的容差：'5%' 或 '0.5[nH]'，默认几乎相等"},
+                    "tolerance": {"type": "string",
+                                  "description": "容差条件：子串或量，如 '+/-0.5[nH]'"},
+                    "part_type": {"type": "string",
+                                  "description": "Type 子串，如 'Wound' / 'X7R'"},
+                    "rated_current_min": {"type": "string",
+                                          "description": "额定电流下限，如 '700mA'"},
+                    "freq_min": {"type": "string", "description": "工作频段下限，如 '50MHz'"},
+                    "freq_max": {"type": "string", "description": "工作频段上限，如 '6GHz'"},
+                    "max_results": {"type": "integer", "description": "返回上限，默认 20"},
+                    "budget_s": {"type": "number", "description": "扫描时间上限秒，默认 30"},
+                    "refresh": {"type": "boolean", "description": "清空选项表缓存后重扫"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "repair_model_includes",
+            "description": (
+                "补齐设计里缺失或为空的**模型 Include**，并用网表证明它真的生效。\\n"
+                "为什么需要：原厂套件（村田等）的模型必须靠 `#include` 指向包内 "
+                "circuit/models 下的 .net（例如 encode.net）才能被仿真器识别。设计里只放一个 "
+                "NetlistInclude 元件、但 IncludeFiles 还是空的占位 `[['', '']]` 时，网表里"
+                "一条 #include 都没有 —— 静态校验全绿，仿真却报 undefined model / "
+                "coded model 加载失败。\\n"
+                "本工具会：① 读该设计用到的已挂接库，找出 circuit/models 下真实 .net；"
+                "② 把空的 NetlistInclude 就地填成这些文件（SDK 不能删除实例，只能就地修），"
+                "或补原厂 `<lib>_Include` 元件；③ 保存后重开只读生成网表，逐个核对文件"
+                "确实被 #include，返回 include 列表与缺失项。\\n"
+                "**这只证明「可以进入仿真」，不等于仿真已通过** —— 出结果还要 run_simulation。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "library": {"type": "string", "description": "设计所在库，如 DAB_ATX_lib"},
+                    "cell": {"type": "string", "description": "设计名，如 MURATA_SMOKE"},
+                    "view": {"type": "string", "description": "视图，默认 schematic"},
+                    "dry_run": {"type": "boolean",
+                                "description": "只报告会补哪些文件，不写设计；默认 false"},
                 },
                 "required": ["library", "cell"],
             },
@@ -1132,6 +1229,7 @@ _SIMULATION_RULE_BINDINGS = {
         "import_shared_model_package", "inspect_model_package", "import_model_package",
         "list_vendor_models", "get_vendor_model_info", "validate_model_import",
         "open_vendor_palette", "import_device_revision", "place_device_component",
+        "search_model_parts", "repair_model_includes",
         "run_design_optimization",
     },
     "environment": {"run_simulation", "run_python", "validate_model_import", "run_design_optimization"},
@@ -1194,6 +1292,10 @@ TIMEOUTS = {
     # 上万个 cell 的原厂库：翻库本身不慢，但读取 model_def 参数定义很贵
     "list_vendor_models": 300,
     "get_vendor_model_info": 180,
+    # 按目标参数扫全库选项表：formset 枚举是进程内缓存的，但要遍历所有 cell
+    "search_model_parts": 240,
+    # 就地补 Include 要开设计写句柄 + 保存 + 重开只读生成网表核对
+    "repair_model_includes": 180,
     "validate_model_import": 300,
     # 打开/定位原生元件列表：ADS 端要读 eesof_lib_cfg → boot.ael → palette.ael，
     # 首批加载大套件可能触发 aelcomp 重编，给足预算（>240）。
@@ -1428,13 +1530,18 @@ def call(cfg: dict, name: str, args: dict, job_id: str = "") -> dict:
         log.error("<- %s  HTTP %s(%s): %s", name, e.code, _elapsed(), detail)
         raise AdsToolError(f"ADS 端返回 HTTP {e.code}: {detail}") from e
     except urllib.error.URLError as e:
+        _TOOLSERVER_VERDICT.pop(ads_base_url(cfg), None)
+        if isinstance(e.reason, TimeoutError):
+            raise AdsToolTimeout(
+                f"工具 {name} 通信超时，作业 job_id={job_id} 可能已到达 ADS 且仍在执行；"
+                "请先核实作业状态，切勿盲目重复提交。", job_id) from e
         log.error("<- %s  连接失败(%s): %s", name, _elapsed(), e.reason)
         raise AdsToolError(
-            "无法连接 ADS 端工具服务 "
-            f"({url})。请确认：1) ADS 2027 已启动；2) 已安装并启用 ADS Agent 插件"
-            "（Tools > ADS Agent）；3) 面板打开过一次。"
+            f"与 ADS 工具服务通信失败（{url}，job_id={job_id}）。"
+            "作业是否已到达 ADS 尚不确定；请先核实状态，切勿盲目重复提交。"
         ) from e
     except TimeoutError as e:
+        _TOOLSERVER_VERDICT.pop(ads_base_url(cfg), None)
         # 本端 socket 读超时：连接层面先放弃了，作业可能仍在 ADS 端执行
         log.error("<- %s  执行超时 >%ss job_id=%s", name, timeout, job_id)
         raise AdsToolTimeout(

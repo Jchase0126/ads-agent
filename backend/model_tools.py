@@ -378,6 +378,45 @@ def list_vendor_models(cfg: dict, args: dict, cancel_event=None) -> dict:
     return tools_mod.call(cfg, "list_vendor_models", params)
 
 
+_SEARCH_PART_ARG_KEYS = (
+    "library", "include_builtin", "cell", "cells", "name_prefix", "param",
+    "part_number", "query", "value", "value_tolerance", "tolerance",
+    "part_type", "kind", "rated_current_min", "freq_min", "freq_max",
+    "max_results", "budget_s", "refresh", "include_placeholder",
+)
+
+
+def search_model_parts(cfg: dict, args: dict, cancel_event=None) -> dict:
+    """按目标值/容差/电流/频段在原厂库的选项表里反查料号。
+
+    ADS 端做真实枚举（ModelParam.formset 的常量 form），后端只补 workspace
+    并透传 —— 型号/数值的判定规则在 ADS 端只有一份，避免两处漂移。
+    """
+    workspace = current_workspace(cfg)
+    params = {"workspace": workspace}
+    for key in _SEARCH_PART_ARG_KEYS:
+        if args.get(key) is not None:
+            params[key] = args[key]
+    return tools_mod.call(cfg, "search_model_parts", params)
+
+
+def repair_model_includes(cfg: dict, args: dict, cancel_event=None) -> dict:
+    """补齐设计里缺失/为空的模型 Include，并由 ADS 侧用网表自证。
+
+    为什么需要单独一只工具：``build_schematic`` 只在**新建/追加**时补
+    Include；已经存在、``IncludeFiles`` 为空的 ``NetlistInclude`` 会让
+    网表里一条 ``#include`` 都没有，仿真报 undefined model，而静态检查
+    全绿。ADS 端没有删除实例的 API，只能就地填文件 —— 判定与写入都在
+    ADS 端完成（那里才能读 library/cell 与参数），后端只补 workspace。
+    """
+    workspace = current_workspace(cfg)
+    params = {"workspace": workspace}
+    for key in ("library", "cell", "view", "dry_run"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+    return tools_mod.call(cfg, "repair_model_includes", params)
+
+
 def _index_entries_for(workspace: str, library: str, cell: str) -> dict:
     """在工作区已导入的模型包索引里检索这个元件。
 
@@ -947,6 +986,8 @@ ADS_HANDLERS = {
     "import_model_package": import_model_package,
     "import_shared_model_package": import_shared_model_package,
     "list_vendor_models": list_vendor_models,
+    "search_model_parts": search_model_parts,
+    "repair_model_includes": repair_model_includes,
     "get_vendor_model_info": get_vendor_model_info,
     "validate_model_import": validate_model_import,
     "open_vendor_palette": open_vendor_palette,
